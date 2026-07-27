@@ -128,7 +128,7 @@ def generate_synthetic_events(
             "cpu_ram_spike",
             "failed_login_series",
         ]
-        scenario_manifest = _scenario_manifest(start_time)
+        scenario_manifest = scenario_manifest_for_start(start_time)
         _inject_anomalies(events, start_time, seed, user_id, host_id)
 
     events.sort(key=lambda event: (event.timestamp, event.event_id))
@@ -145,11 +145,11 @@ def generate_synthetic_events(
     return events, summary
 
 
-def _scenario_manifest(start_time: datetime) -> list[dict[str, str]]:
+def scenario_manifest_for_start(start_time: datetime) -> list[dict[str, str]]:
     scenarios = [
         ("rare_process", start_time + timedelta(hours=18)),
         ("outbound_connection_spike", start_time + timedelta(hours=19)),
-        ("atypical_time_activity", start_time + timedelta(hours=21, minutes=15)),
+        ("atypical_time_activity", start_time + timedelta(hours=21, minutes=30)),
         ("cpu_ram_spike", start_time + timedelta(hours=22)),
         ("failed_login_series", start_time + timedelta(hours=23)),
     ]
@@ -236,7 +236,7 @@ def _inject_anomalies(
         )
 
     night_ts = start_time + timedelta(hours=21, minutes=30)
-    for index in range(20):
+    for index in range(80):
         events.append(
             _event(
                 night_ts + timedelta(seconds=index),
@@ -244,17 +244,17 @@ def _inject_anomalies(
                 user_id,
                 host_id,
                 {
-                    "process_name": "browser.exe",
+                    "process_name": f"night-admin-tool-{index}.exe",
                     "pid": 9500 + index,
-                    "parent_process": "explorer.exe",
-                    "command_family": "interactive",
+                    "parent_process": "powershell.exe",
+                    "command_family": "after_hours_admin",
                 }
                 if index % 2 == 0
                 else {
-                    "remote_address": f"198.51.100.{90 + index}",
-                    "remote_port": 443,
+                    "remote_address": f"203.0.113.{120 + index}",
+                    "remote_port": 40000 + index,
                     "protocol": "tcp",
-                    "connection_count": 2,
+                    "connection_count": 1,
                 },
                 seed,
                 5002,

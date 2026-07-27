@@ -47,6 +47,14 @@ type CollectionStatus = {
   event_summary?: { real?: Record<string, number>; synthetic?: Record<string, number> };
 };
 
+type ScenarioValidation = {
+  scenario_name: string;
+  detected: boolean;
+  match_count: number;
+  best_anomaly_score: number;
+  max_risk_level: string;
+};
+
 const copy = {
   en: {
     title: 'SentinelUEBA',
@@ -67,6 +75,7 @@ const copy = {
     continuous: 'Longest session',
     current: 'Current',
     warning: 'Cumulative collection is not the same as strict continuous 24-hour validation.',
+    scenarios: 'Demo scenarios',
   },
   ru: {
     title: 'SentinelUEBA',
@@ -87,6 +96,7 @@ const copy = {
     continuous: 'Самый длинный сеанс',
     current: 'Текущий',
     warning: 'Накопительный сбор не равен строгой непрерывной 24-часовой проверке.',
+    scenarios: 'Demo-сценарии',
   },
 };
 
@@ -107,6 +117,7 @@ export function App() {
   const [busy, setBusy] = React.useState<string>('');
   const [message, setMessage] = React.useState<string>('Ready');
   const [capabilities, setCapabilities] = React.useState<CollectorCapability[]>([]);
+  const [scenarioValidation, setScenarioValidation] = React.useState<ScenarioValidation[]>([]);
   const t = copy[locale];
 
   const refresh = React.useCallback(async () => {
@@ -126,6 +137,9 @@ export function App() {
     setBusy(label);
     try {
       const result = await action();
+      if (isApiData(result) && Array.isArray(result.data.scenario_validation)) {
+        setScenarioValidation(result.data.scenario_validation as ScenarioValidation[]);
+      }
       setMessage(JSON.stringify(result, null, 2));
       await refresh();
     } catch (error) {
@@ -273,6 +287,23 @@ export function App() {
         )}
       </section>
 
+      {scenarioValidation.length ? (
+        <section className="details">
+          <h2>{t.scenarios}</h2>
+          <div className="scenarioGrid">
+            {scenarioValidation.map((scenario) => (
+              <article key={scenario.scenario_name}>
+                <strong>{scenario.scenario_name}</strong>
+                <span>{scenario.detected ? 'detected' : 'missed'}</span>
+                <span>{scenario.max_risk_level}</span>
+                <span>{scenario.best_anomaly_score.toFixed(4)}</span>
+              </article>
+            ))}
+          </div>
+        </section>
+      ) : null}
+
+
       <pre className="log">{message}</pre>
     </main>
   );
@@ -289,4 +320,8 @@ function formatDuration(seconds: number): string {
   const hours = Math.floor(safeSeconds / 3600);
   const minutes = Math.floor((safeSeconds % 3600) / 60);
   return `${hours}h ${minutes}m`;
+}
+
+function isApiData(value: unknown): value is { data: { scenario_validation?: unknown } } {
+  return typeof value === 'object' && value !== null && 'data' in value;
 }

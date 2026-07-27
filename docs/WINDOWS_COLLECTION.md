@@ -11,9 +11,23 @@ Stage 1 adds opt-in Windows telemetry collection. It is not a Windows Service an
 
 Collected process summaries intentionally exclude command line. General UI summaries do not show raw username, hostname, or full executable paths by default.
 
+## Event Log Cursor
+
+The authentication collector uses the modern Windows Event Log API through pywin32: `EvtQuery`, `EvtNext`, `EvtRender`, and `EvtClose`. On first start it initializes the cursor to the newest existing `EventRecordID`. Polling then queries records with `EventRecordID` greater than the cursor, so the first new event after start is eligible and already processed records are skipped after restart. Event Log handles are closed on success and error paths.
+
+The same parser handles live Event XML and artificial fixtures. Filtering keeps interactive logon types `2`, `7`, `10`, and `11`, excludes `SYSTEM`, `LOCAL SERVICE`, `NETWORK SERVICE`, and machine accounts ending in `$`. If a supported event does not include `LogonType`, the payload omits it instead of inventing `0`.
+
 ## Cumulative vs Continuous
 
 SentinelUEBA tracks cumulative collected duration across sessions separately from the longest continuous session. Reaching 24 cumulative hours is not the same as strict continuous 24-hour validation.
+
+Collection sessions store `last_heartbeat_at` and periodically persisted counters/errors. After a crash or power-off, recovery stops the stale session at the last heartbeat, so time while the computer or app was not running is not counted as collected duration. A session with no available collectors is rejected and does not count.
+
+Process and network collectors use polling. Polling can miss very short-lived processes/connections. Process identity includes PID and process create time, so PID reuse is represented as the old process stopping and a new process starting.
+
+## Demo Scenario Validation
+
+Synthetic demo scenarios are validated after inference by matching the anomaly windows against a separate manifest. The manifest is not passed into model training, feature engineering, or anomaly scoring.
 
 ## Manual Windows Check
 

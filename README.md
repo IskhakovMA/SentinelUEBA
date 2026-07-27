@@ -12,6 +12,7 @@ SentinelUEBA is a local-first Windows-focused UEBA portfolio project. Stage 1 ke
 - 15-minute feature windows for user + host behavior.
 - CPU-friendly PyTorch autoencoder with saved preprocessing and model metadata.
 - Per-feature reconstruction residual explanations.
+- Post-inference validation for all five canonical synthetic demo scenarios.
 - Risk levels: low, medium, high, critical.
 - FastAPI endpoints and a bilingual EN/RU React dashboard.
 
@@ -44,6 +45,8 @@ uv run sentinelueba training-eligibility --dataset real
 Real training is gated by 24 cumulative hours of real non-synthetic telemetry and enough feature windows. Cumulative collection is tracked separately from strict continuous 24-hour validation; the project does not claim continuous validation unless the longest session actually reaches 24 hours.
 
 See [Windows collection](docs/WINDOWS_COLLECTION.md).
+
+Stage 1 persists collection heartbeats. If the application or computer stops, recovery closes the stale session at the last heartbeat, so powered-off time is not counted as collected duration.
 
 ## Architecture
 

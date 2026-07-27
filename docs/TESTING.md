@@ -13,3 +13,5 @@ pnpm --dir frontend build
 
 Tests use synthetic data, temporary SQLite databases, and CPU execution only.
 Windows CI also runs unit tests, PowerShell syntax checks, and a short safe collector smoke without requiring Security Log access.
+
+Stage 1 tests cover Event Log fixture/live parser equivalence through mocks, cursor semantics, handle closure, heartbeat recovery, interruptible stop, PID reuse, migration paths from v1/v2/fresh databases, duplicate counter handling, model SHA-256 validation, and all five canonical demo scenarios.

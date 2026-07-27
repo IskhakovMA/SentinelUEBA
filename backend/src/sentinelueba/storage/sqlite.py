@@ -10,7 +10,7 @@ from typing import Any
 
 from sentinelueba.domain.events import AnomalyRecord, EventType, TelemetryEvent
 
-DB_SCHEMA_VERSION = 2
+DB_SCHEMA_VERSION = 3
 
 
 class SQLiteStorage:
@@ -46,6 +46,9 @@ class SQLiteStorage:
                 version = 1
             if version < 2:
                 self._apply_v2(conn)
+                version = 2
+            if version < 3:
+                self._apply_v3(conn)
 
     def _record_migration(self, conn: sqlite3.Connection, version: int) -> None:
         conn.execute(
@@ -145,17 +148,39 @@ class SQLiteStorage:
         )
         self._record_migration(conn, 2)
 
+    def _apply_v3(self, conn: sqlite3.Connection) -> None:
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(collection_sessions)").fetchall()
+        }
+        if "last_heartbeat_at" not in columns:
+            conn.execute("ALTER TABLE collection_sessions ADD COLUMN last_heartbeat_at TEXT")
+        if "last_successful_collection_at" not in columns:
+            conn.execute(
+                "ALTER TABLE collection_sessions ADD COLUMN "
+                "last_successful_collection_at TEXT"
+            )
+        self._record_migration(conn, 3)
+
     def insert_events(self, events: list[TelemetryEvent]) -> int:
+        inserted, _ = self.insert_events_detailed(events)
+        return inserted
+
+    def insert_events_detailed(
+        self,
+        events: list[TelemetryEvent],
+    ) -> tuple[int, dict[str, int]]:
         with self.connect() as conn:
-            before = conn.total_changes
-            conn.executemany(
-                """
-                INSERT OR IGNORE INTO telemetry_events (
-                    event_id, timestamp, event_type, user_id, host_id, source,
-                    payload_json, synthetic, schema_version
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
+            inserted = 0
+            by_type: dict[str, int] = {}
+            for event in events:
+                cursor = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO telemetry_events (
+                        event_id, timestamp, event_type, user_id, host_id, source,
+                        payload_json, synthetic, schema_version
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
                     (
                         event.event_id,
                         event.timestamp.isoformat(),
@@ -166,11 +191,67 @@ class SQLiteStorage:
                         json.dumps(event.payload, sort_keys=True),
                         int(event.synthetic),
                         event.schema_version,
-                    )
-                    for event in events
-                ],
+                    ),
+                )
+                if cursor.rowcount == 1:
+                    inserted += 1
+                    by_type[event.event_type.value] = by_type.get(event.event_type.value, 0) + 1
+            return inserted, by_type
+
+    def insert_events_and_update_collector_state(
+        self,
+        events: list[TelemetryEvent],
+        collector_id: str,
+        status: str,
+        cursor: dict[str, object],
+        last_error: str | None = None,
+    ) -> tuple[int, dict[str, int]]:
+        with self.connect() as conn:
+            inserted = 0
+            by_type: dict[str, int] = {}
+            for event in events:
+                row = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO telemetry_events (
+                        event_id, timestamp, event_type, user_id, host_id, source,
+                        payload_json, synthetic, schema_version
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event.event_id,
+                        event.timestamp.isoformat(),
+                        event.event_type.value,
+                        event.user_id,
+                        event.host_id,
+                        event.source,
+                        json.dumps(event.payload, sort_keys=True),
+                        int(event.synthetic),
+                        event.schema_version,
+                    ),
+                )
+                if row.rowcount == 1:
+                    inserted += 1
+                    by_type[event.event_type.value] = by_type.get(event.event_type.value, 0) + 1
+            conn.execute(
+                """
+                INSERT INTO collector_state (
+                    collector_id, status, cursor_json, last_error, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(collector_id) DO UPDATE SET
+                    status = excluded.status,
+                    cursor_json = excluded.cursor_json,
+                    last_error = excluded.last_error,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    collector_id,
+                    status,
+                    json.dumps(cursor, sort_keys=True),
+                    last_error,
+                    datetime.now(UTC).isoformat(),
+                ),
             )
-            return int(conn.total_changes - before)
+            return inserted, by_type
 
     def list_events(
         self,
@@ -340,7 +421,8 @@ class SQLiteStorage:
                 INSERT INTO collection_sessions (
                     session_id, started_at, stopped_at, status, collection_mode,
                     enabled_collectors_json, counters_json, errors_json, application_version
-                ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)
+                    , last_heartbeat_at, last_successful_collection_at
+                ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL, NULL)
                 """,
                 (
                     session_id,
@@ -351,6 +433,35 @@ class SQLiteStorage:
                     json.dumps({}),
                     json.dumps([]),
                     application_version,
+                ),
+            )
+
+    def update_session_heartbeat(
+        self,
+        session_id: str,
+        counters: dict[str, int],
+        errors: list[str],
+        successful: bool,
+    ) -> None:
+        now = datetime.now(UTC).isoformat()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE collection_sessions
+                SET last_heartbeat_at = ?,
+                    last_successful_collection_at =
+                        CASE WHEN ? THEN ? ELSE last_successful_collection_at END,
+                    counters_json = ?,
+                    errors_json = ?
+                WHERE session_id = ? AND status = 'running'
+                """,
+                (
+                    now,
+                    int(successful),
+                    now,
+                    json.dumps(counters, sort_keys=True),
+                    json.dumps(errors),
+                    session_id,
                 ),
             )
 
@@ -365,11 +476,16 @@ class SQLiteStorage:
             conn.execute(
                 """
                 UPDATE collection_sessions
-                SET stopped_at = ?, status = ?, counters_json = ?, errors_json = ?
+                SET stopped_at = ?,
+                    last_heartbeat_at = COALESCE(last_heartbeat_at, ?),
+                    status = ?,
+                    counters_json = ?,
+                    errors_json = ?
                 WHERE session_id = ?
                 """,
                 (
-                    datetime.now(UTC).isoformat(),
+                    now := datetime.now(UTC).isoformat(),
+                    now,
                     status,
                     json.dumps(counters, sort_keys=True),
                     json.dumps(errors),
@@ -397,10 +513,10 @@ class SQLiteStorage:
             conn.execute(
                 """
                 UPDATE collection_sessions
-                SET stopped_at = ?, status = 'interrupted'
+                SET stopped_at = COALESCE(last_heartbeat_at, started_at),
+                    status = 'interrupted'
                 WHERE status = 'running'
-                """,
-                (datetime.now(UTC).isoformat(),),
+                """
             )
 
     def event_summary(self) -> dict[str, Any]:
@@ -431,8 +547,12 @@ class SQLiteStorage:
             stop = (
                 datetime.fromisoformat(str(stopped_raw))
                 if stopped_raw
-                else now
+                else datetime.fromisoformat(
+                    str(session.get("last_heartbeat_at") or now.isoformat())
+                )
             )
+            if session["status"] == "running":
+                stop = now
             duration = max(0.0, (stop - start).total_seconds())
             durations.append(duration)
             if session["status"] == "running":
@@ -469,4 +589,6 @@ class SQLiteStorage:
             "counters": json.loads(row["counters_json"]),
             "errors": json.loads(row["errors_json"]),
             "application_version": row["application_version"],
+            "last_heartbeat_at": row["last_heartbeat_at"],
+            "last_successful_collection_at": row["last_successful_collection_at"],
         }

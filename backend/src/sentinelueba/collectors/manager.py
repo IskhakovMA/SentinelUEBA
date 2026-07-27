@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import threading
-import time
 from collections import Counter
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -20,6 +19,16 @@ from sentinelueba.storage.sqlite import SQLiteStorage
 
 
 class CollectionAlreadyRunningError(RuntimeError):
+    pass
+
+
+class NoAvailableCollectorsError(RuntimeError):
+    def __init__(self, capabilities: list[dict[str, Any]]) -> None:
+        super().__init__("no selected collectors are available")
+        self.capabilities = capabilities
+
+
+class CollectionStopTimeoutError(RuntimeError):
     pass
 
 
@@ -79,12 +88,19 @@ class CollectorManager:
             self._stop_event.clear()
             self._counters = Counter()
             self._errors = []
+            self._status = {}
             self._collectors = self.build_collectors(enabled_collectors)
+            capabilities = [
+                collector.check_availability().__dict__
+                for collector in self._collectors
+            ]
             available = [
                 collector
                 for collector in self._collectors
                 if collector.check_availability().status == CollectorStatus.AVAILABLE
             ]
+            if not available:
+                raise NoAvailableCollectorsError(capabilities)
             self._collectors = available
             self._session_id = str(uuid4())
             self.storage.start_session(
@@ -106,6 +122,8 @@ class CollectorManager:
         thread = self._thread
         if thread is not None:
             thread.join(timeout=10)
+            if thread.is_alive():
+                raise CollectionStopTimeoutError("collection thread did not stop within timeout")
         return self.status()
 
     def status(self) -> dict[str, Any]:
@@ -142,8 +160,20 @@ class CollectorManager:
             while not self._stop_event.is_set():
                 if deadline is not None and datetime.now(UTC) >= deadline:
                     break
-                self._collect_once()
-                time.sleep(max(0.1, interval_seconds))
+                successful = self._collect_once()
+                if self._session_id is not None:
+                    self.storage.update_session_heartbeat(
+                        self._session_id,
+                        dict(self._counters),
+                        self._errors,
+                        successful,
+                    )
+                wait_seconds = max(0.1, interval_seconds)
+                if deadline is not None:
+                    remaining = (deadline - datetime.now(UTC)).total_seconds()
+                    wait_seconds = min(wait_seconds, max(0.0, remaining))
+                if self._stop_event.wait(wait_seconds):
+                    break
         except Exception as exc:  # noqa: BLE001
             status = "error"
             self._errors.append(type(exc).__name__)
@@ -172,19 +202,32 @@ class CollectorManager:
                     self._errors,
                 )
 
-    def _collect_once(self) -> None:
+    def _collect_once(self) -> bool:
+        any_success = False
         for collector in self._collectors:
             try:
                 events = normalize_events(collector.collect())
-                inserted = self.storage.insert_events(events)
+                cursor = collector.cursor if hasattr(collector, "cursor") else None
+                if isinstance(cursor, dict):
+                    inserted, by_type = self.storage.insert_events_and_update_collector_state(
+                        events,
+                        collector.collector_id,
+                        "running",
+                        cursor,
+                        None,
+                    )
+                else:
+                    inserted, by_type = self.storage.insert_events_detailed(events)
                 self._counters[collector.collector_id] += inserted
-                for event in events:
-                    self._counters[event.event_type.value] += 1
+                for event_type, count in by_type.items():
+                    self._counters[event_type] += count
                 self._status[collector.collector_id] = collector.health().__dict__
+                any_success = True
             except Exception as exc:  # noqa: BLE001
                 message = f"{collector.collector_id}: {type(exc).__name__}"
                 self._errors.append(message)
                 self.storage.upsert_collector_state(collector.collector_id, "error", {}, message)
+        return any_success
 
 
 _MANAGER: CollectorManager | None = None

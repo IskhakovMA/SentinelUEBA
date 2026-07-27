@@ -60,7 +60,7 @@ def detect_anomalies(
                 risk_level=risk,
                 top_features=top,
                 feature_contributions=contributions[:5],
-                explanation=make_explanation(risk, contributions[:3]),
+                explanation=make_explanation(risk, contributions[:3], preprocessor.dataset_kind),
                 model_version=MODEL_VERSION,
                 window_start=window.window_start,
                 window_end=window.window_end,
@@ -108,11 +108,16 @@ def feature_contributions(
     return sorted(rows, key=lambda item: float(item["contribution"]), reverse=True)
 
 
-def make_explanation(risk: AnomalyRisk, contributions: list[dict[str, float | str]]) -> str:
+def make_explanation(
+    risk: AnomalyRisk,
+    contributions: list[dict[str, float | str]],
+    dataset_kind: str,
+) -> str:
     readable = ", ".join(str(item["feature_name"]) for item in contributions)
+    profile_name = "real local profile" if dataset_kind == "real" else "synthetic profile"
     return (
         f"Statistical anomaly classified as {risk.value}. The strongest deviations from the "
-        f"normal synthetic profile are: {readable}. This is not proof of malicious activity."
+        f"normal {profile_name} are: {readable}. This is not proof of malicious activity."
     )
 
 

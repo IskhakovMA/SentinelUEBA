@@ -15,7 +15,7 @@ from torch import nn
 
 from sentinelueba.features.windows import FEATURE_NAMES
 
-MODEL_VERSION = "autoencoder-stage0-v1"
+MODEL_VERSION = "autoencoder-stage1-v1"
 FEATURE_SCHEMA_VERSION = "feature-windows-v1"
 
 
@@ -166,8 +166,17 @@ def load_model(model_dir: Path) -> tuple[Autoencoder, Preprocessor]:
         )
     if preprocessor.feature_names != FEATURE_NAMES:
         raise ValueError("incompatible feature list in saved preprocessor")
+    info_path = model_dir / "model_info.json"
+    model_path = model_dir / "autoencoder.pt"
+    if info_path.exists():
+        info_payload = json.loads(info_path.read_text())
+        if isinstance(info_payload, dict) and "model_sha256" in info_payload:
+            expected_sha = str(info_payload["model_sha256"])
+            actual_sha = hashlib.sha256(model_path.read_bytes()).hexdigest()
+            if actual_sha != expected_sha:
+                raise ValueError("model SHA-256 mismatch; refusing to load model")
     model = Autoencoder(len(preprocessor.feature_names))
-    state = torch.load(model_dir / "autoencoder.pt", map_location="cpu", weights_only=True)
+    state = torch.load(model_path, map_location="cpu", weights_only=True)
     model.load_state_dict(state)
     model.eval()
     return model, preprocessor

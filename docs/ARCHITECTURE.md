@@ -15,5 +15,9 @@ flowchart LR
   E --> F["PyTorch autoencoder"]
   F --> G["Detection engine"]
   G --> H["FastAPI / CLI / React"]
-  I["Collector state and cursors"] --> H
+  I["Collector state, cursors, heartbeats"] --> H
 ```
+
+Collection-session duration uses persisted heartbeats, not wall-clock gaps between application runs. Stale running sessions are closed at their last heartbeat during recovery.
+
+Demo scenario validation is a post-inference reporting step. It compares the full anomaly list to the synthetic scenario manifest and is not an input to the model or feature pipeline.

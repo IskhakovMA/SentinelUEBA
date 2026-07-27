@@ -3,15 +3,21 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-from sentinelueba.collectors.manager import CollectionAlreadyRunningError, get_manager
+from sentinelueba.collectors.manager import (
+    CollectionAlreadyRunningError,
+    CollectionStopTimeoutError,
+    NoAvailableCollectorsError,
+    get_manager,
+)
 from sentinelueba.config import Settings
 from sentinelueba.detection.engine import detect_anomalies, summarize_scores
+from sentinelueba.detection.scenario_validation import validate_demo_scenarios
 from sentinelueba.domain.events import WindowFeatures
 from sentinelueba.features.windows import build_feature_windows, windows_to_matrix
 from sentinelueba.ml.autoencoder import load_model, model_info, train_autoencoder
 from sentinelueba.normalization.normalizer import normalize_events
 from sentinelueba.storage.sqlite import SQLiteStorage
-from sentinelueba.telemetry.synthetic import generate_synthetic_events
+from sentinelueba.telemetry.synthetic import generate_synthetic_events, scenario_manifest_for_start
 
 
 class DemoPipeline:
@@ -93,12 +99,20 @@ class DemoPipeline:
             range_kind="evaluation",
         )
         self.storage.replace_anomalies(anomalies)
+        anomaly_payload = [item.model_dump(mode="json") for item in anomalies]
+        scenario_validation = []
+        if dataset_kind == "synthetic" and windows:
+            scenario_validation = validate_demo_scenarios(
+                scenario_manifest_for_start(windows[0].window_start),
+                anomaly_payload,
+            )
         return {
             "windows": len(windows),
             "evaluation_windows": len(evaluation_windows),
             "anomalies": len(anomalies),
             "summary": summarize_scores(anomalies),
-            "top_anomalies": [item.model_dump(mode="json") for item in anomalies[:5]],
+            "top_anomalies": anomaly_payload[:5],
+            "scenario_validation": scenario_validation,
         }
 
     def status(self) -> dict[str, object]:
@@ -145,9 +159,16 @@ class DemoPipeline:
             )
         except CollectionAlreadyRunningError as exc:
             raise ValueError(str(exc)) from exc
+        except NoAvailableCollectorsError as exc:
+            raise ValueError(
+                f"{exc}; capabilities={exc.capabilities}"
+            ) from exc
 
     def stop_collection(self) -> dict[str, object]:
-        return get_manager(self.settings).stop()
+        try:
+            return get_manager(self.settings).stop()
+        except CollectionStopTimeoutError as exc:
+            raise ValueError(str(exc)) from exc
 
     def collection_status(self) -> dict[str, object]:
         manager = get_manager(self.settings)

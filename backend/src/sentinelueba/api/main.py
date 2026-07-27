@@ -111,7 +111,10 @@ async def start_collection(request: CollectionStartRequest) -> ApiResponse:
 
 @app.post("/collection/stop", response_model=ApiResponse)
 async def stop_collection() -> ApiResponse:
-    return ApiResponse(data=await run_blocking(pipeline().stop_collection))
+    try:
+        return ApiResponse(data=await run_blocking(pipeline().stop_collection))
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.get("/collection/sessions", response_model=ApiResponse)

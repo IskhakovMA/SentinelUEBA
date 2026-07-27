@@ -19,10 +19,15 @@ from sentinelueba.domain.events import EventType, TelemetryEvent, deterministic_
 @dataclass(frozen=True)
 class ProcessSnapshot:
     pid: int
+    create_time: float
     name: str
     executable_path: str | None
     parent_pid: int | None
     parent_name: str | None
+
+    @property
+    def key(self) -> tuple[int, float]:
+        return (self.pid, self.create_time)
 
 
 def diff_process_snapshots(
@@ -32,6 +37,9 @@ def diff_process_snapshots(
     events: list[tuple[str, ProcessSnapshot]] = []
     for pid, snapshot in current.items():
         if pid not in previous:
+            events.append(("started", snapshot))
+        elif previous[pid].create_time != snapshot.create_time:
+            events.append(("stopped", previous[pid]))
             events.append(("started", snapshot))
     for pid, snapshot in previous.items():
         if pid not in current:
@@ -96,7 +104,7 @@ class ProcessCollector:
 
     def snapshot(self) -> dict[int, ProcessSnapshot]:
         snapshots: dict[int, ProcessSnapshot] = {}
-        for proc in psutil.process_iter(["pid", "name", "exe", "ppid"]):
+        for proc in psutil.process_iter(["pid", "name", "exe", "ppid", "create_time"]):
             try:
                 info: dict[str, Any] = proc.info
                 parent_name = None
@@ -109,6 +117,7 @@ class ProcessCollector:
                 pid = int(info["pid"])
                 snapshots[pid] = ProcessSnapshot(
                     pid=pid,
+                    create_time=float(info.get("create_time") or 0.0),
                     name=str(info.get("name") or "unknown"),
                     executable_path=info.get("exe") if isinstance(info.get("exe"), str) else None,
                     parent_pid=parent_pid if isinstance(parent_pid, int) else None,
@@ -129,7 +138,14 @@ class ProcessCollector:
         }
         return TelemetryEvent(
             event_id=deterministic_event_id(
-                [self.collector_id, timestamp.isoformat(), action, str(snapshot.pid), snapshot.name]
+                [
+                    self.collector_id,
+                    timestamp.isoformat(),
+                    action,
+                    str(snapshot.pid),
+                    str(snapshot.create_time),
+                    snapshot.name,
+                ]
             ),
             timestamp=timestamp,
             event_type=EventType.PROCESS,

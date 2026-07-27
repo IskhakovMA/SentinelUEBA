@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import sqlite3
+import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -16,7 +18,11 @@ from sentinelueba.collectors.base import (
     PrivilegeLevel,
 )
 from sentinelueba.collectors.identity import IdentityProvider
-from sentinelueba.collectors.manager import CollectionAlreadyRunningError, CollectorManager
+from sentinelueba.collectors.manager import (
+    CollectionAlreadyRunningError,
+    CollectorManager,
+    NoAvailableCollectorsError,
+)
 from sentinelueba.collectors.network import NetworkSnapshot, diff_network_snapshots
 from sentinelueba.collectors.process import ProcessSnapshot, diff_process_snapshots
 from sentinelueba.collectors.system_metrics import SystemMetricsCollector
@@ -25,7 +31,7 @@ from sentinelueba.config import Settings
 from sentinelueba.detection.engine import detect_anomalies
 from sentinelueba.domain.events import EventType, TelemetryEvent, deterministic_event_id
 from sentinelueba.features.windows import build_feature_windows, windows_to_matrix
-from sentinelueba.ml.autoencoder import train_autoencoder
+from sentinelueba.ml.autoencoder import load_model, train_autoencoder
 from sentinelueba.services.pipeline import DemoPipeline
 from sentinelueba.storage.sqlite import SQLiteStorage
 from sentinelueba.telemetry.synthetic import generate_synthetic_events
@@ -54,11 +60,20 @@ def event(index: int, synthetic: bool = False) -> TelemetryEvent:
 
 
 def test_process_snapshot_diff() -> None:
-    previous = {1: ProcessSnapshot(1, "a.exe", None, None, None)}
-    current = {2: ProcessSnapshot(2, "b.exe", None, 1, "a.exe")}
+    previous = {1: ProcessSnapshot(1, 10.0, "a.exe", None, None, None)}
+    current = {2: ProcessSnapshot(2, 20.0, "b.exe", None, 1, "a.exe")}
     assert diff_process_snapshots(previous, current) == [
         ("started", current[2]),
         ("stopped", previous[1]),
+    ]
+
+
+def test_process_snapshot_diff_handles_pid_reuse() -> None:
+    previous = {10: ProcessSnapshot(10, 100.0, "old.exe", None, None, None)}
+    current = {10: ProcessSnapshot(10, 200.0, "new.exe", None, None, None)}
+    assert diff_process_snapshots(previous, current) == [
+        ("stopped", previous[10]),
+        ("started", current[10]),
     ]
 
 
@@ -96,6 +111,45 @@ def test_windows_auth_fixture_parser_and_cursor() -> None:
     duplicate = collector.event_from_fixture(fixture, datetime.now(UTC))
     assert first is not None
     assert duplicate is None
+    assert "logon_type" in first.payload
+
+
+def test_windows_auth_parser_filters_accounts_and_logon_types() -> None:
+    base = {"EventID": 4624, "RecordID": 1, "LogonType": 2, "TargetUserName": "analyst"}
+    assert parse_auth_fixture(base) is not None
+    assert parse_auth_fixture(base | {"LogonType": 3}) is None
+    assert parse_auth_fixture(base | {"TargetUserName": "SYSTEM"}) is None
+    assert parse_auth_fixture(base | {"TargetUserName": "HOST$"}) is None
+
+
+def test_windows_auth_evt_query_cursor_and_handles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_evt = FakeEvtModule(
+        [
+            auth_xml(100, 4624, "existing", 2),
+            auth_xml(101, 4624, "analyst", 2),
+            auth_xml(102, 4624, "service", 3),
+        ]
+    )
+    monkeypatch.setattr("platform.system", lambda: "Windows")
+    monkeypatch.setitem(sys.modules, "win32evtlog", fake_evt)
+    collector = WindowsAuthCollector("u", "h")
+    collector.start()
+    assert collector.cursor["last_record_id"] == 102
+    fake_evt.records.append(auth_xml(103, 4625, "analyst", 2, status="0xC000006D"))
+    events = collector.collect()
+    assert [event.payload["record_id"] for event in events] == [103]
+    assert collector.cursor["last_record_id"] == 103
+    assert fake_evt.closed
+
+
+def test_windows_auth_permission_required(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_evt = FakeEvtModule([], permission_error=True)
+    monkeypatch.setattr("platform.system", lambda: "Windows")
+    monkeypatch.setitem(sys.modules, "win32evtlog", fake_evt)
+    capability = WindowsAuthCollector("u", "h").check_availability()
+    assert capability.status == CollectorStatus.PERMISSION_REQUIRED
 
 
 def test_identity_pseudonymization_uses_local_secret(tmp_path: Path) -> None:
@@ -107,7 +161,7 @@ def test_identity_pseudonymization_uses_local_secret(tmp_path: Path) -> None:
     assert not first[0].startswith("maksut")
 
 
-def test_migration_v1_to_v2_preserves_events(tmp_path: Path) -> None:
+def test_migration_v1_to_current_preserves_events(tmp_path: Path) -> None:
     db = tmp_path / "v1.sqlite3"
     conn = sqlite3.connect(db)
     conn.execute(
@@ -151,11 +205,67 @@ def test_migration_v1_to_v2_preserves_events(tmp_path: Path) -> None:
     conn.close()
     store = SQLiteStorage(db)
     store.initialize()
-    assert store.status()["schema_version"] == 2
+    assert store.status()["schema_version"] == 3
     assert store.status()["event_count"] == 1
     assert "collection_sessions" in {
         row[0] for row in sqlite3.connect(db).execute("SELECT name FROM sqlite_master")
     }
+
+
+def test_migration_v2_to_current_adds_heartbeat(tmp_path: Path) -> None:
+    db = tmp_path / "v2.sqlite3"
+    store = SQLiteStorage(db)
+    store.initialize()
+    conn = sqlite3.connect(db)
+    conn.execute("DELETE FROM schema_version WHERE version = 3")
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(collection_sessions)")]
+    if "last_heartbeat_at" in columns:
+        conn.execute("ALTER TABLE collection_sessions RENAME TO collection_sessions_old")
+        conn.execute(
+            """
+            CREATE TABLE collection_sessions (
+                session_id TEXT PRIMARY KEY, started_at TEXT NOT NULL, stopped_at TEXT,
+                status TEXT NOT NULL, collection_mode TEXT NOT NULL,
+                enabled_collectors_json TEXT NOT NULL, counters_json TEXT NOT NULL,
+                errors_json TEXT NOT NULL, application_version TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("DROP TABLE collection_sessions_old")
+    conn.commit()
+    conn.close()
+    store.initialize()
+    columns = {
+        row[1] for row in sqlite3.connect(db).execute("PRAGMA table_info(collection_sessions)")
+    }
+    assert "last_heartbeat_at" in columns
+    assert store.status()["schema_version"] == 3
+
+
+def test_downtime_after_heartbeat_is_not_counted(tmp_path: Path) -> None:
+    store = SQLiteStorage(tmp_path / "downtime.sqlite3")
+    store.initialize()
+    conn = sqlite3.connect(store.database_path)
+    conn.execute(
+        """
+        INSERT INTO collection_sessions (
+            session_id, started_at, stopped_at, status, collection_mode,
+            enabled_collectors_json, counters_json, errors_json, application_version,
+            last_heartbeat_at, last_successful_collection_at
+        ) VALUES (?, ?, NULL, 'running', 'real', '[]', '{}', '[]', 'test', ?, ?)
+        """,
+        (
+            "s1",
+            "2026-01-01T00:00:00+00:00",
+            "2026-01-01T00:00:10+00:00",
+            "2026-01-01T00:00:10+00:00",
+        ),
+    )
+    conn.commit()
+    conn.close()
+    store.mark_stale_running_sessions()
+    progress = store.collection_progress()
+    assert progress["cumulative_collected_seconds"] == 10
 
 
 class FakeCollector:
@@ -196,9 +306,25 @@ class FakeCollector:
         return [event(self.events, synthetic=False)]
 
 
+class UnavailableCollector(FakeCollector):
+    collector_id = "fake.unavailable"
+
+    def check_availability(self) -> CollectorCapability:
+        return CollectorCapability(
+            self.collector_id,
+            self.version,
+            CollectorStatus.UNAVAILABLE,
+            self.required_privilege,
+            "fake unavailable",
+        )
+
+
 def test_collector_failure_isolation_and_collection_smoke(tmp_path: Path) -> None:
     manager = CollectorManager(settings(tmp_path))
-    manager.build_collectors = lambda enabled=None: [FakeCollector(), FakeCollector(fail=True)]  # type: ignore[method-assign]
+    manager.build_collectors = lambda enabled=None: [  # type: ignore[method-assign]
+        FakeCollector(),
+        FakeCollector(fail=True),
+    ]
     manager.start(duration_seconds=1, interval_seconds=0.1)
     time.sleep(1.3)
     status = manager.status()
@@ -206,6 +332,14 @@ def test_collector_failure_isolation_and_collection_smoke(tmp_path: Path) -> Non
     assert status["counters"]["fake.collector"] >= 1
     assert status["errors"]
     assert manager.progress()["cumulative_collected_seconds"] > 0
+
+
+def test_empty_collection_session_is_rejected(tmp_path: Path) -> None:
+    manager = CollectorManager(settings(tmp_path))
+    manager.build_collectors = lambda enabled=None: [UnavailableCollector()]  # type: ignore[method-assign]
+    with pytest.raises(NoAvailableCollectorsError):
+        manager.start(duration_seconds=1)
+    assert manager.sessions() == []
 
 
 def test_concurrent_start_rejection(tmp_path: Path) -> None:
@@ -217,12 +351,29 @@ def test_concurrent_start_rejection(tmp_path: Path) -> None:
     manager.stop()
 
 
+def test_stop_interrupts_large_polling_interval(tmp_path: Path) -> None:
+    manager = CollectorManager(settings(tmp_path))
+    manager.build_collectors = lambda enabled=None: [FakeCollector()]  # type: ignore[method-assign]
+    manager.start(interval_seconds=60)
+    time.sleep(0.2)
+    start = time.monotonic()
+    status = manager.stop()
+    elapsed = time.monotonic() - start
+    assert elapsed < 2
+    assert status["running"] is False
+    assert manager.sessions()[0]["status"] == "stopped"
+    assert manager.sessions()[0]["stopped_at"] is not None
+
+
 def test_real_synthetic_dataset_separation(tmp_path: Path) -> None:
     store = SQLiteStorage(tmp_path / "events.sqlite3")
     store.initialize()
     store.insert_events([event(1, synthetic=True), event(2, synthetic=False)])
     assert len(store.list_events(synthetic=True)) == 1
     assert len(store.list_events(synthetic=False)) == 1
+    inserted, by_type = store.insert_events_detailed([event(2, synthetic=False)])
+    assert inserted == 0
+    assert by_type == {}
 
 
 def test_per_feature_reconstruction_contributions(tmp_path: Path) -> None:
@@ -248,20 +399,31 @@ def test_per_feature_reconstruction_contributions(tmp_path: Path) -> None:
     } <= set(contribution)
 
 
-def test_demo_scenario_manifest_windows_are_detected_or_reported(tmp_path: Path) -> None:
+def test_model_sha256_mismatch_is_rejected(tmp_path: Path) -> None:
+    normal_events = generate_synthetic_events(seed=42, include_anomalies=False)[0]
+    windows = build_feature_windows(normal_events)
+    train_autoencoder(windows_to_matrix(windows[:24]), tmp_path / "model", epochs=8)
+    model_path = tmp_path / "model" / "autoencoder.pt"
+    model_path.write_bytes(model_path.read_bytes() + b"tamper")
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        load_model(tmp_path / "model")
+
+
+def test_demo_scenario_manifest_windows_are_all_detected(tmp_path: Path) -> None:
     pipe = DemoPipeline(settings(tmp_path))
-    generated = pipe.generate_demo_data(seed=42)
+    pipe.generate_demo_data(seed=42)
     pipe.train(seed=42)
     detected = pipe.detect()
-    detected_windows = {item["window_start"] for item in detected["top_anomalies"]}
-    manifest = generated["scenario_manifest"]
-    assert len(manifest) == 5
-    missed = [
-        item["name"]
-        for item in manifest
-        if item["window_start"].replace("+00:00", "Z") not in detected_windows
-    ]
-    assert len(missed) < 5
+    validation = detected["scenario_validation"]
+    assert len(validation) == 5
+    assert {item["scenario_name"] for item in validation} == {
+        "rare_process",
+        "outbound_connection_spike",
+        "atypical_time_activity",
+        "cpu_ram_spike",
+        "failed_login_series",
+    }
+    assert all(item["detected"] is True for item in validation)
 
 
 def test_api_stage1_endpoints(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -276,3 +438,71 @@ def test_api_stage1_endpoints(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     eligibility = client.post("/training/eligibility", json={"dataset_kind": "real"}).json()["data"]
     assert eligibility["eligible"] is False
     assert "24 cumulative hours" in eligibility["reason"]
+
+
+class FakeEvtModule(SimpleNamespace):
+    EvtQueryChannelPath = 1
+    EvtQueryReverseDirection = 2
+    EvtRenderEventXml = 1
+
+    def __init__(self, records: list[str], permission_error: bool = False) -> None:
+        super().__init__()
+        self.records = records
+        self.permission_error = permission_error
+        self.closed: list[object] = []
+
+    def EvtQuery(self, channel: str, query: str, flags: int) -> dict[str, object]:
+        if self.permission_error:
+            raise PermissionError("denied")
+        return {"query": query, "flags": flags}
+
+    def EvtNext(self, handle: dict[str, object], count: int) -> list[dict[str, object]]:
+        last_record_id = int(str(handle["query"]).split("EventRecordID>")[1].split("]")[0])
+        records = [
+            {"xml": xml, "id": record_id_from_xml(xml)}
+            for xml in self.records
+            if record_id_from_xml(xml) > last_record_id
+        ]
+        if int(handle["flags"]) & self.EvtQueryReverseDirection:
+            records = list(reversed(records[:]))
+        batch = records[:count]
+        batch_ids = {record["id"] for record in batch}
+        self.records = [
+            xml for xml in self.records if record_id_from_xml(xml) not in batch_ids
+        ]
+        return batch
+
+    def EvtRender(self, handle: dict[str, object], flags: int) -> str:
+        return str(handle["xml"])
+
+    def EvtClose(self, handle: object) -> None:
+        self.closed.append(handle)
+
+
+def auth_xml(
+    record_id: int,
+    event_id: int,
+    user: str,
+    logon_type: int | None,
+    status: str = "",
+) -> str:
+    logon = "" if logon_type is None else f'<Data Name="LogonType">{logon_type}</Data>'
+    return f"""
+    <Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+      <System>
+        <EventID>{event_id}</EventID>
+        <TimeCreated SystemTime="2026-01-01T00:00:00.000000Z" />
+        <EventRecordID>{record_id}</EventRecordID>
+      </System>
+      <EventData>
+        <Data Name="TargetUserName">{user}</Data>
+        <Data Name="TargetDomainName">DEMO</Data>
+        {logon}
+        <Data Name="Status">{status}</Data>
+      </EventData>
+    </Event>
+    """
+
+
+def record_id_from_xml(xml: str) -> int:
+    return int(xml.split("<EventRecordID>")[1].split("</EventRecordID>")[0])

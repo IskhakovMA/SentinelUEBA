@@ -136,7 +136,8 @@ button:hover {
   gap: 10px;
 }
 
-.collectorGrid article {
+.collectorGrid article,
+.scenarioGrid article {
   border: 1px solid #34414d;
   border-radius: 7px;
   padding: 10px;
@@ -145,8 +146,15 @@ button:hover {
   min-height: 112px;
 }
 
+.scenarioGrid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+}
+
 .collectorGrid strong,
-.collectorGrid small {
+.collectorGrid small,
+.scenarioGrid strong {
   overflow-wrap: anywhere;
 }
 
@@ -263,7 +271,8 @@ button:hover {
 
   .metrics,
   .grid,
-  .collectorGrid {
+  .collectorGrid,
+  .scenarioGrid {
     grid-template-columns: 1fr;
   }
 }

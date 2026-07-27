@@ -14,3 +14,5 @@ Repository rules:
 - no identity secret.
 
 Stage 1 does not collect command lines, file contents, active windows, browser history, clipboard contents, keystrokes, packet payloads, or traffic payloads.
+
+Windows authentication collection stores Security Event Log metadata only for supported interactive logon/logoff events. It does not change Windows audit policy.
