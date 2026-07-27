@@ -9,8 +9,14 @@ from pathlib import Path
 from typing import Any
 
 from sentinelueba.domain.events import AnomalyRecord, EventType, TelemetryEvent
+from sentinelueba.validation import (
+    EVENT_SCHEMA_VERSION,
+    ValidationFailure,
+    payload_hash,
+    validate_event,
+)
 
-DB_SCHEMA_VERSION = 3
+DB_SCHEMA_VERSION = 4
 
 
 class SQLiteStorage:
@@ -49,6 +55,9 @@ class SQLiteStorage:
                 version = 2
             if version < 3:
                 self._apply_v3(conn)
+                version = 3
+            if version < 4:
+                self._apply_v4(conn)
 
     def _record_migration(self, conn: sqlite3.Connection, version: int) -> None:
         conn.execute(
@@ -162,6 +171,156 @@ class SQLiteStorage:
             )
         self._record_migration(conn, 3)
 
+    def _apply_v4(self, conn: sqlite3.Connection) -> None:
+        event_columns = self._columns(conn, "telemetry_events")
+        metadata_columns = {
+            "ingested_at": "TEXT",
+            "collection_session_id": "TEXT",
+            "collector_id": "TEXT",
+            "collector_version": "TEXT",
+            "validation_status": "TEXT",
+            "payload_hash": "TEXT",
+            "event_schema_version": "TEXT",
+        }
+        for column, column_type in metadata_columns.items():
+            if column not in event_columns:
+                conn.execute(f"ALTER TABLE telemetry_events ADD COLUMN {column} {column_type}")
+        now = datetime.now(UTC).isoformat()
+        rows = conn.execute(
+            """
+            SELECT event_id, payload_json, source, schema_version
+            FROM telemetry_events
+            """
+        ).fetchall()
+        for row in rows:
+            try:
+                parsed_payload = json.loads(row["payload_json"])
+                parsed_hash = payload_hash(
+                    parsed_payload if isinstance(parsed_payload, dict) else {}
+                )
+            except (TypeError, ValueError):
+                parsed_hash = ""
+            conn.execute(
+                """
+                UPDATE telemetry_events
+                SET ingested_at = COALESCE(ingested_at, ?),
+                    collector_id = COALESCE(collector_id, source),
+                    collector_version = COALESCE(collector_version, 'unknown'),
+                    validation_status = COALESCE(validation_status, 'accepted'),
+                    payload_hash = COALESCE(payload_hash, ?),
+                    event_schema_version = COALESCE(event_schema_version, schema_version)
+                WHERE event_id = ?
+                """,
+                (now, parsed_hash, row["event_id"]),
+            )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS quarantined_events (
+                quarantine_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                received_at TEXT NOT NULL,
+                collector_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                event_schema_version TEXT NOT NULL,
+                error_class TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                safe_event_json TEXT NOT NULL,
+                payload_hash TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS feature_windows (
+                window_id TEXT PRIMARY KEY,
+                dataset_kind TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                host_id TEXT NOT NULL,
+                window_start TEXT NOT NULL,
+                window_end TEXT NOT NULL,
+                feature_schema_version TEXT NOT NULL,
+                window_size_minutes INTEGER NOT NULL,
+                features_json TEXT NOT NULL,
+                event_count INTEGER NOT NULL,
+                event_counts_json TEXT NOT NULL,
+                collector_coverage_json TEXT NOT NULL,
+                quality_status TEXT NOT NULL,
+                quality_reasons_json TEXT NOT NULL,
+                gap_duration_seconds REAL NOT NULL,
+                finalized INTEGER NOT NULL,
+                source_event_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(dataset_kind, user_id, host_id, window_start, feature_schema_version)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS feature_materialization_state (
+                dataset_kind TEXT PRIMARY KEY,
+                watermark TEXT,
+                last_materialized_at TEXT NOT NULL,
+                late_event_interval_minutes INTEGER NOT NULL,
+                window_size_minutes INTEGER NOT NULL,
+                baseline_state_json TEXT NOT NULL,
+                last_rebuild_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS data_quality_runs (
+                run_id TEXT PRIMARY KEY,
+                dataset_kind TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                summary_json TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dataset_snapshots (
+                dataset_id TEXT PRIMARY KEY,
+                dataset_kind TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                manifest_json TEXT NOT NULL,
+                manifest_sha256 TEXT NOT NULL,
+                parquet_sha256 TEXT NOT NULL,
+                feature_schema_version TEXT NOT NULL,
+                profile_json TEXT NOT NULL,
+                start_at TEXT NOT NULL,
+                end_at TEXT NOT NULL,
+                window_count INTEGER NOT NULL,
+                status TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_ingested_at "
+            "ON telemetry_events(ingested_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_dataset_time "
+            "ON telemetry_events(synthetic, timestamp)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_quarantine_received "
+            "ON quarantined_events(received_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_windows_kind_time "
+            "ON feature_windows(dataset_kind, window_start)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_windows_quality "
+            "ON feature_windows(dataset_kind, quality_status)"
+        )
+        self._record_migration(conn, 4)
+
+    def _columns(self, conn: sqlite3.Connection, table: str) -> set[str]:
+        return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
     def insert_events(self, events: list[TelemetryEvent]) -> int:
         inserted, _ = self.insert_events_detailed(events)
         return inserted
@@ -170,16 +329,41 @@ class SQLiteStorage:
         self,
         events: list[TelemetryEvent],
     ) -> tuple[int, dict[str, int]]:
+        return self._insert_events_with_metadata(events)
+
+    def _insert_events_with_metadata(
+        self,
+        events: list[TelemetryEvent],
+        *,
+        collection_session_id: str | None = None,
+        collector_id: str | None = None,
+        collector_version: str | None = None,
+    ) -> tuple[int, dict[str, int]]:
         with self.connect() as conn:
             inserted = 0
             by_type: dict[str, int] = {}
             for event in events:
+                validation = validate_event(event)
+                if isinstance(validation, ValidationFailure):
+                    self._insert_quarantine_row(
+                        conn,
+                        event,
+                        validation.reason,
+                        validation.error_class,
+                        validation.safe_event,
+                        validation.payload_hash,
+                        collector_id or event.source,
+                    )
+                    continue
+                event = validation.event
                 cursor = conn.execute(
                     """
                     INSERT OR IGNORE INTO telemetry_events (
                         event_id, timestamp, event_type, user_id, host_id, source,
-                        payload_json, synthetic, schema_version
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        payload_json, synthetic, schema_version, ingested_at,
+                        collection_session_id, collector_id, collector_version,
+                        validation_status, payload_hash, event_schema_version
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         event.event_id,
@@ -191,6 +375,13 @@ class SQLiteStorage:
                         json.dumps(event.payload, sort_keys=True),
                         int(event.synthetic),
                         event.schema_version,
+                        datetime.now(UTC).isoformat(),
+                        collection_session_id,
+                        collector_id or event.source,
+                        collector_version or "unknown",
+                        "accepted",
+                        validation.payload_hash,
+                        validation.event_schema_version,
                     ),
                 )
                 if cursor.rowcount == 1:
@@ -205,17 +396,34 @@ class SQLiteStorage:
         status: str,
         cursor: dict[str, object],
         last_error: str | None = None,
+        collection_session_id: str | None = None,
+        collector_version: str | None = None,
     ) -> tuple[int, dict[str, int]]:
         with self.connect() as conn:
             inserted = 0
             by_type: dict[str, int] = {}
             for event in events:
+                validation = validate_event(event)
+                if isinstance(validation, ValidationFailure):
+                    self._insert_quarantine_row(
+                        conn,
+                        event,
+                        validation.reason,
+                        validation.error_class,
+                        validation.safe_event,
+                        validation.payload_hash,
+                        collector_id,
+                    )
+                    continue
+                event = validation.event
                 row = conn.execute(
                     """
                     INSERT OR IGNORE INTO telemetry_events (
                         event_id, timestamp, event_type, user_id, host_id, source,
-                        payload_json, synthetic, schema_version
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        payload_json, synthetic, schema_version, ingested_at,
+                        collection_session_id, collector_id, collector_version,
+                        validation_status, payload_hash, event_schema_version
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         event.event_id,
@@ -227,6 +435,13 @@ class SQLiteStorage:
                         json.dumps(event.payload, sort_keys=True),
                         int(event.synthetic),
                         event.schema_version,
+                        datetime.now(UTC).isoformat(),
+                        collection_session_id,
+                        collector_id,
+                        collector_version or getattr(event, "version", "unknown"),
+                        "accepted",
+                        validation.payload_hash,
+                        validation.event_schema_version,
                     ),
                 )
                 if row.rowcount == 1:
@@ -252,6 +467,36 @@ class SQLiteStorage:
                 ),
             )
             return inserted, by_type
+
+    def _insert_quarantine_row(
+        self,
+        conn: sqlite3.Connection,
+        event: TelemetryEvent,
+        reason: str,
+        error_class: str,
+        safe_event: dict[str, Any],
+        event_payload_hash: str,
+        collector_id: str,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO quarantined_events (
+                received_at, collector_id, source, event_type, event_schema_version,
+                error_class, reason, safe_event_json, payload_hash
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.now(UTC).isoformat(),
+                collector_id,
+                event.source,
+                event.event_type.value,
+                EVENT_SCHEMA_VERSION,
+                error_class,
+                reason[:1000],
+                json.dumps(safe_event, sort_keys=True),
+                event_payload_hash,
+            ),
+        )
 
     def list_events(
         self,
@@ -292,6 +537,274 @@ class SQLiteStorage:
                 synthetic=bool(row["synthetic"]),
                 schema_version=row["schema_version"],
             )
+            for row in rows
+        ]
+
+    def list_event_rows(
+        self,
+        *,
+        synthetic: bool | None = None,
+        since: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if synthetic is not None:
+            clauses.append("synthetic = ?")
+            params.append(int(synthetic))
+        if since is not None:
+            clauses.append("timestamp >= ?")
+            params.append(since.isoformat())
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM telemetry_events {where} ORDER BY timestamp ASC, event_id ASC",
+                params,
+            ).fetchall()
+        output: list[dict[str, Any]] = []
+        for row in rows:
+            output.append(
+                {
+                    "event": TelemetryEvent(
+                        event_id=row["event_id"],
+                        timestamp=datetime.fromisoformat(row["timestamp"]),
+                        event_type=EventType(row["event_type"]),
+                        user_id=row["user_id"],
+                        host_id=row["host_id"],
+                        source=row["source"],
+                        payload=json.loads(row["payload_json"]),
+                        synthetic=bool(row["synthetic"]),
+                        schema_version=row["schema_version"],
+                    ),
+                    "ingested_at": row["ingested_at"],
+                    "collection_session_id": row["collection_session_id"],
+                    "collector_id": row["collector_id"],
+                    "collector_version": row["collector_version"],
+                    "validation_status": row["validation_status"],
+                    "payload_hash": row["payload_hash"],
+                    "event_schema_version": row["event_schema_version"],
+                }
+            )
+        return output
+
+    def upsert_feature_windows(self, windows: list[dict[str, Any]]) -> int:
+        with self.connect() as conn:
+            count = 0
+            for window in windows:
+                now = datetime.now(UTC).isoformat()
+                existing = conn.execute(
+                    "SELECT created_at FROM feature_windows WHERE window_id = ?",
+                    (window["window_id"],),
+                ).fetchone()
+                created_at = existing["created_at"] if existing is not None else now
+                conn.execute(
+                    """
+                    INSERT INTO feature_windows (
+                        window_id, dataset_kind, user_id, host_id, window_start, window_end,
+                        feature_schema_version, window_size_minutes, features_json,
+                        event_count, event_counts_json, collector_coverage_json,
+                        quality_status, quality_reasons_json, gap_duration_seconds,
+                        finalized, source_event_hash, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(window_id) DO UPDATE SET
+                        features_json = excluded.features_json,
+                        event_count = excluded.event_count,
+                        event_counts_json = excluded.event_counts_json,
+                        collector_coverage_json = excluded.collector_coverage_json,
+                        quality_status = excluded.quality_status,
+                        quality_reasons_json = excluded.quality_reasons_json,
+                        gap_duration_seconds = excluded.gap_duration_seconds,
+                        finalized = excluded.finalized,
+                        source_event_hash = excluded.source_event_hash,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        window["window_id"],
+                        window["dataset_kind"],
+                        window["user_id"],
+                        window["host_id"],
+                        window["window_start"],
+                        window["window_end"],
+                        window["feature_schema_version"],
+                        window["window_size_minutes"],
+                        json.dumps(window["features"], sort_keys=True),
+                        window["event_count"],
+                        json.dumps(window["event_counts"], sort_keys=True),
+                        json.dumps(window["collector_coverage"], sort_keys=True),
+                        window["quality_status"],
+                        json.dumps(window["quality_reasons"], sort_keys=True),
+                        window["gap_duration_seconds"],
+                        int(window["finalized"]),
+                        window["source_event_hash"],
+                        created_at,
+                        now,
+                    ),
+                )
+                count += 1
+            return count
+
+    def delete_feature_windows(
+        self,
+        dataset_kind: str,
+        *,
+        from_start: datetime | None = None,
+    ) -> int:
+        clauses = ["dataset_kind = ?"]
+        params: list[object] = [dataset_kind]
+        if from_start is not None:
+            clauses.append("window_start >= ?")
+            params.append(from_start.isoformat())
+        with self.connect() as conn:
+            row = conn.execute(
+                f"DELETE FROM feature_windows WHERE {' AND '.join(clauses)}",
+                params,
+            )
+            return int(row.rowcount)
+
+    def list_feature_windows(
+        self,
+        *,
+        dataset_kind: str | None = None,
+        quality_status: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if dataset_kind is not None:
+            clauses.append("dataset_kind = ?")
+            params.append(dataset_kind)
+        if quality_status:
+            placeholders = ", ".join("?" for _ in quality_status)
+            clauses.append(f"quality_status IN ({placeholders})")
+            params.extend(sorted(quality_status))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM feature_windows {where} ORDER BY window_start ASC, window_id ASC",
+                params,
+            ).fetchall()
+        return [self._feature_window_row(row) for row in rows]
+
+    def feature_window_summary(self) -> dict[str, Any]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT dataset_kind, quality_status, COUNT(*) AS count
+                FROM feature_windows
+                GROUP BY dataset_kind, quality_status
+                """
+            ).fetchall()
+        summary: dict[str, Any] = {"synthetic": {}, "real": {}}
+        for row in rows:
+            summary.setdefault(row["dataset_kind"], {})[row["quality_status"]] = row["count"]
+        return summary
+
+    def get_materialization_state(self, dataset_kind: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM feature_materialization_state WHERE dataset_kind = ?",
+                (dataset_kind,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "dataset_kind": row["dataset_kind"],
+            "watermark": row["watermark"],
+            "last_materialized_at": row["last_materialized_at"],
+            "late_event_interval_minutes": row["late_event_interval_minutes"],
+            "window_size_minutes": row["window_size_minutes"],
+            "baseline_state": json.loads(row["baseline_state_json"]),
+            "last_rebuild_at": row["last_rebuild_at"],
+        }
+
+    def upsert_materialization_state(
+        self,
+        dataset_kind: str,
+        *,
+        watermark: datetime | None,
+        late_event_interval_minutes: int,
+        window_size_minutes: int,
+        baseline_state: dict[str, Any],
+        rebuilt: bool = False,
+    ) -> None:
+        now = datetime.now(UTC).isoformat()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO feature_materialization_state (
+                    dataset_kind, watermark, last_materialized_at,
+                    late_event_interval_minutes, window_size_minutes,
+                    baseline_state_json, last_rebuild_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(dataset_kind) DO UPDATE SET
+                    watermark = excluded.watermark,
+                    last_materialized_at = excluded.last_materialized_at,
+                    late_event_interval_minutes = excluded.late_event_interval_minutes,
+                    window_size_minutes = excluded.window_size_minutes,
+                    baseline_state_json = excluded.baseline_state_json,
+                    last_rebuild_at = COALESCE(excluded.last_rebuild_at, last_rebuild_at)
+                """,
+                (
+                    dataset_kind,
+                    watermark.isoformat() if watermark else None,
+                    now,
+                    late_event_interval_minutes,
+                    window_size_minutes,
+                    json.dumps(baseline_state, sort_keys=True),
+                    now if rebuilt else None,
+                ),
+            )
+
+    def register_dataset_snapshot(self, manifest: dict[str, Any], manifest_sha256: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO dataset_snapshots (
+                    dataset_id, dataset_kind, created_at, manifest_json, manifest_sha256,
+                    parquet_sha256, feature_schema_version, profile_json, start_at, end_at,
+                    window_count, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    manifest["dataset_id"],
+                    manifest["dataset_kind"],
+                    manifest["created_at"],
+                    json.dumps(manifest, sort_keys=True),
+                    manifest_sha256,
+                    manifest["parquet_sha256"],
+                    manifest["feature_schema_version"],
+                    json.dumps(manifest["profile"], sort_keys=True),
+                    manifest["start"],
+                    manifest["end"],
+                    manifest["window_count"],
+                    "created",
+                ),
+            )
+
+    def list_dataset_snapshots(self, dataset_kind: str | None = None) -> list[dict[str, Any]]:
+        params: list[object] = []
+        where = ""
+        if dataset_kind is not None:
+            where = "WHERE dataset_kind = ?"
+            params.append(dataset_kind)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM dataset_snapshots {where} ORDER BY created_at DESC",
+                params,
+            ).fetchall()
+        return [
+            {
+                "dataset_id": row["dataset_id"],
+                "dataset_kind": row["dataset_kind"],
+                "created_at": row["created_at"],
+                "manifest": json.loads(row["manifest_json"]),
+                "manifest_sha256": row["manifest_sha256"],
+                "parquet_sha256": row["parquet_sha256"],
+                "feature_schema_version": row["feature_schema_version"],
+                "profile": json.loads(row["profile_json"]),
+                "start": row["start_at"],
+                "end": row["end_at"],
+                "window_count": row["window_count"],
+                "status": row["status"],
+            }
             for row in rows
         ]
 
@@ -352,6 +865,95 @@ class SQLiteStorage:
         with self.connect() as conn:
             conn.execute("DELETE FROM anomalies")
             conn.execute("DELETE FROM telemetry_events WHERE synthetic = 1")
+            conn.execute("DELETE FROM feature_windows WHERE dataset_kind = 'synthetic'")
+
+    def quarantine_summary(self) -> dict[str, Any]:
+        with self.connect() as conn:
+            total = conn.execute("SELECT COUNT(*) FROM quarantined_events").fetchone()[0]
+            rows = conn.execute(
+                """
+                SELECT event_type, error_class, COUNT(*) AS count
+                FROM quarantined_events
+                GROUP BY event_type, error_class
+                ORDER BY count DESC
+                """
+            ).fetchall()
+        return {
+            "count": total,
+            "by_reason": [
+                {
+                    "event_type": row["event_type"],
+                    "error_class": row["error_class"],
+                    "count": row["count"],
+                }
+                for row in rows
+            ],
+        }
+
+    def record_data_quality_run(
+        self,
+        run_id: str,
+        dataset_kind: str,
+        summary: dict[str, Any],
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO data_quality_runs (
+                    run_id, dataset_kind, created_at, summary_json
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    dataset_kind,
+                    datetime.now(UTC).isoformat(),
+                    json.dumps(summary, sort_keys=True),
+                ),
+            )
+
+    def retention_preview(self, cutoff: datetime) -> dict[str, Any]:
+        with self.connect() as conn:
+            real = conn.execute(
+                """
+                SELECT COUNT(*) AS count, MIN(timestamp) AS oldest, MAX(timestamp) AS newest
+                FROM telemetry_events
+                WHERE synthetic = 0 AND timestamp < ?
+                """,
+                (cutoff.isoformat(),),
+            ).fetchone()
+            quarantine = conn.execute(
+                """
+                SELECT COUNT(*) AS count, MIN(received_at) AS oldest, MAX(received_at) AS newest
+                FROM quarantined_events
+                WHERE received_at < ?
+                """,
+                (cutoff.isoformat(),),
+            ).fetchone()
+        return {
+            "cutoff": cutoff.isoformat(),
+            "raw_real_events": dict(real),
+            "quarantined_events": dict(quarantine),
+            "snapshots_affected": 0,
+            "models_affected": 0,
+        }
+
+    def retention_apply(self, cutoff: datetime) -> dict[str, Any]:
+        with self.connect() as conn:
+            real = conn.execute(
+                "DELETE FROM telemetry_events WHERE synthetic = 0 AND timestamp < ?",
+                (cutoff.isoformat(),),
+            ).rowcount
+            quarantine = conn.execute(
+                "DELETE FROM quarantined_events WHERE received_at < ?",
+                (cutoff.isoformat(),),
+            ).rowcount
+        return {
+            "cutoff": cutoff.isoformat(),
+            "deleted_raw_real_events": int(real),
+            "deleted_quarantined_events": int(quarantine),
+            "snapshots_deleted": 0,
+            "models_deleted": 0,
+        }
 
     def status(self) -> dict[str, Any]:
         with self.connect() as conn:
@@ -360,6 +962,13 @@ class SQLiteStorage:
                 "SELECT COUNT(*) FROM telemetry_events WHERE synthetic = 0"
             ).fetchone()[0]
             anomaly_count = conn.execute("SELECT COUNT(*) FROM anomalies").fetchone()[0]
+            quarantine_count = conn.execute("SELECT COUNT(*) FROM quarantined_events").fetchone()[0]
+            feature_window_count = conn.execute(
+                "SELECT COUNT(*) FROM feature_windows"
+            ).fetchone()[0]
+            dataset_snapshot_count = conn.execute(
+                "SELECT COUNT(*) FROM dataset_snapshots"
+            ).fetchone()[0]
             schema = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
         return {
             "database_path": str(self.database_path),
@@ -367,6 +976,9 @@ class SQLiteStorage:
             "event_count": event_count,
             "real_event_count": real_event_count,
             "anomaly_count": anomaly_count,
+            "quarantine_count": quarantine_count,
+            "feature_window_count": feature_window_count,
+            "dataset_snapshot_count": dataset_snapshot_count,
         }
 
     def upsert_collector_state(
@@ -591,4 +1203,27 @@ class SQLiteStorage:
             "application_version": row["application_version"],
             "last_heartbeat_at": row["last_heartbeat_at"],
             "last_successful_collection_at": row["last_successful_collection_at"],
+        }
+
+    def _feature_window_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "window_id": row["window_id"],
+            "dataset_kind": row["dataset_kind"],
+            "user_id": row["user_id"],
+            "host_id": row["host_id"],
+            "window_start": row["window_start"],
+            "window_end": row["window_end"],
+            "feature_schema_version": row["feature_schema_version"],
+            "window_size_minutes": row["window_size_minutes"],
+            "features": json.loads(row["features_json"]),
+            "event_count": row["event_count"],
+            "event_counts": json.loads(row["event_counts_json"]),
+            "collector_coverage": json.loads(row["collector_coverage_json"]),
+            "quality_status": row["quality_status"],
+            "quality_reasons": json.loads(row["quality_reasons_json"]),
+            "gap_duration_seconds": row["gap_duration_seconds"],
+            "finalized": bool(row["finalized"]),
+            "source_event_hash": row["source_event_hash"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
         }

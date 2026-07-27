@@ -215,6 +215,8 @@ class CollectorManager:
                         "running",
                         cursor,
                         None,
+                        collection_session_id=self._session_id,
+                        collector_version=collector.version,
                     )
                 else:
                     inserted, by_type = self.storage.insert_events_detailed(events)

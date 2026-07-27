@@ -43,6 +43,14 @@ uv run sentinelueba training-eligibility --dataset real
 
 Security Event Log access may require elevated rights. The collector must report `permission_required`; it must not modify Windows audit policy.
 
+## Stage 2 Usable Coverage
+
+Stage 2 changes the real training gate from raw session duration to usable real coverage:
+at least 24 cumulative hours of good 15-minute real feature windows in one user+host
+profile. Process and system metrics are core sources, network is recommended, and
+authentication is optional. Missing authentication rights do not make the whole dataset
+unusable.
+
 ## Delete Local Telemetry
 
 ```powershell

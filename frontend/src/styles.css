@@ -89,6 +89,7 @@ button:hover {
 .metrics article,
 .panel,
 .collectionPanel,
+.pipelinePanel,
 .details,
 .log {
   border: 1px solid #2f3b46;
@@ -121,6 +122,7 @@ button:hover {
 }
 
 .collectionActions,
+.pipelineActions,
 .progressLine,
 .eventCounts {
   display: flex;
@@ -128,6 +130,40 @@ button:hover {
   align-items: center;
   gap: 10px;
   margin-bottom: 12px;
+}
+
+.pipelinePanel {
+  max-width: 1280px;
+  margin: 0 auto 18px;
+  padding: 16px;
+}
+
+.pipelineActions {
+  margin-bottom: 14px;
+}
+
+.pipelineActions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.pipelineGrid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.pipelineGrid article {
+  border: 1px solid #34414d;
+  border-radius: 7px;
+  padding: 10px;
+  display: grid;
+  gap: 6px;
+  min-height: 78px;
+}
+
+.pipelineGrid strong {
+  overflow-wrap: anywhere;
 }
 
 .collectorGrid {
@@ -272,7 +308,8 @@ button:hover {
   .metrics,
   .grid,
   .collectorGrid,
-  .scenarioGrid {
+  .scenarioGrid,
+  .pipelineGrid {
     grid-template-columns: 1fr;
   }
 }

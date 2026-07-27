@@ -22,6 +22,13 @@ jobs:
         run: uv run mypy backend/src
       - name: Pytest
         run: uv run pytest
+      - name: Dataset pipeline smoke
+        run: |
+          uv run sentinelueba generate-demo
+          uv run sentinelueba features materialize
+          uv run sentinelueba datasets create --kind synthetic
+          DATASET_ID="$(ls -1t data/datasets | head -n 1)"
+          uv run sentinelueba datasets verify "$DATASET_ID"
 
   frontend:
     runs-on: ubuntu-latest
@@ -55,6 +62,14 @@ jobs:
         run: uv sync --all-extras --dev
       - name: Unit tests
         run: uv run pytest
+      - name: Dataset pipeline smoke
+        shell: pwsh
+        run: |
+          uv run sentinelueba generate-demo
+          uv run sentinelueba features materialize
+          uv run sentinelueba datasets create --kind synthetic
+          $dataset = Get-ChildItem data/datasets | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          uv run sentinelueba datasets verify $dataset.Name
       - name: PowerShell syntax
         shell: pwsh
         run: |

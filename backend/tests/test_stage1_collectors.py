@@ -246,11 +246,15 @@ def test_migration_v1_to_current_preserves_events(tmp_path: Path) -> None:
     conn.close()
     store = SQLiteStorage(db)
     store.initialize()
-    assert store.status()["schema_version"] == 3
+    assert store.status()["schema_version"] == 4
     assert store.status()["event_count"] == 1
     assert "collection_sessions" in {
         row[0] for row in sqlite3.connect(db).execute("SELECT name FROM sqlite_master")
     }
+    columns = {
+        row[1] for row in sqlite3.connect(db).execute("PRAGMA table_info(telemetry_events)")
+    }
+    assert {"ingested_at", "payload_hash", "event_schema_version"}.issubset(columns)
 
 
 def test_migration_v2_to_current_adds_heartbeat(tmp_path: Path) -> None:
@@ -259,6 +263,7 @@ def test_migration_v2_to_current_adds_heartbeat(tmp_path: Path) -> None:
     store.initialize()
     conn = sqlite3.connect(db)
     conn.execute("DELETE FROM schema_version WHERE version = 3")
+    conn.execute("DELETE FROM schema_version WHERE version = 4")
     columns = [row[1] for row in conn.execute("PRAGMA table_info(collection_sessions)")]
     if "last_heartbeat_at" in columns:
         conn.execute("ALTER TABLE collection_sessions RENAME TO collection_sessions_old")
@@ -280,7 +285,7 @@ def test_migration_v2_to_current_adds_heartbeat(tmp_path: Path) -> None:
         row[1] for row in sqlite3.connect(db).execute("PRAGMA table_info(collection_sessions)")
     }
     assert "last_heartbeat_at" in columns
-    assert store.status()["schema_version"] == 3
+    assert store.status()["schema_version"] == 4
 
 
 def test_downtime_after_heartbeat_is_not_counted(tmp_path: Path) -> None:

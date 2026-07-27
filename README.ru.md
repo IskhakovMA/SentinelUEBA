@@ -1,6 +1,6 @@
 # SentinelUEBA
 
-SentinelUEBA — local-first Windows-focused UEBA портфолио-проект. Stage 1 сохраняет synthetic demo из Stage 0 и добавляет opt-in сбор Windows-телеметрии, collection sessions, cumulative 24-hour progress, FastAPI, CLI и React-интерфейс.
+SentinelUEBA — local-first Windows-focused UEBA портфолио-проект. Stage 2 сохраняет synthetic demo и opt-in Windows telemetry из предыдущих стадий, затем добавляет validation, data quality, materialized feature windows, immutable Parquet dataset snapshots, retention controls, FastAPI, CLI и React-интерфейс.
 
 [English version](README.md)
 
@@ -9,7 +9,9 @@ SentinelUEBA — local-first Windows-focused UEBA портфолио-проек�
 - Безопасная synthetic demo telemetry за 24-hour-equivalent период.
 - Opt-in Windows collectors для процессов, сети, системных метрик и optional Security Event Log authentication metadata.
 - SQLite с последовательными миграциями, индексами, защитой от дублей, collection sessions и collector cursors.
-- 15-минутные окна признаков для пары user + host.
+- Payload validation, quarantine и ingestion metadata.
+- Persistent 15-минутные UTC feature windows для пары user + host.
+- Immutable Parquet dataset snapshots с manifest и SHA-256 verification.
 - CPU-friendly PyTorch autoencoder с preprocessing и model metadata.
 - Объяснения на основе per-feature reconstruction residual.
 - Post-inference validation для всех пяти canonical synthetic demo-сценариев.
@@ -23,6 +25,8 @@ SentinelUEBA — local-first Windows-focused UEBA портфолио-проек�
 ```powershell
 uv sync --all-extras --dev
 uv run sentinelueba generate-demo --seed 42
+uv run sentinelueba features materialize --dataset synthetic
+uv run sentinelueba datasets create --kind synthetic
 uv run sentinelueba train --seed 42
 uv run sentinelueba detect
 uv run sentinelueba run-api
@@ -42,13 +46,27 @@ uv run sentinelueba collection-sessions
 uv run sentinelueba training-eligibility --dataset real
 ```
 
-Real training разрешается только после 24 накопительных часов real non-synthetic telemetry и достаточного числа feature windows. Накопительный сбор считается отдельно от strict continuous 24-hour validation.
+Real training разрешается только после 24 накопительных часов usable real coverage из good feature windows в одном user + host profile. Накопительный сбор считается отдельно от strict continuous 24-hour validation.
 
 Подробнее: [Windows collection](docs/WINDOWS_COLLECTION.md).
 
 Stage 1 сохраняет heartbeats collection session. После остановки приложения или компьютера stale session закрывается по последнему heartbeat, поэтому выключенное время не входит в collected duration.
 
-## Ограничения Stage 1
+## Data Pipeline
+
+```bash
+uv run sentinelueba data-quality
+uv run sentinelueba features status
+uv run sentinelueba datasets list
+uv run sentinelueba datasets verify <dataset-id>
+uv run sentinelueba retention preview
+uv run sentinelueba quarantine summary
+```
+
+Обучение теперь использует verified dataset snapshots, а не произвольное текущее содержимое SQLite.
+Подробнее: [data pipeline](docs/DATA_PIPELINE.md), [data quality](docs/DATA_QUALITY.md), [dataset snapshots](docs/DATASET_SNAPSHOTS.md).
+
+## Ограничения Stage 2
 
 Не реализованы Windows Service, Linux collectors, ETW, kernel driver, cloud backend, SIEM, alerts, packet capture, keylogging, clipboard, browser history, traffic payload inspection, Isolation Forest и ручная калибровка threshold.
 

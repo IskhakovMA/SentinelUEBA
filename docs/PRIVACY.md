@@ -16,3 +16,12 @@ Repository rules:
 Stage 1 does not collect command lines, file contents, active windows, browser history, clipboard contents, keystrokes, packet payloads, or traffic payloads.
 
 Windows authentication collection stores Security Event Log metadata only for supported interactive logon/logoff events. It does not change Windows audit policy.
+
+## Stage 2 Data Handling
+
+Payload validation runs after normalization. Rejected events are quarantined with a safe
+normalized representation and rejection reason. Dataset snapshots contain materialized
+feature windows and ML metadata only; raw event payloads are not included by default.
+
+Retention defaults to 30 days for raw real events and quarantined events. Dataset snapshots
+and model artifacts are not deleted automatically.

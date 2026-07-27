@@ -10,6 +10,8 @@ from sentinelueba.api.schemas import (
     AnomalyListResponse,
     ApiResponse,
     CollectionStartRequest,
+    DatasetKindRequest,
+    RetentionApplyRequest,
     SeedRequest,
     TrainingEligibilityRequest,
 )
@@ -135,6 +137,88 @@ async def event_summary() -> ApiResponse:
 @app.post("/training/eligibility", response_model=ApiResponse)
 async def training_eligibility(request: TrainingEligibilityRequest) -> ApiResponse:
     return ApiResponse(data=pipeline().training_eligibility(request.dataset_kind))
+
+
+@app.get("/data-quality", response_model=ApiResponse)
+async def data_quality() -> ApiResponse:
+    return ApiResponse(data=await run_blocking(pipeline().data_quality))
+
+
+@app.post("/features/materialize", response_model=ApiResponse)
+async def materialize_features(request: DatasetKindRequest) -> ApiResponse:
+    return ApiResponse(
+        data=await run_blocking(pipeline().materialize_features, request.dataset_kind)
+    )
+
+
+@app.post("/features/rebuild", response_model=ApiResponse)
+async def rebuild_features(request: DatasetKindRequest) -> ApiResponse:
+    return ApiResponse(data=await run_blocking(pipeline().rebuild_features, request.dataset_kind))
+
+
+@app.get("/features/status", response_model=ApiResponse)
+async def features_status() -> ApiResponse:
+    return ApiResponse(data=pipeline().features_status())
+
+
+@app.get("/features/windows", response_model=ApiResponse)
+async def feature_window_summary() -> ApiResponse:
+    return ApiResponse(data={"windows": pipeline().features_status().get("windows", {})})
+
+
+@app.post("/datasets", response_model=ApiResponse)
+async def create_dataset(request: DatasetKindRequest) -> ApiResponse:
+    try:
+        return ApiResponse(data=await run_blocking(pipeline().create_dataset, request.dataset_kind))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/datasets", response_model=ApiResponse)
+async def list_datasets(dataset_kind: str | None = None) -> ApiResponse:
+    if dataset_kind is not None and dataset_kind not in {"synthetic", "real"}:
+        raise HTTPException(status_code=400, detail="dataset_kind must be synthetic or real")
+    return ApiResponse(data=pipeline().list_datasets(dataset_kind))
+
+
+@app.get("/datasets/{dataset_id}", response_model=ApiResponse)
+async def show_dataset(dataset_id: str) -> ApiResponse:
+    try:
+        return ApiResponse(data=pipeline().show_dataset(dataset_id))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/datasets/{dataset_id}/verify", response_model=ApiResponse)
+async def verify_dataset(dataset_id: str) -> ApiResponse:
+    try:
+        return ApiResponse(data=await run_blocking(pipeline().verify_dataset, dataset_id))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/readiness/{dataset_kind}", response_model=ApiResponse)
+async def readiness(dataset_kind: str) -> ApiResponse:
+    if dataset_kind not in {"synthetic", "real"}:
+        raise HTTPException(status_code=400, detail="dataset_kind must be synthetic or real")
+    return ApiResponse(data=pipeline().training_eligibility(dataset_kind))
+
+
+@app.get("/quarantine/summary", response_model=ApiResponse)
+async def quarantine_summary() -> ApiResponse:
+    return ApiResponse(data=pipeline().quarantine_summary())
+
+
+@app.get("/retention/preview", response_model=ApiResponse)
+async def retention_preview() -> ApiResponse:
+    return ApiResponse(data=pipeline().retention_preview())
+
+
+@app.post("/retention/apply", response_model=ApiResponse)
+async def retention_apply(request: RetentionApplyRequest) -> ApiResponse:
+    if not request.confirm:
+        raise HTTPException(status_code=400, detail="retention apply requires confirm=true")
+    return ApiResponse(data=await run_blocking(pipeline().retention_apply))
 
 
 @app.get("/anomalies", response_model=AnomalyListResponse)
