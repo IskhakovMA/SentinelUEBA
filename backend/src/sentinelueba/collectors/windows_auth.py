@@ -100,7 +100,11 @@ class WindowsAuthCollector:
             )
         handle: object | None = None
         try:
-            handle = evt.EvtQuery("Security", _event_query(0), evt.EvtQueryChannelPath)
+            handle = evt.EvtQuery(
+                Path="Security",
+                Flags=evt.EvtQueryChannelPath,
+                Query=_event_query(0),
+            )
         except Exception as exc:  # noqa: BLE001 - pywin32 raises dynamic permission errors.
             return CollectorCapability(
                 self.collector_id,
@@ -158,9 +162,9 @@ class WindowsAuthCollector:
         latest = self._last_record_id()
         try:
             query_handle = evt.EvtQuery(
-                "Security",
-                _event_query(0),
-                evt.EvtQueryChannelPath | evt.EvtQueryReverseDirection,
+                Path="Security",
+                Flags=evt.EvtQueryChannelPath | evt.EvtQueryReverseDirection,
+                Query=_event_query(0),
             )
             event_handles = list(evt.EvtNext(query_handle, 1))
             if event_handles:
@@ -184,9 +188,9 @@ class WindowsAuthCollector:
         max_record_id = self._last_record_id()
         try:
             query_handle = evt.EvtQuery(
-                "Security",
-                _event_query(max_record_id),
-                evt.EvtQueryChannelPath,
+                Path="Security",
+                Flags=evt.EvtQueryChannelPath,
+                Query=_event_query(max_record_id),
             )
             while True:
                 event_handles = list(evt.EvtNext(query_handle, 32))

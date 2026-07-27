@@ -144,6 +144,47 @@ def test_windows_auth_evt_query_cursor_and_handles(
     assert fake_evt.closed
 
 
+def test_windows_auth_evt_query_uses_pywin32_argument_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_evt = FakeEvtModule([auth_xml(100, 4624, "existing", 2)])
+    monkeypatch.setattr("platform.system", lambda: "Windows")
+    monkeypatch.setitem(sys.modules, "win32evtlog", fake_evt)
+    collector = WindowsAuthCollector("u", "h")
+
+    capability = collector.check_availability()
+    assert capability.status == CollectorStatus.AVAILABLE
+    availability_call = fake_evt.query_calls[-1]
+    assert availability_call["path"] == "Security"
+    assert availability_call["flags"] == fake_evt.EvtQueryChannelPath
+    assert isinstance(availability_call["flags"], int)
+    assert isinstance(availability_call["query"], str)
+
+    collector.start()
+    latest_call = fake_evt.query_calls[-1]
+    assert latest_call["flags"] == (
+        fake_evt.EvtQueryChannelPath | fake_evt.EvtQueryReverseDirection
+    )
+    assert isinstance(latest_call["flags"], int)
+    assert isinstance(latest_call["query"], str)
+
+    fake_evt.records.append(auth_xml(101, 4625, "analyst", 2, status="0xC000006D"))
+    events = collector.collect()
+    assert [event.payload["record_id"] for event in events] == [101]
+    live_call = fake_evt.query_calls[-1]
+    assert live_call["flags"] == fake_evt.EvtQueryChannelPath
+    assert not int(live_call["flags"]) & fake_evt.EvtQueryReverseDirection
+    assert isinstance(live_call["flags"], int)
+    assert isinstance(live_call["query"], str)
+
+    with pytest.raises(TypeError):
+        fake_evt.EvtQuery(
+            "Security",
+            "bad-query-in-flags-position",  # type: ignore[arg-type]
+            fake_evt.EvtQueryChannelPath,  # type: ignore[arg-type]
+        )
+
+
 def test_windows_auth_permission_required(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_evt = FakeEvtModule([], permission_error=True)
     monkeypatch.setattr("platform.system", lambda: "Windows")
@@ -450,11 +491,24 @@ class FakeEvtModule(SimpleNamespace):
         self.records = records
         self.permission_error = permission_error
         self.closed: list[object] = []
+        self.query_calls: list[dict[str, object]] = []
 
-    def EvtQuery(self, channel: str, query: str, flags: int) -> dict[str, object]:
+    def EvtQuery(  # noqa: N802 - mirrors pywin32's public API name.
+        self,
+        Path: str,
+        Flags: int,
+        Query: str | None = None,
+        Session: object | None = None,
+    ) -> dict[str, object]:
+        if not isinstance(Flags, int):
+            raise TypeError("flags must be int")
+        if Query is not None and not isinstance(Query, str):
+            raise TypeError("query must be str")
         if self.permission_error:
             raise PermissionError("denied")
-        return {"query": query, "flags": flags}
+        call = {"path": Path, "flags": Flags, "query": Query, "session": Session}
+        self.query_calls.append(call)
+        return {"query": Query or "", "flags": Flags}
 
     def EvtNext(self, handle: dict[str, object], count: int) -> list[dict[str, object]]:
         last_record_id = int(str(handle["query"]).split("EventRecordID>")[1].split("]")[0])
