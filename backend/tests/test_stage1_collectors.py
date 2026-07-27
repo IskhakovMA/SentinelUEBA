@@ -367,7 +367,9 @@ def test_collector_failure_isolation_and_collection_smoke(tmp_path: Path) -> Non
         FakeCollector(fail=True),
     ]
     manager.start(duration_seconds=1, interval_seconds=0.1)
-    time.sleep(1.3)
+    deadline = time.monotonic() + 5
+    while manager.status()["running"] and time.monotonic() < deadline:
+        time.sleep(0.1)
     status = manager.status()
     assert status["running"] is False
     assert status["counters"]["fake.collector"] >= 1
