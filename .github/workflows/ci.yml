@@ -24,6 +24,7 @@ jobs:
         run: uv run pytest
       - name: Dataset and ML pipeline smoke
         run: |
+          rm -rf data artifacts
           uv run sentinelueba generate-demo
           uv run sentinelueba features materialize
           uv run sentinelueba datasets create --kind synthetic
@@ -134,7 +135,7 @@ jobs:
           import os
           noop = json.loads(os.environ["NOOP_DETECTION_JSON"])
           assert noop["evaluated_count"] == 0, noop
-          assert noop["no_op_count"] == 96, noop
+          assert noop["examined_count"] == 0, noop
           PY
           SUPPRESSION_JSON="$(
             uv run sentinelueba detection suppressions create \
@@ -147,7 +148,7 @@ jobs:
           SUPPRESSION_ID="$(
             SUPPRESSION_JSON="$SUPPRESSION_JSON" uv run python -c 'import json, os; print(json.loads(os.environ["SUPPRESSION_JSON"])["suppression_id"])'
           )"
-          uv run sentinelueba detection suppressions revoke "$SUPPRESSION_ID"
+          uv run sentinelueba detection suppressions revoke "$SUPPRESSION_ID" --confirm
           uv run sentinelueba detection worker run-foreground --dataset synthetic --max-windows 16
           NOOP_JSON="$(uv run sentinelueba features materialize)"
           NOOP_JSON="$NOOP_JSON" uv run python - <<'PY'
@@ -196,6 +197,7 @@ jobs:
       - name: Dataset and ML pipeline smoke
         shell: pwsh
         run: |
+          Remove-Item -Recurse -Force data, artifacts -ErrorAction SilentlyContinue
           uv run sentinelueba generate-demo
           uv run sentinelueba features materialize
           uv run sentinelueba datasets create --kind synthetic
@@ -236,9 +238,9 @@ jobs:
           $detection = uv run sentinelueba detection run-once --dataset synthetic | ConvertFrom-Json
           if ($detection.evaluated_count -ne 96 -or $detection.finding_count -lt 5) { throw "unexpected detection result" }
           $noopDetection = uv run sentinelueba detection run-once --dataset synthetic | ConvertFrom-Json
-          if ($noopDetection.evaluated_count -ne 0 -or $noopDetection.no_op_count -ne 96) { throw "unexpected detection no-op" }
+          if ($noopDetection.evaluated_count -ne 0 -or $noopDetection.examined_count -ne 0) { throw "unexpected detection no-op" }
           $suppression = uv run sentinelueba detection suppressions create --scope signal_for_dataset_kind --dataset synthetic --signal-id rare-process-v1 --ttl-minutes 30 --reason ci-smoke | ConvertFrom-Json
-          uv run sentinelueba detection suppressions revoke $suppression.suppression_id
+          uv run sentinelueba detection suppressions revoke $suppression.suppression_id --confirm
           uv run sentinelueba detection worker run-foreground --dataset synthetic --max-windows 16
           $noop = uv run sentinelueba features materialize | ConvertFrom-Json
           if ($noop.processed_events -ne 0 -or $noop.processed_observations -ne 0 -or $noop.upserted_windows -ne 0 -or $noop.deleted_windows -ne 0) { throw "unexpected no-op materialization" }
