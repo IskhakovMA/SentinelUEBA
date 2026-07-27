@@ -20,5 +20,5 @@ Parquet is portable across Windows and Linux and is efficient for feature matric
 Snapshots are generated local artifacts and are excluded from Git and CI artifacts.
 Snapshot verification is required before training and snapshot-backed detection. The
 verification path rejects checksum, manifest, registry, path safety, schema/order, row
-count, profile/kind, ordering, duplicate window, and NaN/Infinity failures before rows are
-used by ML code.
+count, row index, manifest boundary, profile/kind, ordering, duplicate window, and
+NaN/Infinity failures before rows are used by ML code.

@@ -7,7 +7,7 @@ from typing import Any
 from uuid import uuid4
 
 from sentinelueba import __version__
-from sentinelueba.collectors.base import CollectorStatus, TelemetryCollector
+from sentinelueba.collectors.base import CollectorPollResult, CollectorStatus, TelemetryCollector
 from sentinelueba.collectors.identity import IdentityProvider
 from sentinelueba.collectors.network import NetworkCollector
 from sentinelueba.collectors.process import ProcessCollector
@@ -207,15 +207,25 @@ class CollectorManager:
         for collector in self._collectors:
             observed_at = datetime.now(UTC)
             try:
-                events = normalize_events(collector.collect())
+                poll = getattr(collector, "poll", None)
+                poll_result = (
+                    poll()
+                    if callable(poll)
+                    else CollectorPollResult(
+                        events=collector.collect(),
+                        successful=True,
+                        status="ok",
+                    )
+                )
+                events = normalize_events(poll_result.events)
                 cursor = collector.cursor if hasattr(collector, "cursor") else None
                 if isinstance(cursor, dict):
                     inserted, by_type = self.storage.insert_events_and_update_collector_state(
                         events,
                         collector.collector_id,
-                        "running",
+                        poll_result.status,
                         cursor,
-                        None,
+                        poll_result.error_class,
                         collection_session_id=self._session_id,
                         collector_version=collector.version,
                     )
@@ -229,6 +239,13 @@ class CollectorManager:
                 self._counters[collector.collector_id] += inserted
                 for event_type, count in by_type.items():
                     self._counters[event_type] += count
+                if poll_result.warnings:
+                    self._errors.extend(
+                        f"{collector.collector_id}: warning:{warning}"
+                        for warning in poll_result.warnings
+                    )
+                if poll_result.error_class:
+                    self._errors.append(f"{collector.collector_id}: {poll_result.error_class}")
                 self._status[collector.collector_id] = collector.health().__dict__
                 self.storage.record_collector_observation(
                     session_id=self._session_id,
@@ -236,14 +253,14 @@ class CollectorManager:
                     user_id=getattr(collector, "user_id", None),
                     host_id=getattr(collector, "host_id", None),
                     observed_at=observed_at,
-                    status="ok",
-                    successful_poll=True,
-                    error_class=None,
+                    status=poll_result.status,
+                    successful_poll=poll_result.successful,
+                    error_class=poll_result.error_class,
                     configured_interval_seconds=interval_seconds,
-                    returned_events=len(events),
+                    returned_events=len(poll_result.events),
                     saved_events=inserted,
                 )
-                any_success = True
+                any_success = any_success or poll_result.successful
             except Exception as exc:  # noqa: BLE001
                 message = f"{collector.collector_id}: {type(exc).__name__}"
                 self._errors.append(message)

@@ -42,6 +42,15 @@ class CollectorHealth:
     events_collected: int = 0
 
 
+@dataclass(frozen=True)
+class CollectorPollResult:
+    events: list[TelemetryEvent]
+    successful: bool
+    status: str
+    error_class: str | None = None
+    warnings: list[str] = field(default_factory=list)
+
+
 class TelemetryCollector(Protocol):
     collector_id: str
     version: str
@@ -62,3 +71,5 @@ class TelemetryCollector(Protocol):
     def collect(self) -> list[TelemetryEvent]:
         """Collect a polling batch and convert it to normalized telemetry events."""
 
+    def poll(self) -> CollectorPollResult:
+        """Collect one polling batch and report whether the source was actually polled."""

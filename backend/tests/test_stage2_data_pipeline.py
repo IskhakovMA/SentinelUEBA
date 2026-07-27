@@ -25,7 +25,7 @@ from sentinelueba.features.materialization import FeatureMaterializer
 from sentinelueba.features.windows import align_window_start
 from sentinelueba.ml.autoencoder import model_info
 from sentinelueba.services.pipeline import DemoPipeline
-from sentinelueba.storage.sqlite import SQLiteStorage
+from sentinelueba.storage.sqlite import SchemaIntegrityError, SQLiteStorage
 from sentinelueba.validation import validate_event
 
 
@@ -67,6 +67,45 @@ def test_payload_validation_rejects_unknown_fields_and_quarantines(tmp_path: Pat
     assert summary["count"] == 1
 
 
+@pytest.mark.parametrize(
+    ("event_type", "payload"),
+    [
+        (
+            EventType.PROCESS,
+            {"process_name": "editor.exe", "unexpected": "value"},
+        ),
+        (
+            EventType.NETWORK,
+            {"remote_address": "198.51.100.10", "remote_port": 443, "unexpected": "value"},
+        ),
+        (
+            EventType.SYSTEM_METRICS,
+            {"cpu_percent": 10.0, "ram_percent": 20.0, "unexpected": "value"},
+        ),
+        (
+            EventType.AUTHENTICATION,
+            {"result": "success", "method": "local", "unexpected": "value"},
+        ),
+    ],
+)
+def test_unknown_payload_fields_are_quarantined_without_forbidden_values(
+    tmp_path: Path,
+    event_type: EventType,
+    payload: dict[str, object],
+) -> None:
+    store = SQLiteStorage(tmp_path / f"unknown-{event_type.value}.sqlite3")
+    store.initialize()
+    assert store.insert_events([event(1, event_type, payload)]) == 0
+    with store.connect() as conn:
+        row = conn.execute(
+            "SELECT reason, safe_event_json FROM quarantined_events"
+        ).fetchone()
+    assert row is not None
+    assert "unknown" in row["reason"] or "forbidden" in row["reason"]
+    assert "unexpected" not in row["safe_event_json"]
+    assert "value" not in row["safe_event_json"]
+
+
 def test_real_stage1_collector_payloads_are_accepted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -86,10 +125,13 @@ def test_real_stage1_collector_payloads_are_accepted(
     )
     auth = WindowsAuthCollector("user-a", "host-a").event_from_fixture(
         {
-            "EventID": 4624,
+            "EventID": 4625,
             "RecordID": 101,
             "LogonType": 2,
             "TargetUserName": "analyst",
+            "TargetDomainName": "DEMO",
+            "Status": "0xC000006D",
+            "SubStatus": "0xC000006A",
         },
         ts,
     )
@@ -107,6 +149,10 @@ def test_real_stage1_collector_payloads_are_accepted(
     rows = store.list_event_rows(synthetic=False)
     assert len(rows) == 4
     assert {row["validation_status"] for row in rows} == {"accepted"}
+    auth_row = next(row for row in rows if row["event"].event_type == EventType.AUTHENTICATION)
+    assert auth_row["event"].payload["target_domain_name"] == "DEMO"
+    assert auth_row["event"].payload["status"] == "0xC000006D"
+    assert auth_row["event"].payload["sub_status"] == "0xC000006A"
     assert store.quarantine_summary()["count"] == 0
 
 
@@ -130,21 +176,65 @@ def test_invalid_payload_for_each_event_type_is_quarantined(
     assert store.quarantine_summary()["count"] == 1
 
 
-def test_event_metadata_migration_v3_to_latest(tmp_path: Path) -> None:
-    db = tmp_path / "v3.sqlite3"
+@pytest.mark.parametrize("version", [1, 2, 3, 4])
+def test_historical_schema_migrations_to_v5(tmp_path: Path, version: int) -> None:
+    db = tmp_path / f"v{version}.sqlite3"
+    create_historical_database(db, version)
     store = SQLiteStorage(db)
     store.initialize()
-    conn = sqlite3.connect(db)
-    conn.execute("DELETE FROM schema_version WHERE version = 4")
-    conn.execute("DROP TABLE IF EXISTS dataset_snapshots")
-    conn.commit()
-    conn.close()
-    store.initialize()
     assert store.status()["schema_version"] == 5
+    assert store.status()["event_count"] == 1
     columns = {
         row[1] for row in sqlite3.connect(db).execute("PRAGMA table_info(telemetry_events)")
     }
     assert {"ingested_at", "collection_session_id", "payload_hash"}.issubset(columns)
+    assert "collector_observations" in table_names(db)
+
+
+def test_fresh_schema_initializes_to_v5(tmp_path: Path) -> None:
+    store = SQLiteStorage(tmp_path / "fresh.sqlite3")
+    store.initialize()
+    assert store.status()["schema_version"] == 5
+    assert "collector_observations" in table_names(store.database_path)
+
+
+def test_repeated_initialize_v5_runs_no_migrations_or_event_updates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SQLiteStorage(tmp_path / "repeat.sqlite3")
+    store.initialize()
+    original = event(1, EventType.SYSTEM_METRICS, {"cpu_percent": 10.0, "ram_percent": 40.0})
+    assert store.insert_events([original]) == 1
+    before = sqlite3.connect(store.database_path).execute(
+        "SELECT ingested_at, payload_hash, payload_json FROM telemetry_events WHERE event_id = ?",
+        (original.event_id,),
+    ).fetchone()
+
+    def fail_migration(method_name: str):
+        def fail(conn: sqlite3.Connection) -> None:
+            pytest.fail(f"{method_name} should not run for schema v5")
+
+        return fail
+
+    for name in ["_apply_v1", "_apply_v2", "_apply_v3", "_apply_v4", "_apply_v5"]:
+        monkeypatch.setattr(store, name, fail_migration(name))
+    store.initialize()
+
+    after = sqlite3.connect(store.database_path).execute(
+        "SELECT ingested_at, payload_hash, payload_json FROM telemetry_events WHERE event_id = ?",
+        (original.event_id,),
+    ).fetchone()
+    assert after == before
+
+
+def test_v5_missing_required_table_raises_schema_integrity_error(tmp_path: Path) -> None:
+    store = SQLiteStorage(tmp_path / "corrupt-v5.sqlite3")
+    store.initialize()
+    with sqlite3.connect(store.database_path) as conn:
+        conn.execute("DROP TABLE collector_observations")
+    with pytest.raises(SchemaIntegrityError, match="missing table"):
+        store.initialize()
 
 
 def test_deterministic_window_alignment_and_profile_isolation(tmp_path: Path) -> None:
@@ -255,6 +345,48 @@ def test_incremental_new_event_after_watermark_only_materializes_new_window(
     assert len(store.list_feature_windows(dataset_kind="synthetic")) == 3
 
 
+def test_incremental_materialization_reads_only_new_and_affected_ranges(
+    tmp_path: Path,
+) -> None:
+    store = InstrumentedStorage(tmp_path / "instrumented.sqlite3")
+    store.initialize()
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    add_session(store, start, start + timedelta(hours=1))
+    add_observations(store, start, windows=3)
+    store.insert_events(real_profile_events(start, windows=3, synthetic=False))
+    materializer = FeatureMaterializer(store)
+    materializer.materialize("real", rebuild=True)
+    windows_before = store.list_feature_windows(dataset_kind="real")
+    store.reset_instrumentation()
+
+    add_observations(store, start + timedelta(minutes=45), windows=1)
+    store.insert_events(
+        [
+            event(
+                100,
+                EventType.PROCESS,
+                {"process_name": "new.exe"},
+                ts=start + timedelta(minutes=45),
+                synthetic=False,
+            )
+        ]
+    )
+    result = materializer.materialize("real")
+    windows_after = store.list_feature_windows(dataset_kind="real")
+
+    assert result["processed_events"] == 1
+    assert result["processed_observations"] == 3
+    assert result["upserted_windows"] == 1
+    assert store.unrestricted_event_reads == 0
+    assert store.unrestricted_observation_reads == 0
+    assert any(call.get("start") is not None for call in store.event_row_calls)
+    assert any(call.get("start") is not None for call in store.observation_calls)
+    before_by_start = {window["window_start"]: window for window in windows_before}
+    after_by_start = {window["window_start"]: window for window in windows_after}
+    for window_start, before_window in before_by_start.items():
+        assert after_by_start[window_start]["updated_at"] == before_window["updated_at"]
+
+
 def test_late_event_recomputation_and_full_rebuild_equivalence(tmp_path: Path) -> None:
     store = SQLiteStorage(tmp_path / "late.sqlite3")
     store.initialize()
@@ -315,6 +447,33 @@ def test_late_event_outside_policy_is_reported_in_data_quality(tmp_path: Path) -
     assert quality["late_events"]["outside_policy"] == 1
 
 
+def test_data_quality_received_counters_and_readiness_use_shared_eligibility(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteStorage(tmp_path / "quality-counters.sqlite3")
+    store.initialize()
+    accepted = event(1, EventType.SYSTEM_METRICS, {"cpu_percent": 10.0, "ram_percent": 20.0})
+    quarantined = event(
+        2,
+        EventType.SYSTEM_METRICS,
+        {"cpu_percent": 10.0, "ram_percent": 20.0, "unexpected": "value"},
+    )
+    assert store.insert_events([accepted, accepted, quarantined]) == 1
+    pipe = DemoPipeline(settings(tmp_path))
+    pipe.storage = store
+    quality = pipe.data_quality()
+    synthetic_eligibility = pipe.training_eligibility("synthetic")
+    real_eligibility = pipe.training_eligibility("real")
+
+    assert quality["accepted_events"] == 1
+    assert quality["duplicate_event_count"] == 1
+    assert quality["quarantined_event_count"] == 1
+    assert quality["received_events"] == 3
+    assert quality["readiness"]["synthetic"] == synthetic_eligibility
+    assert quality["readiness"]["real"] == real_eligibility
+    assert set(quality["window_quality"]) == {"synthetic", "real"}
+
+
 def test_materialization_large_dataset_rerun_has_no_duplicate_windows(tmp_path: Path) -> None:
     store = SQLiteStorage(tmp_path / "large.sqlite3")
     store.initialize()
@@ -328,6 +487,34 @@ def test_materialization_large_dataset_rerun_has_no_duplicate_windows(tmp_path: 
     assert len(windows) == 10_000
     assert second["upserted_windows"] <= first["upserted_windows"]
     assert len({window["window_id"] for window in windows}) == len(windows)
+
+
+def test_large_incremental_materialization_reads_bounded_rows(tmp_path: Path) -> None:
+    store = InstrumentedStorage(tmp_path / "large-bounded.sqlite3")
+    store.initialize()
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    store.insert_events(real_profile_events(start, windows=10_000, synthetic=True))
+    materializer = FeatureMaterializer(store)
+    materializer.materialize("synthetic", rebuild=True)
+    store.reset_instrumentation()
+    store.insert_events(
+        [
+            event(
+                100_000,
+                EventType.PROCESS,
+                {"process_name": "bounded.exe"},
+                ts=start + timedelta(minutes=15 * 10_000),
+            )
+        ]
+    )
+
+    result = materializer.materialize("synthetic")
+
+    assert result["processed_events"] == 1
+    assert result["upserted_windows"] == 1
+    assert store.unrestricted_event_reads == 0
+    assert max(store.event_rows_read, default=0) <= 1
+    assert sum(store.event_rows_read) < 100
 
 
 def test_parquet_snapshot_roundtrip_immutable_and_checksum(tmp_path: Path) -> None:
@@ -400,6 +587,46 @@ def test_snapshot_path_and_parquet_content_validation(tmp_path: Path) -> None:
     pq.write_table(pa.Table.from_pylist(rows), dataset_dir / "features.parquet")
     with pytest.raises(SnapshotVerificationError):
         pipe.verify_dataset(dataset_id)
+
+
+def test_snapshot_row_index_boundaries_registry_and_missing_files_are_rejected(
+    tmp_path: Path,
+) -> None:
+    pipe = prepared_snapshot_pipe(tmp_path, seed=68)
+    dataset_id = str(pipe.list_datasets("synthetic")["datasets"][0]["dataset_id"])
+    dataset_dir = tmp_path / "data" / "datasets" / dataset_id
+    rows = pq.read_table(dataset_dir / "features.parquet").to_pylist()
+    rows[0]["row_index"] = 99
+    rewrite_snapshot_with_consistent_hashes(pipe, dataset_id, rows)
+    with pytest.raises(SnapshotVerificationError, match="row_index"):
+        pipe.verify_dataset(dataset_id)
+
+    pipe = prepared_snapshot_pipe(tmp_path / "boundary", seed=69)
+    dataset_id = str(pipe.list_datasets("synthetic")["datasets"][0]["dataset_id"])
+    dataset_dir = tmp_path / "boundary" / "data" / "datasets" / dataset_id
+    rows = pq.read_table(dataset_dir / "features.parquet").to_pylist()
+    rows[0]["window_start"] = "2026-01-01T00:01:00+00:00"
+    rewrite_snapshot_with_consistent_hashes(pipe, dataset_id, rows)
+    with pytest.raises(SnapshotVerificationError, match="first Parquet window_start"):
+        pipe.verify_dataset(dataset_id)
+
+    pipe = prepared_snapshot_pipe(tmp_path / "registry-profile", seed=70)
+    dataset_id = str(pipe.list_datasets("synthetic")["datasets"][0]["dataset_id"])
+    with pipe.storage.connect() as conn:
+        conn.execute(
+            "UPDATE dataset_snapshots SET profile_json = ? WHERE dataset_id = ?",
+            (json.dumps({"user_id": "other", "host_id": "host-a"}), dataset_id),
+        )
+    with pytest.raises(SnapshotVerificationError, match="SQLite profile"):
+        pipe.verify_dataset(dataset_id)
+
+    for filename in ["features.parquet", "manifest.json", "checksums.sha256"]:
+        pipe = prepared_snapshot_pipe(tmp_path / f"missing-{filename}", seed=71)
+        dataset_id = str(pipe.list_datasets("synthetic")["datasets"][0]["dataset_id"])
+        missing = tmp_path / f"missing-{filename}" / "data" / "datasets" / dataset_id / filename
+        missing.unlink()
+        with pytest.raises(SnapshotVerificationError):
+            pipe.verify_dataset(dataset_id)
 
 
 def test_partial_snapshot_create_is_not_registered(
@@ -523,6 +750,57 @@ def test_stable_host_zero_change_polls_create_good_windows(tmp_path: Path) -> No
     assert window["features"]["network_connection_count"] == 0
 
 
+def test_system_metrics_failed_poll_cannot_create_good_window(tmp_path: Path) -> None:
+    store = SQLiteStorage(tmp_path / "failed-system-window.sqlite3")
+    store.initialize()
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    add_session(store, start, start + timedelta(minutes=15))
+    add_observations(
+        store,
+        start,
+        windows=1,
+        failed_collectors={"windows.system_metrics.psutil"},
+    )
+    store.insert_events(
+        [
+            event(
+                1,
+                EventType.SYSTEM_METRICS,
+                {"cpu_percent": 5.0, "ram_percent": 35.0},
+                ts=start,
+                synthetic=False,
+            )
+        ]
+    )
+    FeatureMaterializer(store).materialize("real", rebuild=True)
+    window = store.list_feature_windows(dataset_kind="real")[0]
+    assert window["quality_status"] != "good"
+    assert window["collector_coverage"]["collector_coverage"].get(
+        "windows.system_metrics.psutil",
+        0,
+    ) == 0
+
+
+def test_failed_system_polls_for_24h_do_not_allow_real_eligibility(tmp_path: Path) -> None:
+    store = SQLiteStorage(tmp_path / "failed-system-24h.sqlite3")
+    store.initialize()
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    add_session(store, start, start + timedelta(hours=24))
+    add_observations(
+        store,
+        start,
+        windows=96,
+        failed_collectors={"windows.system_metrics.psutil"},
+    )
+    store.insert_events(real_profile_events(start, windows=96, synthetic=False))
+    FeatureMaterializer(store).materialize("real", rebuild=True)
+    pipe = DemoPipeline(settings(tmp_path))
+    pipe.storage = store
+    eligibility = pipe.training_eligibility("real")
+    assert eligibility["eligible"] is False
+    assert eligibility["avg_system_metrics_coverage"] == 0
+
+
 def test_heartbeat_gap_reduces_usable_coverage(tmp_path: Path) -> None:
     store = SQLiteStorage(tmp_path / "gap.sqlite3")
     store.initialize()
@@ -605,6 +883,256 @@ def prepared_snapshot_pipe(tmp_path: Path, *, seed: int) -> DemoPipeline:
     return pipe
 
 
+def rewrite_snapshot_with_consistent_hashes(
+    pipe: DemoPipeline,
+    dataset_id: str,
+    rows: list[dict[str, object]],
+) -> None:
+    dataset_dir = pipe.settings.data_dir / "datasets" / dataset_id
+    parquet_path = dataset_dir / "features.parquet"
+    manifest_path = dataset_dir / "manifest.json"
+    pq.write_table(pa.Table.from_pylist(rows), parquet_path)
+    manifest = json.loads(manifest_path.read_text())
+    parquet_sha = snapshot_module.sha256_file(parquet_path)
+    manifest["parquet_sha256"] = parquet_sha
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+    manifest_sha = snapshot_module.sha256_file(manifest_path)
+    (dataset_dir / "checksums.sha256").write_text(
+        f"{parquet_sha}  features.parquet\n{manifest_sha}  manifest.json\n"
+    )
+    with pipe.storage.connect() as conn:
+        conn.execute(
+            """
+            UPDATE dataset_snapshots
+            SET manifest_json = ?, manifest_sha256 = ?, parquet_sha256 = ?
+            WHERE dataset_id = ?
+            """,
+            (json.dumps(manifest, sort_keys=True), manifest_sha, parquet_sha, dataset_id),
+        )
+
+
+def create_historical_database(db: Path, version: int) -> None:
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE schema_version(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+    )
+    for item in range(1, version + 1):
+        conn.execute(
+            "INSERT INTO schema_version VALUES (?, '2026-01-01T00:00:00+00:00')",
+            (item,),
+        )
+    conn.execute(
+        """
+        CREATE TABLE telemetry_events (
+            event_id TEXT PRIMARY KEY, timestamp TEXT NOT NULL, event_type TEXT NOT NULL,
+            user_id TEXT NOT NULL, host_id TEXT NOT NULL, source TEXT NOT NULL,
+            payload_json TEXT NOT NULL, synthetic INTEGER NOT NULL, schema_version TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE anomalies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, user_id TEXT NOT NULL,
+            host_id TEXT NOT NULL, anomaly_score REAL NOT NULL, threshold_value REAL NOT NULL,
+            risk_level TEXT NOT NULL, top_features_json TEXT NOT NULL, explanation TEXT NOT NULL,
+            model_version TEXT NOT NULL, window_start TEXT NOT NULL, window_end TEXT NOT NULL
+        )
+        """
+    )
+    if version >= 2:
+        conn.execute(
+            "ALTER TABLE anomalies ADD COLUMN feature_contributions_json "
+            "TEXT NOT NULL DEFAULT '[]'"
+        )
+        conn.execute(
+            "ALTER TABLE anomalies ADD COLUMN range_kind TEXT NOT NULL DEFAULT 'evaluation'"
+        )
+        conn.execute(
+            """
+            CREATE TABLE collection_sessions (
+                session_id TEXT PRIMARY KEY, started_at TEXT NOT NULL, stopped_at TEXT,
+                status TEXT NOT NULL, collection_mode TEXT NOT NULL,
+                enabled_collectors_json TEXT NOT NULL, counters_json TEXT NOT NULL,
+                errors_json TEXT NOT NULL, application_version TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE collector_state (
+                collector_id TEXT PRIMARY KEY, status TEXT NOT NULL, cursor_json TEXT NOT NULL,
+                last_error TEXT, updated_at TEXT NOT NULL
+            )
+            """
+        )
+    if version >= 3:
+        conn.execute("ALTER TABLE collection_sessions ADD COLUMN last_heartbeat_at TEXT")
+        conn.execute(
+            "ALTER TABLE collection_sessions ADD COLUMN last_successful_collection_at TEXT"
+        )
+    if version >= 4:
+        for column, column_type in {
+            "ingested_at": "TEXT",
+            "collection_session_id": "TEXT",
+            "collector_id": "TEXT",
+            "collector_version": "TEXT",
+            "validation_status": "TEXT",
+            "payload_hash": "TEXT",
+            "event_schema_version": "TEXT",
+        }.items():
+            conn.execute(f"ALTER TABLE telemetry_events ADD COLUMN {column} {column_type}")
+        conn.execute(
+            """
+            CREATE TABLE quarantined_events (
+                quarantine_id INTEGER PRIMARY KEY AUTOINCREMENT, received_at TEXT NOT NULL,
+                collector_id TEXT NOT NULL, source TEXT NOT NULL, event_type TEXT NOT NULL,
+                event_schema_version TEXT NOT NULL, error_class TEXT NOT NULL,
+                reason TEXT NOT NULL, safe_event_json TEXT NOT NULL, payload_hash TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE feature_windows (
+                window_id TEXT PRIMARY KEY, dataset_kind TEXT NOT NULL, user_id TEXT NOT NULL,
+                host_id TEXT NOT NULL, window_start TEXT NOT NULL, window_end TEXT NOT NULL,
+                feature_schema_version TEXT NOT NULL, window_size_minutes INTEGER NOT NULL,
+                features_json TEXT NOT NULL, event_count INTEGER NOT NULL,
+                event_counts_json TEXT NOT NULL, collector_coverage_json TEXT NOT NULL,
+                quality_status TEXT NOT NULL, quality_reasons_json TEXT NOT NULL,
+                gap_duration_seconds REAL NOT NULL, finalized INTEGER NOT NULL,
+                source_event_hash TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE feature_materialization_state (
+                dataset_kind TEXT PRIMARY KEY, watermark TEXT, last_materialized_at TEXT NOT NULL,
+                late_event_interval_minutes INTEGER NOT NULL, window_size_minutes INTEGER NOT NULL,
+                baseline_state_json TEXT NOT NULL, last_rebuild_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE data_quality_runs (
+                run_id TEXT PRIMARY KEY, dataset_kind TEXT NOT NULL, created_at TEXT NOT NULL,
+                summary_json TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE dataset_snapshots (
+                dataset_id TEXT PRIMARY KEY, dataset_kind TEXT NOT NULL, created_at TEXT NOT NULL,
+                manifest_json TEXT NOT NULL, manifest_sha256 TEXT NOT NULL,
+                parquet_sha256 TEXT NOT NULL, feature_schema_version TEXT NOT NULL,
+                profile_json TEXT NOT NULL, start_at TEXT NOT NULL, end_at TEXT NOT NULL,
+                window_count INTEGER NOT NULL, status TEXT NOT NULL
+            )
+            """
+        )
+    insert_historical_event(conn, version)
+    conn.commit()
+    conn.close()
+
+
+def insert_historical_event(conn: sqlite3.Connection, version: int) -> None:
+    values: list[object] = [
+        "e1",
+        "2026-01-01T00:00:00+00:00",
+        "system_metrics",
+        "u",
+        "h",
+        "test",
+        json.dumps({"cpu_percent": 10.0, "ram_percent": 40.0}),
+        1,
+        "event-v1",
+    ]
+    columns = [
+        "event_id",
+        "timestamp",
+        "event_type",
+        "user_id",
+        "host_id",
+        "source",
+        "payload_json",
+        "synthetic",
+        "schema_version",
+    ]
+    if version >= 4:
+        columns.extend(
+            [
+                "ingested_at",
+                "collection_session_id",
+                "collector_id",
+                "collector_version",
+                "validation_status",
+                "payload_hash",
+                "event_schema_version",
+            ]
+        )
+        values.extend(
+            [
+                "2026-01-01T00:00:01+00:00",
+                None,
+                "test",
+                "unknown",
+                "accepted",
+                "historical-hash",
+                "event-v1",
+            ]
+        )
+    conn.execute(
+        f"INSERT INTO telemetry_events ({', '.join(columns)}) "
+        f"VALUES ({', '.join('?' for _ in columns)})",
+        values,
+    )
+
+
+def table_names(db: Path) -> set[str]:
+    with sqlite3.connect(db) as conn:
+        return {
+            row[0]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+
+
+class InstrumentedStorage(SQLiteStorage):
+    def __init__(self, database_path: Path) -> None:
+        super().__init__(database_path)
+        self.reset_instrumentation()
+
+    def reset_instrumentation(self) -> None:
+        self.event_row_calls: list[dict[str, object]] = []
+        self.observation_calls: list[dict[str, object]] = []
+        self.event_rows_read: list[int] = []
+        self.observation_rows_read: list[int] = []
+        self.unrestricted_event_reads = 0
+        self.unrestricted_observation_reads = 0
+
+    def list_event_rows(self, **kwargs: object) -> list[dict[str, object]]:
+        self.event_row_calls.append(dict(kwargs))
+        if not any(
+            kwargs.get(key) is not None
+            for key in ["since", "ingested_after", "after_event_id", "start", "end"]
+        ):
+            self.unrestricted_event_reads += 1
+        rows = super().list_event_rows(**kwargs)  # type: ignore[arg-type]
+        self.event_rows_read.append(len(rows))
+        return rows
+
+    def list_collector_observations(self, **kwargs: object) -> list[dict[str, object]]:
+        self.observation_calls.append(dict(kwargs))
+        if not any(kwargs.get(key) is not None for key in ["since", "start", "end"]):
+            self.unrestricted_observation_reads += 1
+        rows = super().list_collector_observations(**kwargs)  # type: ignore[arg-type]
+        self.observation_rows_read.append(len(rows))
+        return rows
+
+
 def add_observations(
     store: SQLiteStorage,
     start: datetime,
@@ -612,7 +1140,9 @@ def add_observations(
     windows: int,
     gap_start: int | None = None,
     gap_windows: int = 0,
+    failed_collectors: set[str] | None = None,
 ) -> None:
+    failed = failed_collectors or set()
     for index in range(windows):
         if gap_start is not None and gap_start <= index < gap_start + gap_windows:
             continue
@@ -622,15 +1152,16 @@ def add_observations(
             "windows.process.psutil",
             "windows.network.psutil",
         ]:
+            successful = collector_id not in failed
             store.record_collector_observation(
                 session_id="fixture-session",
                 collector_id=collector_id,
                 user_id="user-a",
                 host_id="host-a",
                 observed_at=observed_at,
-                status="ok",
-                successful_poll=True,
-                error_class=None,
+                status="ok" if successful else "error",
+                successful_poll=successful,
+                error_class=None if successful else "FixturePollError",
                 configured_interval_seconds=15 * 60,
                 returned_events=0,
                 saved_events=0,

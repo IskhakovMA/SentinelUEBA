@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
+from sentinelueba.services.eligibility import EligibilityService
 from sentinelueba.storage.sqlite import SQLiteStorage
 
 
@@ -29,18 +30,24 @@ class DataQualityService:
         observations = self.storage.list_collector_observations()
         late_events = self.storage.late_event_summary()
         duplicates = self.storage.duplicate_event_summary()
-        quality_counts = Counter(window["quality_status"] for window in windows)
+        quarantine = self.storage.quarantine_summary()
+        accepted_events = len(events)
+        duplicate_events = int(duplicates["count"])
+        quarantined_events = int(quarantine["count"])
         usable_real_windows = [
             window
             for window in windows
             if window["dataset_kind"] == "real" and window["quality_status"] == "good"
         ]
+        readiness = EligibilityService(self.storage).readiness()
         summary = {
             "event_counts_by_type": dict(by_type),
             "event_counts_by_collector": dict(by_collector),
-            "received_events": len(events) + duplicates["count"],
-            "accepted_events": len(events),
-            "quarantine": self.storage.quarantine_summary(),
+            "received_events": accepted_events + duplicate_events + quarantined_events,
+            "accepted_events": accepted_events,
+            "duplicate_event_count": duplicate_events,
+            "quarantined_event_count": quarantined_events,
+            "quarantine": quarantine,
             "duplicate_events": duplicates,
             "time_range": {
                 "start": min(timestamps).isoformat() if timestamps else None,
@@ -48,7 +55,7 @@ class DataQualityService:
             },
             "gaps": self.storage.collection_progress()["gaps"],
             "collector_coverage": self._collector_coverage(windows),
-            "window_quality": dict(quality_counts),
+            "window_quality": self._window_quality(windows),
             "usable_coverage_seconds": len(usable_real_windows) * 15 * 60,
             "profiles": profiles,
             "schema_versions": sorted(
@@ -66,14 +73,7 @@ class DataQualityService:
                 kind: value.get("watermark") if value else None
                 for kind, value in state.items()
             },
-            "readiness": {
-                "synthetic_snapshot": any(
-                    window["dataset_kind"] == "synthetic"
-                    and window["quality_status"] in {"good", "degraded"}
-                    for window in windows
-                ),
-                "real_snapshot": self._real_ready(windows),
-            },
+            "readiness": readiness,
             "collection_progress": self.storage.collection_progress(),
             "dataset_snapshots": {
                 "synthetic": self.storage.list_dataset_snapshots("synthetic")[:1],
@@ -97,6 +97,14 @@ class DataQualityService:
             for kind, values in by_kind.items()
         }
 
+    def _window_quality(self, windows: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
+        by_kind: dict[str, Counter[str]] = {"synthetic": Counter(), "real": Counter()}
+        for window in windows:
+            kind = str(window["dataset_kind"])
+            status = str(window["quality_status"])
+            by_kind.setdefault(kind, Counter())[status] += 1
+        return {kind: dict(counts) for kind, counts in by_kind.items()}
+
     def _observation_summary(self, observations: list[dict[str, Any]]) -> dict[str, Any]:
         by_collector: dict[str, dict[str, int]] = {}
         for row in observations:
@@ -110,13 +118,6 @@ class DataQualityService:
             else:
                 current["failed"] += 1
         return {"total": len(observations), "by_collector": by_collector}
-
-    def _real_ready(self, windows: list[dict[str, Any]]) -> bool:
-        real = [window for window in windows if window["dataset_kind"] == "real"]
-        good = [window for window in real if window["quality_status"] == "good"]
-        profiles = {(window["user_id"], window["host_id"]) for window in real}
-        return len(good) >= 96 and len(profiles) == 1
-
 
 class RetentionService:
     def __init__(

@@ -29,4 +29,6 @@ SQLite keeps Windows setup simple and CI portable. It is not a streaming framewo
 event handling is implemented by deterministic invalidation and rebuild of affected
 window ranges. Real coverage is derived from collector observations so a quiet but
 successfully polled host can still produce usable windows without inventing change
-events.
+events. Databases already at schema v5 are verified for required structure; missing
+tables or columns are treated as integrity failures instead of triggering old migrations
+again.

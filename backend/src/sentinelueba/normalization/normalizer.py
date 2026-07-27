@@ -42,6 +42,9 @@ ALLOWED_PAYLOAD_KEYS: dict[EventType, set[str]] = {
         "event_id",
         "record_id",
         "logon_type",
+        "target_domain_name",
+        "status",
+        "sub_status",
     },
 }
 

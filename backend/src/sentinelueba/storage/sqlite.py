@@ -19,6 +19,10 @@ from sentinelueba.validation import (
 DB_SCHEMA_VERSION = 5
 
 
+class SchemaIntegrityError(RuntimeError):
+    pass
+
+
 class SQLiteStorage:
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path
@@ -47,6 +51,13 @@ class SQLiteStorage:
             )
             current_version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
             version = int(current_version or 0)
+            if version > DB_SCHEMA_VERSION:
+                raise SchemaIntegrityError(
+                    f"database schema version {version} is newer than supported {DB_SCHEMA_VERSION}"
+                )
+            if version == DB_SCHEMA_VERSION:
+                self._assert_schema_integrity(conn)
+                return
             if version < 1:
                 self._apply_v1(conn)
                 version = 1
@@ -61,10 +72,7 @@ class SQLiteStorage:
                 version = 4
             if version < 5:
                 self._apply_v5(conn)
-            if version >= DB_SCHEMA_VERSION:
-                self._apply_v3(conn)
-                self._apply_v4(conn)
-                self._apply_v5(conn)
+            self._assert_schema_integrity(conn)
 
     def _record_migration(self, conn: sqlite3.Connection, version: int) -> None:
         conn.execute(
@@ -327,6 +335,72 @@ class SQLiteStorage:
 
     def _columns(self, conn: sqlite3.Connection, table: str) -> set[str]:
         return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+    def _assert_schema_integrity(self, conn: sqlite3.Connection) -> None:
+        required_tables = {
+            "schema_version",
+            "telemetry_events",
+            "anomalies",
+            "collection_sessions",
+            "collector_state",
+            "quarantined_events",
+            "feature_windows",
+            "feature_materialization_state",
+            "data_quality_runs",
+            "dataset_snapshots",
+            "collector_observations",
+            "late_event_records",
+            "duplicate_event_records",
+        }
+        existing_tables = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        missing = sorted(required_tables - existing_tables)
+        if missing:
+            raise SchemaIntegrityError(
+                "database schema integrity check failed; missing table(s): "
+                + ", ".join(missing)
+            )
+        required_columns = {
+            "telemetry_events": {
+                "event_id",
+                "timestamp",
+                "event_type",
+                "user_id",
+                "host_id",
+                "payload_json",
+                "ingested_at",
+                "payload_hash",
+                "event_schema_version",
+            },
+            "feature_materialization_state": {
+                "dataset_kind",
+                "last_ingested_at",
+                "last_event_id",
+                "event_time_watermark",
+                "last_observation_at",
+                "last_successful_run_at",
+            },
+            "collector_observations": {
+                "collector_id",
+                "observed_at",
+                "status",
+                "successful_poll",
+                "configured_interval_seconds",
+                "returned_events",
+                "saved_events",
+            },
+        }
+        for table, columns in required_columns.items():
+            missing_columns = sorted(columns - self._columns(conn, table))
+            if missing_columns:
+                raise SchemaIntegrityError(
+                    "database schema integrity check failed; "
+                    f"{table} missing column(s): {', '.join(missing_columns)}"
+                )
 
     def _apply_v5(self, conn: sqlite3.Connection) -> None:
         state_columns = self._columns(conn, "feature_materialization_state")
@@ -788,61 +862,58 @@ class SQLiteStorage:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def feature_novelty_baseline(
+        self,
+        *,
+        synthetic: bool,
+        before: datetime,
+    ) -> dict[tuple[str, str], dict[str, set[str]]]:
+        baseline: dict[tuple[str, str], dict[str, set[str]]] = {}
+        with self.connect() as conn:
+            process_rows = conn.execute(
+                """
+                SELECT DISTINCT user_id, host_id,
+                    json_extract(payload_json, '$.process_name') AS process_name
+                FROM telemetry_events
+                WHERE synthetic = ?
+                    AND timestamp < ?
+                    AND event_type = ?
+                    AND process_name IS NOT NULL
+                    AND process_name != ''
+                """,
+                (int(synthetic), before.isoformat(), EventType.PROCESS.value),
+            ).fetchall()
+            network_rows = conn.execute(
+                """
+                SELECT DISTINCT user_id, host_id,
+                    json_extract(payload_json, '$.remote_address') AS remote_address,
+                    json_extract(payload_json, '$.remote_port') AS remote_port
+                FROM telemetry_events
+                WHERE synthetic = ?
+                    AND timestamp < ?
+                    AND event_type = ?
+                    AND remote_address IS NOT NULL
+                    AND remote_port IS NOT NULL
+                """,
+                (int(synthetic), before.isoformat(), EventType.NETWORK.value),
+            ).fetchall()
+        for row in process_rows:
+            current = baseline.setdefault(
+                (str(row["user_id"]), str(row["host_id"])),
+                {"processes": set(), "remotes": set()},
+            )
+            current["processes"].add(str(row["process_name"]))
+        for row in network_rows:
+            current = baseline.setdefault(
+                (str(row["user_id"]), str(row["host_id"])),
+                {"processes": set(), "remotes": set()},
+            )
+            current["remotes"].add(f"{row['remote_address']}:{row['remote_port']}")
+        return baseline
+
     def upsert_feature_windows(self, windows: list[dict[str, Any]]) -> int:
         with self.connect() as conn:
-            count = 0
-            for window in windows:
-                now = datetime.now(UTC).isoformat()
-                existing = conn.execute(
-                    "SELECT created_at FROM feature_windows WHERE window_id = ?",
-                    (window["window_id"],),
-                ).fetchone()
-                created_at = existing["created_at"] if existing is not None else now
-                conn.execute(
-                    """
-                    INSERT INTO feature_windows (
-                        window_id, dataset_kind, user_id, host_id, window_start, window_end,
-                        feature_schema_version, window_size_minutes, features_json,
-                        event_count, event_counts_json, collector_coverage_json,
-                        quality_status, quality_reasons_json, gap_duration_seconds,
-                        finalized, source_event_hash, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(window_id) DO UPDATE SET
-                        features_json = excluded.features_json,
-                        event_count = excluded.event_count,
-                        event_counts_json = excluded.event_counts_json,
-                        collector_coverage_json = excluded.collector_coverage_json,
-                        quality_status = excluded.quality_status,
-                        quality_reasons_json = excluded.quality_reasons_json,
-                        gap_duration_seconds = excluded.gap_duration_seconds,
-                        finalized = excluded.finalized,
-                        source_event_hash = excluded.source_event_hash,
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        window["window_id"],
-                        window["dataset_kind"],
-                        window["user_id"],
-                        window["host_id"],
-                        window["window_start"],
-                        window["window_end"],
-                        window["feature_schema_version"],
-                        window["window_size_minutes"],
-                        json.dumps(window["features"], sort_keys=True),
-                        window["event_count"],
-                        json.dumps(window["event_counts"], sort_keys=True),
-                        json.dumps(window["collector_coverage"], sort_keys=True),
-                        window["quality_status"],
-                        json.dumps(window["quality_reasons"], sort_keys=True),
-                        window["gap_duration_seconds"],
-                        int(window["finalized"]),
-                        window["source_event_hash"],
-                        created_at,
-                        now,
-                    ),
-                )
-                count += 1
-            return count
+            return self._upsert_feature_windows_conn(conn, windows)
 
     def delete_feature_windows(
         self,
@@ -860,11 +931,101 @@ class SQLiteStorage:
             clauses.append("window_start < ?")
             params.append(before_start.isoformat())
         with self.connect() as conn:
-            row = conn.execute(
-                f"DELETE FROM feature_windows WHERE {' AND '.join(clauses)}",
-                params,
+            return self._delete_feature_windows_conn(conn, clauses, params)
+
+    def replace_feature_windows_and_materialization_state(
+        self,
+        dataset_kind: str,
+        *,
+        windows: list[dict[str, Any]],
+        state: dict[str, Any],
+        from_start: datetime | None = None,
+        before_start: datetime | None = None,
+    ) -> tuple[int, int]:
+        clauses = ["dataset_kind = ?"]
+        params: list[object] = [dataset_kind]
+        if from_start is not None:
+            clauses.append("window_start >= ?")
+            params.append(from_start.isoformat())
+        if before_start is not None:
+            clauses.append("window_start < ?")
+            params.append(before_start.isoformat())
+        with self.connect() as conn:
+            deleted = self._delete_feature_windows_conn(conn, clauses, params)
+            upserted = self._upsert_feature_windows_conn(conn, windows)
+            self._upsert_materialization_state_conn(conn, **state)
+            return deleted, upserted
+
+    def _upsert_feature_windows_conn(
+        self,
+        conn: sqlite3.Connection,
+        windows: list[dict[str, Any]],
+    ) -> int:
+        count = 0
+        for window in windows:
+            now = datetime.now(UTC).isoformat()
+            existing = conn.execute(
+                "SELECT created_at FROM feature_windows WHERE window_id = ?",
+                (window["window_id"],),
+            ).fetchone()
+            created_at = existing["created_at"] if existing is not None else now
+            conn.execute(
+                """
+                INSERT INTO feature_windows (
+                    window_id, dataset_kind, user_id, host_id, window_start, window_end,
+                    feature_schema_version, window_size_minutes, features_json,
+                    event_count, event_counts_json, collector_coverage_json,
+                    quality_status, quality_reasons_json, gap_duration_seconds,
+                    finalized, source_event_hash, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(window_id) DO UPDATE SET
+                    features_json = excluded.features_json,
+                    event_count = excluded.event_count,
+                    event_counts_json = excluded.event_counts_json,
+                    collector_coverage_json = excluded.collector_coverage_json,
+                    quality_status = excluded.quality_status,
+                    quality_reasons_json = excluded.quality_reasons_json,
+                    gap_duration_seconds = excluded.gap_duration_seconds,
+                    finalized = excluded.finalized,
+                    source_event_hash = excluded.source_event_hash,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    window["window_id"],
+                    window["dataset_kind"],
+                    window["user_id"],
+                    window["host_id"],
+                    window["window_start"],
+                    window["window_end"],
+                    window["feature_schema_version"],
+                    window["window_size_minutes"],
+                    json.dumps(window["features"], sort_keys=True),
+                    window["event_count"],
+                    json.dumps(window["event_counts"], sort_keys=True),
+                    json.dumps(window["collector_coverage"], sort_keys=True),
+                    window["quality_status"],
+                    json.dumps(window["quality_reasons"], sort_keys=True),
+                    window["gap_duration_seconds"],
+                    int(window["finalized"]),
+                    window["source_event_hash"],
+                    created_at,
+                    now,
+                ),
             )
-            return int(row.rowcount)
+            count += 1
+        return count
+
+    def _delete_feature_windows_conn(
+        self,
+        conn: sqlite3.Connection,
+        clauses: list[str],
+        params: list[object],
+    ) -> int:
+        row = conn.execute(
+            f"DELETE FROM feature_windows WHERE {' AND '.join(clauses)}",
+            params,
+        )
+        return int(row.rowcount)
 
     def record_late_event(
         self,
@@ -1002,50 +1163,83 @@ class SQLiteStorage:
         late_events_outside_policy: int = 0,
         rebuilt: bool = False,
     ) -> None:
-        now = datetime.now(UTC).isoformat()
         with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO feature_materialization_state (
-                    dataset_kind, watermark, last_materialized_at,
-                    late_event_interval_minutes, window_size_minutes,
-                    baseline_state_json, last_rebuild_at, last_ingested_at,
-                    last_event_id, event_time_watermark, last_observation_at,
-                    last_successful_run_at, late_events_within_policy,
-                    late_events_outside_policy
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(dataset_kind) DO UPDATE SET
-                    watermark = excluded.watermark,
-                    last_materialized_at = excluded.last_materialized_at,
-                    late_event_interval_minutes = excluded.late_event_interval_minutes,
-                    window_size_minutes = excluded.window_size_minutes,
-                    baseline_state_json = excluded.baseline_state_json,
-                    last_rebuild_at = COALESCE(excluded.last_rebuild_at, last_rebuild_at),
-                    last_ingested_at = excluded.last_ingested_at,
-                    last_event_id = excluded.last_event_id,
-                    event_time_watermark = excluded.event_time_watermark,
-                    last_observation_at = excluded.last_observation_at,
-                    last_successful_run_at = excluded.last_successful_run_at,
-                    late_events_within_policy = excluded.late_events_within_policy,
-                    late_events_outside_policy = excluded.late_events_outside_policy
-                """,
-                (
-                    dataset_kind,
-                    watermark.isoformat() if watermark else None,
-                    now,
-                    late_event_interval_minutes,
-                    window_size_minutes,
-                    json.dumps(baseline_state, sort_keys=True),
-                    now if rebuilt else None,
-                    last_ingested_at,
-                    last_event_id,
-                    event_time_watermark.isoformat() if event_time_watermark else None,
-                    last_observation_at,
-                    now,
-                    late_events_within_policy,
-                    late_events_outside_policy,
-                ),
+            self._upsert_materialization_state_conn(
+                conn,
+                dataset_kind=dataset_kind,
+                watermark=watermark,
+                late_event_interval_minutes=late_event_interval_minutes,
+                window_size_minutes=window_size_minutes,
+                baseline_state=baseline_state,
+                event_time_watermark=event_time_watermark,
+                last_ingested_at=last_ingested_at,
+                last_event_id=last_event_id,
+                last_observation_at=last_observation_at,
+                late_events_within_policy=late_events_within_policy,
+                late_events_outside_policy=late_events_outside_policy,
+                rebuilt=rebuilt,
             )
+
+    def _upsert_materialization_state_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        dataset_kind: str,
+        watermark: datetime | None,
+        late_event_interval_minutes: int,
+        window_size_minutes: int,
+        baseline_state: dict[str, Any],
+        event_time_watermark: datetime | None = None,
+        last_ingested_at: str | None = None,
+        last_event_id: str | None = None,
+        last_observation_at: str | None = None,
+        late_events_within_policy: int = 0,
+        late_events_outside_policy: int = 0,
+        rebuilt: bool = False,
+    ) -> None:
+        now = datetime.now(UTC).isoformat()
+        conn.execute(
+            """
+            INSERT INTO feature_materialization_state (
+                dataset_kind, watermark, last_materialized_at,
+                late_event_interval_minutes, window_size_minutes,
+                baseline_state_json, last_rebuild_at, last_ingested_at,
+                last_event_id, event_time_watermark, last_observation_at,
+                last_successful_run_at, late_events_within_policy,
+                late_events_outside_policy
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(dataset_kind) DO UPDATE SET
+                watermark = excluded.watermark,
+                last_materialized_at = excluded.last_materialized_at,
+                late_event_interval_minutes = excluded.late_event_interval_minutes,
+                window_size_minutes = excluded.window_size_minutes,
+                baseline_state_json = excluded.baseline_state_json,
+                last_rebuild_at = COALESCE(excluded.last_rebuild_at, last_rebuild_at),
+                last_ingested_at = excluded.last_ingested_at,
+                last_event_id = excluded.last_event_id,
+                event_time_watermark = excluded.event_time_watermark,
+                last_observation_at = excluded.last_observation_at,
+                last_successful_run_at = excluded.last_successful_run_at,
+                late_events_within_policy = excluded.late_events_within_policy,
+                late_events_outside_policy = excluded.late_events_outside_policy
+            """,
+            (
+                dataset_kind,
+                watermark.isoformat() if watermark else None,
+                now,
+                late_event_interval_minutes,
+                window_size_minutes,
+                json.dumps(baseline_state, sort_keys=True),
+                now if rebuilt else None,
+                last_ingested_at,
+                last_event_id,
+                event_time_watermark.isoformat() if event_time_watermark else None,
+                last_observation_at,
+                now,
+                late_events_within_policy,
+                late_events_outside_policy,
+            )
+        )
 
     def get_dataset_snapshot(self, dataset_id: str) -> dict[str, Any] | None:
         with self.connect() as conn:

@@ -31,11 +31,15 @@ Rejected events are written to `quarantined_events` with a safe normalized event
 representation, reason, collector/source, receipt timestamp, schema version, and error
 class. The quarantine does not store fields removed by the normalizer.
 
-The quality summary also reports received and accepted events, duplicate events, late
-events split by policy, and collector observation counts. Readiness uses the same real
-eligibility rules as training: one real profile, compatible feature schema, at least 96
-good windows, 24 hours of usable good coverage, core process/system coverage, and no
-synthetic windows mixed into the real dataset.
+The quality summary reports `received_events = accepted_events + duplicate_events +
+quarantined_events`, plus accepted, duplicate, quarantined, late-within-policy,
+late-outside-policy, and collector observation counts separately. Window quality is split
+by `synthetic` and `real` so demo quality does not hide real collection gaps.
+
+Readiness uses the same shared eligibility service as training: one real profile,
+compatible feature schema, at least 96 good windows, 24 hours of usable good coverage,
+cumulative duration, core process/system coverage, no synthetic windows mixed into the
+real dataset, and cumulative duration greater than or equal to usable coverage.
 
 Use:
 

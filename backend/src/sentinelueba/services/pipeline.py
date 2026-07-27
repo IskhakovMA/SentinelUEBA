@@ -17,15 +17,12 @@ from sentinelueba.datasets import DatasetSnapshotService
 from sentinelueba.detection.engine import detect_anomalies, summarize_scores
 from sentinelueba.detection.scenario_validation import validate_demo_scenarios
 from sentinelueba.domain.events import WindowFeatures
-from sentinelueba.features.materialization import (
-    CORE_PROCESS_COLLECTOR,
-    CORE_SYSTEM_COLLECTOR,
-    FeatureMaterializer,
-)
+from sentinelueba.features.materialization import FeatureMaterializer
 from sentinelueba.features.windows import FEATURE_NAMES, build_feature_windows
 from sentinelueba.ml.autoencoder import load_model, model_info, train_autoencoder
 from sentinelueba.normalization.normalizer import normalize_events
 from sentinelueba.quality import DataQualityService, RetentionService
+from sentinelueba.services.eligibility import EligibilityService
 from sentinelueba.storage.sqlite import SQLiteStorage
 from sentinelueba.telemetry.synthetic import generate_synthetic_events, scenario_manifest_for_start
 
@@ -235,95 +232,7 @@ class DemoPipeline:
 
     def training_eligibility(self, dataset_kind: str = "real") -> dict[str, object]:
         self.storage.initialize()
-        windows = self.storage.list_feature_windows(dataset_kind=dataset_kind)
-        if dataset_kind == "synthetic":
-            return {
-                "dataset_kind": dataset_kind,
-                "eligible": len(windows) >= 12,
-                "reason": "ready" if len(windows) >= 12 else "not enough synthetic windows",
-                "windows": len(windows),
-            }
-        progress = self.storage.collection_progress()
-        good_windows = [window for window in windows if window["quality_status"] == "good"]
-        profiles = {(window["user_id"], window["host_id"]) for window in windows}
-        usable_seconds = len(good_windows) * 15 * 60
-        enough_duration = float(progress["cumulative_collected_seconds"]) >= 24 * 60 * 60
-        enough_usable = usable_seconds >= 24 * 60 * 60
-        enough_windows = len(good_windows) >= 96
-        single_profile = len(profiles) == 1 if profiles else False
-        compatible_schema = all(
-            window["feature_schema_version"] == "feature-windows-v2" for window in windows
-        )
-        synthetic_mixed = any(window["dataset_kind"] != "real" for window in windows)
-        enough_system_coverage = self._average_collector_coverage(
-            good_windows,
-            CORE_SYSTEM_COLLECTOR,
-        ) >= 0.8
-        enough_process_coverage = self._average_collector_coverage(
-            good_windows,
-            CORE_PROCESS_COLLECTOR,
-        ) >= 0.8
-        duration_covers_usable = (
-            float(progress["cumulative_collected_seconds"]) >= usable_seconds
-        )
-        reason = "ready"
-        if not enough_duration:
-            reason = "requires 24 cumulative hours of real collection"
-        elif not enough_usable:
-            reason = "requires 24 cumulative hours of usable real coverage"
-        elif not enough_windows:
-            reason = "not enough good real feature windows"
-        elif not single_profile:
-            reason = "requires exactly one user+host profile"
-        elif not enough_system_coverage:
-            reason = "system metrics coverage is insufficient"
-        elif not enough_process_coverage:
-            reason = "process collector coverage is insufficient"
-        elif not compatible_schema:
-            reason = "feature schema is incompatible"
-        elif synthetic_mixed:
-            reason = "real eligibility cannot include synthetic windows"
-        elif not duration_covers_usable:
-            reason = "cumulative duration is less than usable coverage"
-        eligible = (
-            enough_duration
-            and enough_usable
-            and enough_windows
-            and single_profile
-            and enough_system_coverage
-            and enough_process_coverage
-            and compatible_schema
-            and not synthetic_mixed
-            and duration_covers_usable
-        )
-        return {
-            "dataset_kind": dataset_kind,
-            "eligible": eligible,
-            "reason": reason,
-            "windows": len(windows),
-            "good_windows": len(good_windows),
-            "degraded_windows": sum(
-                1 for window in windows if window["quality_status"] == "degraded"
-            ),
-            "insufficient_windows": sum(
-                1 for window in windows if window["quality_status"] == "insufficient"
-            ),
-            "cumulative_collected_seconds": progress["cumulative_collected_seconds"],
-            "usable_coverage_seconds": usable_seconds,
-            "usable_coverage_hours": usable_seconds / 3600,
-            "avg_system_metrics_coverage": self._average_collector_coverage(
-                good_windows,
-                CORE_SYSTEM_COLLECTOR,
-            ),
-            "avg_process_coverage": self._average_collector_coverage(
-                good_windows,
-                CORE_PROCESS_COLLECTOR,
-            ),
-            "longest_continuous_collection_seconds": progress[
-                "longest_continuous_session_seconds"
-            ],
-            "strict_continuous_24h_validated": progress["strict_continuous_24h_validated"],
-        }
+        return EligibilityService(self.storage).training_eligibility(dataset_kind)
 
     def data_quality(self) -> dict[str, object]:
         self.storage.initialize()
@@ -381,22 +290,6 @@ class DemoPipeline:
     def _create_dataset_locked(self, dataset_kind: str) -> dict[str, object]:
         self.materializer().materialize(dataset_kind)
         return self.snapshots().create(dataset_kind)
-
-    def _average_collector_coverage(
-        self,
-        windows: list[dict[str, object]],
-        collector_id: str,
-    ) -> float:
-        if not windows:
-            return 0.0
-        values = []
-        for window in windows:
-            coverage = window.get("collector_coverage", {})
-            if isinstance(coverage, dict):
-                per_collector = coverage.get("collector_coverage", {})
-                if isinstance(per_collector, dict):
-                    values.append(float(per_collector.get(collector_id, 0.0)))
-        return sum(values) / len(windows) if values else 0.0
 
     def _with_feature_lock(
         self,

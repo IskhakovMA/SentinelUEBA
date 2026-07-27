@@ -56,9 +56,14 @@ type CollectionStatus = {
 
 type DataQuality = {
   quarantine: { count: number };
-  window_quality: Record<string, number>;
+  window_quality: Record<string, Record<string, number>>;
   usable_coverage_seconds: number;
-  readiness: { synthetic_snapshot: boolean; real_snapshot: boolean };
+  readiness: {
+    synthetic_snapshot: boolean;
+    real_snapshot: boolean;
+    synthetic?: Record<string, unknown>;
+    real?: Record<string, unknown>;
+  };
   watermark: { synthetic?: string | null; real?: string | null };
   dataset_snapshots: {
     synthetic: Array<{ dataset_id: string; manifest_sha256: string; created_at: string }>;
@@ -433,9 +438,17 @@ function isApiData(value: unknown): value is { data: { scenario_validation?: unk
   return typeof value === 'object' && value !== null && 'data' in value;
 }
 
-function qualityText(quality?: Record<string, number>): string {
+function qualityText(quality?: Record<string, Record<string, number>>): string {
   if (!quality) return '0 / 0 / 0';
-  return `${quality.good ?? 0} / ${quality.degraded ?? 0} / ${quality.insufficient ?? 0}`;
+  const totals = Object.values(quality).reduce(
+    (acc, item) => ({
+      good: acc.good + (item.good ?? 0),
+      degraded: acc.degraded + (item.degraded ?? 0),
+      insufficient: acc.insufficient + (item.insufficient ?? 0),
+    }),
+    { good: 0, degraded: 0, insufficient: 0 },
+  );
+  return `${totals.good} / ${totals.degraded} / ${totals.insufficient}`;
 }
 
 function shortValue(value: unknown): string {

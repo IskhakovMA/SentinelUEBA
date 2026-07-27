@@ -63,6 +63,13 @@ as coverage because it proves the collector ran and observed no changes. Gaps in
 observations reduce coverage, and session `started_at` to `stopped_at` is not counted as
 usable coverage by itself.
 
+Collectors report an explicit poll result to the manager. `successful=true` means the
+source was actually polled; it is not inferred from the absence of a thrown exception.
+Process and network collectors may return successful zero-event polls when there are no
+changes. Whole-source failures such as `AccessDenied`, `OSError`, permission loss, or
+Event Log query/render failures produce failed observations with `successful_poll=0`.
+Returned event counts and saved event counts are stored separately.
+
 ## Delete Local Telemetry
 
 ```powershell

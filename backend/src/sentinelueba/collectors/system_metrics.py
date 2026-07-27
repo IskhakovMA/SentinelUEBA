@@ -8,6 +8,7 @@ import psutil
 from sentinelueba.collectors.base import (
     CollectorCapability,
     CollectorHealth,
+    CollectorPollResult,
     CollectorStatus,
     PrivilegeLevel,
 )
@@ -62,6 +63,9 @@ class SystemMetricsCollector:
         )
 
     def collect(self) -> list[TelemetryEvent]:
+        return self.poll().events
+
+    def poll(self) -> CollectorPollResult:
         timestamp = datetime.now(UTC)
         try:
             cpu = float(psutil.cpu_percent(interval=None))
@@ -81,21 +85,30 @@ class SystemMetricsCollector:
                 "boot_time": boot_time,
                 "uptime_seconds": max(0.0, timestamp.timestamp() - boot_time),
             }
-        except OSError as exc:
-            self._errors.append(type(exc).__name__)
-            return []
-        self._events += 1
-        return [
-            TelemetryEvent(
-                event_id=deterministic_event_id(
-                    [self.collector_id, timestamp.isoformat(), self.user_id, self.host_id]
-                ),
-                timestamp=timestamp,
-                event_type=EventType.SYSTEM_METRICS,
-                user_id=self.user_id,
-                host_id=self.host_id,
-                source=self.collector_id,
-                payload=payload,
-                synthetic=False,
+        except (OSError, AttributeError, TypeError, ValueError) as exc:
+            error_class = type(exc).__name__
+            self._errors.append(error_class)
+            return CollectorPollResult(
+                events=[],
+                successful=False,
+                status="error",
+                error_class=error_class,
             )
-        ]
+        self._events += 1
+        event = TelemetryEvent(
+            event_id=deterministic_event_id(
+                [self.collector_id, timestamp.isoformat(), self.user_id, self.host_id]
+            ),
+            timestamp=timestamp,
+            event_type=EventType.SYSTEM_METRICS,
+            user_id=self.user_id,
+            host_id=self.host_id,
+            source=self.collector_id,
+            payload=payload,
+            synthetic=False,
+        )
+        return CollectorPollResult(
+            events=[event],
+            successful=True,
+            status="ok",
+        )

@@ -234,6 +234,14 @@ class DatasetSnapshotService:
                 raise SnapshotVerificationError("SQLite Parquet SHA-256 mismatch")
             if registry["dataset_kind"] != manifest["dataset_kind"]:
                 raise SnapshotVerificationError("SQLite dataset kind mismatch")
+            if registry["profile"] != manifest["profile"]:
+                raise SnapshotVerificationError("SQLite profile mismatch")
+            if registry["start"] != manifest["start"] or registry["end"] != manifest["end"]:
+                raise SnapshotVerificationError("SQLite dataset range mismatch")
+            if int(registry["window_count"]) != int(manifest["window_count"]):
+                raise SnapshotVerificationError("SQLite window count mismatch")
+            if registry["feature_schema_version"] != manifest["feature_schema_version"]:
+                raise SnapshotVerificationError("SQLite feature schema mismatch")
         try:
             table = pq.read_table(parquet_path)
         except Exception as exc:  # noqa: BLE001
@@ -255,9 +263,16 @@ class DatasetSnapshotService:
         rows = table.to_pylist()
         if len(rows) != int(manifest["window_count"]):
             raise SnapshotVerificationError("Parquet row count does not match manifest")
+        if rows:
+            if str(rows[0]["window_start"]) != manifest["start"]:
+                raise SnapshotVerificationError("first Parquet window_start mismatch")
+            if str(rows[-1]["window_end"]) != manifest["end"]:
+                raise SnapshotVerificationError("last Parquet window_end mismatch")
         seen_windows: set[str] = set()
         previous_start = ""
-        for row in rows:
+        for index, row in enumerate(rows):
+            if int(row["row_index"]) != index:
+                raise SnapshotVerificationError("Parquet row_index sequence mismatch")
             if row["window_id"] in seen_windows:
                 raise SnapshotVerificationError("duplicate window_id in Parquet")
             seen_windows.add(str(row["window_id"]))
@@ -334,7 +349,10 @@ class DatasetSnapshotService:
 
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except FileNotFoundError as exc:
+        raise SnapshotVerificationError(f"{path.name} is missing") from exc
     return digest.hexdigest()

@@ -10,6 +10,7 @@ import psutil
 from sentinelueba.collectors.base import (
     CollectorCapability,
     CollectorHealth,
+    CollectorPollResult,
     CollectorStatus,
     PrivilegeLevel,
 )
@@ -94,37 +95,62 @@ class ProcessCollector:
         )
 
     def collect(self) -> list[TelemetryEvent]:
+        return self.poll().events
+
+    def poll(self) -> CollectorPollResult:
         now = datetime.now(UTC)
-        current = self.snapshot()
+        errors_before = len(self._errors)
+        try:
+            current = self.snapshot()
+        except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess, OSError) as exc:
+            error_class = type(exc).__name__
+            self._errors.append(error_class)
+            return CollectorPollResult(
+                events=[],
+                successful=False,
+                status="error",
+                error_class=error_class,
+            )
         changes = diff_process_snapshots(self._previous, current)
         self._previous = current
         events = [self._event(now, action, snapshot) for action, snapshot in changes]
         self._events += len(events)
-        return events
+        return CollectorPollResult(
+            events=events,
+            successful=True,
+            status="ok",
+            warnings=self._errors[errors_before:],
+        )
 
     def snapshot(self) -> dict[int, ProcessSnapshot]:
         snapshots: dict[int, ProcessSnapshot] = {}
-        for proc in psutil.process_iter(["pid", "name", "exe", "ppid", "create_time"]):
-            try:
-                info: dict[str, Any] = proc.info
-                parent_name = None
-                parent_pid = info.get("ppid")
-                if isinstance(parent_pid, int) and parent_pid > 0:
-                    try:
-                        parent_name = psutil.Process(parent_pid).name()
-                    except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
-                        parent_name = None
-                pid = int(info["pid"])
-                snapshots[pid] = ProcessSnapshot(
-                    pid=pid,
-                    create_time=float(info.get("create_time") or 0.0),
-                    name=str(info.get("name") or "unknown"),
-                    executable_path=info.get("exe") if isinstance(info.get("exe"), str) else None,
-                    parent_pid=parent_pid if isinstance(parent_pid, int) else None,
-                    parent_name=parent_name,
-                )
-            except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess) as exc:
-                self._errors.append(type(exc).__name__)
+        try:
+            iterator = psutil.process_iter(["pid", "name", "exe", "ppid", "create_time"])
+            for proc in iterator:
+                try:
+                    info: dict[str, Any] = proc.info
+                    parent_name = None
+                    parent_pid = info.get("ppid")
+                    if isinstance(parent_pid, int) and parent_pid > 0:
+                        try:
+                            parent_name = psutil.Process(parent_pid).name()
+                        except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
+                            parent_name = None
+                    pid = int(info["pid"])
+                    snapshots[pid] = ProcessSnapshot(
+                        pid=pid,
+                        create_time=float(info.get("create_time") or 0.0),
+                        name=str(info.get("name") or "unknown"),
+                        executable_path=info.get("exe")
+                        if isinstance(info.get("exe"), str)
+                        else None,
+                        parent_pid=parent_pid if isinstance(parent_pid, int) else None,
+                        parent_name=parent_name,
+                    )
+                except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess) as exc:
+                    self._errors.append(type(exc).__name__)
+        except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess, OSError):
+            raise
         return snapshots
 
     def _event(self, timestamp: datetime, action: str, snapshot: ProcessSnapshot) -> TelemetryEvent:

@@ -18,10 +18,11 @@ version.
 manifest, unreadable Parquet file, or checksum mismatch fails with a clear error.
 
 Snapshot creation writes to a temporary directory and atomically renames it only after the
-files verify. Verification rejects unsafe dataset ids, path traversal, manifest/checksum
-tampering, SQLite registry mismatches, wrong manifest version or feature order, missing or
-reordered Parquet columns, row count mismatches, profile/kind mismatches, duplicate or
-unsorted windows, and NaN/Infinity feature values.
+files verify. Verification rejects unsafe dataset ids, path traversal, missing
+manifest/Parquet/checksum files, manifest/checksum tampering, SQLite registry mismatches,
+wrong manifest version or feature order, missing or reordered Parquet columns, row count
+mismatches, row index gaps, manifest start/end boundary mismatches, profile/kind
+mismatches, duplicate or unsorted windows, and NaN/Infinity feature values.
 
 Commands:
 

@@ -9,7 +9,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from sentinelueba.domain.events import EventType, TelemetryEvent
-from sentinelueba.normalization.normalizer import normalize_event
+from sentinelueba.normalization.normalizer import ALLOWED_PAYLOAD_KEYS, normalize_event
 
 EVENT_SCHEMA_VERSION = "event-v1"
 MAX_STRING_LENGTH = 512
@@ -83,6 +83,9 @@ class AuthenticationPayload(StrictPayload):
     event_id: int | None = Field(default=None, ge=0)
     record_id: int | None = Field(default=None, ge=0)
     logon_type: int | None = Field(default=None, ge=0, le=99)
+    target_domain_name: str | None = Field(default=None, max_length=MAX_STRING_LENGTH)
+    status: str | None = Field(default=None, max_length=128)
+    sub_status: str | None = Field(default=None, max_length=128)
 
 
 PAYLOAD_MODELS: dict[EventType, type[StrictPayload]] = {
@@ -95,6 +98,9 @@ PAYLOAD_MODELS: dict[EventType, type[StrictPayload]] = {
 
 def validate_event(event: TelemetryEvent) -> ValidationSuccess | ValidationFailure:
     try:
+        unknown_fields = sorted(set(event.payload) - ALLOWED_PAYLOAD_KEYS[event.event_type])
+        if unknown_fields:
+            raise ValueError(f"unknown or forbidden payload field(s): {', '.join(unknown_fields)}")
         normalized = normalize_event(event)
         if normalized.timestamp.tzinfo is None:
             raise ValueError("timestamp must be timezone-aware")
@@ -132,16 +138,21 @@ def payload_hash(payload: dict[str, Any]) -> str:
 
 
 def safe_quarantine_event(event: TelemetryEvent) -> dict[str, Any]:
-    normalized = normalize_event(event)
+    allowed = ALLOWED_PAYLOAD_KEYS.get(event.event_type, set())
+    safe_payload = {
+        key: value
+        for key, value in event.payload.items()
+        if key in allowed
+    }
     return {
-        "event_id": normalized.event_id,
-        "timestamp": normalized.timestamp.astimezone(UTC).isoformat(),
-        "event_type": normalized.event_type.value,
-        "user_id": normalized.user_id,
-        "host_id": normalized.host_id,
-        "source": normalized.source,
-        "synthetic": normalized.synthetic,
-        "payload": _json_safe(normalized.payload),
+        "event_id": event.event_id,
+        "timestamp": event.timestamp.astimezone(UTC).isoformat(),
+        "event_type": event.event_type.value,
+        "user_id": event.user_id,
+        "host_id": event.host_id,
+        "source": event.source,
+        "synthetic": event.synthetic,
+        "payload": _json_safe(safe_payload),
     }
 
 
