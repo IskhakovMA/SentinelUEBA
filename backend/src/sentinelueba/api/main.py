@@ -103,6 +103,12 @@ async def ml_train(request: MLTrainRequest) -> ApiResponse:
                 families=request.families,
                 seed=request.seed,
                 target_fpr=request.target_fpr,
+                autoencoder_config=(
+                    request.autoencoder.model_dump() if request.autoencoder else None
+                ),
+                isolation_forest_config=(
+                    request.isolation_forest.model_dump() if request.isolation_forest else None
+                ),
             )
         )
     except ValueError as exc:
@@ -141,6 +147,21 @@ async def ml_verify_model(model_id: str) -> ApiResponse:
         return ApiResponse(data=await run_blocking(pipeline().ml_verify_model, model_id))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/ml/models/{model_id}/recommend", response_model=ApiResponse)
+async def ml_recommend_model(model_id: str, request: MLConfirmRequest) -> ApiResponse:
+    try:
+        return ApiResponse(
+            data=await run_blocking(
+                pipeline().ml_recommend_model,
+                model_id,
+                confirm=request.confirm,
+                reason=request.reason,
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/ml/models/{model_id}/promote", response_model=ApiResponse)
@@ -207,6 +228,7 @@ async def ml_score(request: MLScoreRequest) -> ApiResponse:
                 dataset_id=request.dataset_id,
                 model_id=request.model_id,
                 dataset_kind=request.dataset_kind,
+                batch_size=request.batch_size,
             )
         )
     except ValueError as exc:

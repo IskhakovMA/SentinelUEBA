@@ -107,11 +107,13 @@ type ScenarioValidation = {
 type MLModel = {
   model_id: string;
   family: string;
+  model_version: string;
   lifecycle_status: string;
   dataset_id: string;
   dataset_kind: string;
   threshold: number;
   created_at: string;
+  verified_at?: string | null;
 };
 
 type MLTrainingRun = {
@@ -119,19 +121,23 @@ type MLTrainingRun = {
   dataset_id: string;
   dataset_kind: string;
   split_id: string;
+  profile_key: string;
   status: string;
   started_at: string;
   completed_at?: string | null;
+  safe_error_message?: string | null;
 };
 
 type MLScoringRun = {
   scoring_run_id: string;
   model_id: string;
   dataset_id: string;
+  split_range?: { kind?: string };
   status: string;
   window_count: number;
   anomaly_count: number;
   started_at: string;
+  safe_error?: string | null;
 };
 
 type MLStatus = {
@@ -141,6 +147,7 @@ type MLStatus = {
   training_runs: MLTrainingRun[];
   scoring_runs: MLScoringRun[];
   legacy_unregistered: boolean;
+  legacy_artifact?: { description: string; recommendation: string };
 };
 
 const copy = {
@@ -252,6 +259,13 @@ export function App() {
   const [scenarioValidation, setScenarioValidation] = React.useState<ScenarioValidation[]>([]);
   const [dataQuality, setDataQuality] = React.useState<DataQuality | null>(null);
   const [mlStatus, setMlStatus] = React.useState<MLStatus | null>(null);
+  const [mlDatasetKind, setMlDatasetKind] = React.useState<'synthetic' | 'real'>('synthetic');
+  const [selectedDatasetId, setSelectedDatasetId] = React.useState<string>('');
+  const [trainAutoencoder, setTrainAutoencoder] = React.useState<boolean>(true);
+  const [trainIsolationForest, setTrainIsolationForest] = React.useState<boolean>(true);
+  const [autoencoderEpochs, setAutoencoderEpochs] = React.useState<number>(20);
+  const [ifEstimators, setIfEstimators] = React.useState<number>(32);
+  const [scoreBatchSize, setScoreBatchSize] = React.useState<number>(64);
   const t = copy[locale];
 
   const refresh = React.useCallback(async () => {
@@ -296,6 +310,19 @@ export function App() {
   const recommended = mlStatus?.models.find((model) => model.lifecycle_status === 'recommended');
   const latestTrainingRun = mlStatus?.training_runs[0];
   const latestScoringRun = mlStatus?.scoring_runs[0];
+  const availableDatasets = dataQuality?.dataset_snapshots[mlDatasetKind] ?? [];
+  const effectiveDatasetId = selectedDatasetId || availableDatasets[0]?.dataset_id || '';
+  const selectedFamilies = [
+    trainAutoencoder ? 'autoencoder' : '',
+    trainIsolationForest ? 'isolation-forest' : '',
+  ].filter(Boolean);
+  const stage3ModelStatus = champion
+    ? `champion ${shortValue(champion.model_id)}`
+    : mlStatus?.legacy_unregistered
+      ? 'legacy'
+      : status?.model.trained
+        ? 'legacy'
+        : 'missing';
 
   return (
     <main>
@@ -376,7 +403,7 @@ export function App() {
         <article>
           <Shield size={18} />
           <span>{t.model}</span>
-          <strong>{status?.model.trained ? 'trained' : 'missing'}</strong>
+          <strong>{stage3ModelStatus}</strong>
         </article>
       </section>
 
@@ -440,15 +467,115 @@ export function App() {
           <Sparkles size={18} />
           <span>{t.mlLab}</span>
         </div>
+        <div className="mlControls">
+          <label>
+            Dataset kind
+            <select
+              value={mlDatasetKind}
+              onChange={(event) => {
+                setMlDatasetKind(event.target.value as 'synthetic' | 'real');
+                setSelectedDatasetId('');
+              }}
+            >
+              <option value="synthetic">synthetic</option>
+              <option value="real">real</option>
+            </select>
+          </label>
+          <label>
+            Dataset
+            <select
+              value={effectiveDatasetId}
+              onChange={(event) => setSelectedDatasetId(event.target.value)}
+            >
+              {availableDatasets.length ? (
+                availableDatasets.map((dataset) => (
+                  <option key={dataset.dataset_id} value={dataset.dataset_id}>
+                    {shortValue(dataset.dataset_id)} / {shortValue(dataset.manifest_sha256)}
+                  </option>
+                ))
+              ) : (
+                <option value="">none</option>
+              )}
+            </select>
+          </label>
+          <label className="checkControl">
+            <input
+              type="checkbox"
+              checked={trainAutoencoder}
+              onChange={(event) => setTrainAutoencoder(event.target.checked)}
+            />
+            Autoencoder
+          </label>
+          <label className="checkControl">
+            <input
+              type="checkbox"
+              checked={trainIsolationForest}
+              onChange={(event) => setTrainIsolationForest(event.target.checked)}
+            />
+            Isolation Forest
+          </label>
+          <label>
+            AE epochs
+            <input
+              type="number"
+              min={1}
+              max={300}
+              value={autoencoderEpochs}
+              onChange={(event) => setAutoencoderEpochs(Number(event.target.value))}
+            />
+          </label>
+          <label>
+            IF estimators
+            <input
+              type="number"
+              min={10}
+              max={500}
+              value={ifEstimators}
+              onChange={(event) => setIfEstimators(Number(event.target.value))}
+            />
+          </label>
+          <label>
+            Batch
+            <input
+              type="number"
+              min={1}
+              max={4096}
+              value={scoreBatchSize}
+              onChange={(event) => setScoreBatchSize(Number(event.target.value))}
+            />
+          </label>
+        </div>
         <div className="pipelineActions">
           <button
+            disabled={!selectedFamilies.length}
             onClick={() =>
               run(
                 'ml-train',
                 () =>
                   api('/ml/train', {
                     method: 'POST',
-                    body: JSON.stringify({ dataset_kind: 'synthetic', seed: 42 }),
+                    body: JSON.stringify({
+                      dataset_kind: mlDatasetKind,
+                      dataset_id: effectiveDatasetId || undefined,
+                      families: selectedFamilies,
+                      seed: 42,
+                      autoencoder: {
+                        epochs: autoencoderEpochs,
+                        batch_size: 16,
+                        learning_rate: 0.005,
+                        weight_decay: 0.0001,
+                        hidden_dim: 10,
+                        latent_dim: 4,
+                        plateau_patience: 12,
+                      },
+                      isolation_forest: {
+                        n_estimators: ifEstimators,
+                        max_samples: 'auto',
+                        max_features: 1,
+                        bootstrap: false,
+                        n_jobs: 1,
+                      },
+                    }),
                   }),
               )
             }
@@ -480,6 +607,7 @@ export function App() {
                         body: JSON.stringify({
                           dataset_id: champion.dataset_id,
                           model_id: champion.model_id,
+                          batch_size: scoreBatchSize,
                         }),
                       }),
                   )
@@ -546,8 +674,122 @@ export function App() {
             <span>Threshold</span>
             <strong>{champion ? champion.threshold.toFixed(4) : 'none'}</strong>
           </article>
+          <article>
+            <span>Legacy</span>
+            <strong>{mlStatus?.legacy_unregistered ? 'unregistered' : 'none'}</strong>
+          </article>
         </div>
         <p className="warning">{t.mlWarning}</p>
+        {mlStatus?.legacy_unregistered ? (
+          <p className="warning">{mlStatus.legacy_artifact?.recommendation}</p>
+        ) : null}
+        <div className="mlTables">
+          <div>
+            <h3>Models</h3>
+            <div className="table compactTable">
+              {(mlStatus?.models ?? []).map((model) => (
+                <div className="row" key={model.model_id}>
+                  <span>{shortValue(model.model_id)}</span>
+                  <span>{model.family}</span>
+                  <span>{model.lifecycle_status}</span>
+                  <span>{model.dataset_kind}</span>
+                  <span>{model.threshold.toFixed(4)}</span>
+                  <span>{model.verified_at ? 'verified' : 'pending'}</span>
+                  <button
+                    disabled={model.lifecycle_status !== 'candidate'}
+                    onClick={() =>
+                      run(
+                        'recommend',
+                        () =>
+                          api(`/ml/models/${model.model_id}/recommend`, {
+                            method: 'POST',
+                            body: JSON.stringify({ confirm: true, reason: 'ML Lab recommendation' }),
+                          }),
+                      )
+                    }
+                  >
+                    {t.recommended}
+                  </button>
+                  <button
+                    disabled={!['candidate', 'recommended'].includes(model.lifecycle_status)}
+                    onClick={() =>
+                      run(
+                        'promote',
+                        () =>
+                          api(`/ml/models/${model.model_id}/promote`, {
+                            method: 'POST',
+                            body: JSON.stringify({ confirm: true, reason: 'ML Lab promotion' }),
+                          }),
+                      )
+                    }
+                  >
+                    {t.champion}
+                  </button>
+                  <button
+                    disabled={model.lifecycle_status !== 'champion'}
+                    onClick={() =>
+                      run(
+                        'retire',
+                        () =>
+                          api(`/ml/models/${model.model_id}/retire`, {
+                            method: 'POST',
+                            body: JSON.stringify({ confirm: true, reason: 'ML Lab retirement' }),
+                          }),
+                      )
+                    }
+                  >
+                    retire
+                  </button>
+                  <button
+                    disabled={model.lifecycle_status !== 'retired'}
+                    onClick={() =>
+                      run(
+                        'rollback',
+                        () =>
+                          api(`/ml/models/${model.model_id}/rollback`, {
+                            method: 'POST',
+                            body: JSON.stringify({ confirm: true, reason: 'ML Lab rollback' }),
+                          }),
+                      )
+                    }
+                  >
+                    rollback
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div>
+            <h3>Training runs</h3>
+            <div className="table compactTable">
+              {(mlStatus?.training_runs ?? []).map((run) => (
+                <div className="row" key={run.training_run_id}>
+                  <span>{shortValue(run.training_run_id)}</span>
+                  <span>{run.dataset_kind}</span>
+                  <span>{shortValue(run.profile_key)}</span>
+                  <span>{run.status}</span>
+                  <span>{shortValue(run.split_id)}</span>
+                  <span>{run.safe_error_message ? 'failed safely' : 'ok'}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div>
+            <h3>Scoring runs</h3>
+            <div className="table compactTable">
+              {(mlStatus?.scoring_runs ?? []).map((run) => (
+                <div className="row" key={run.scoring_run_id}>
+                  <span>{shortValue(run.scoring_run_id)}</span>
+                  <span>{shortValue(run.model_id)}</span>
+                  <span>{run.split_range?.kind ?? 'snapshot'}</span>
+                  <span>{run.status}</span>
+                  <span>{run.anomaly_count}/{run.window_count}</span>
+                  <span>{run.safe_error ? 'failed safely' : 'ok'}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
       </section>
 
       <section className="grid">

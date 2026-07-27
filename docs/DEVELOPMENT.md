@@ -31,10 +31,11 @@ uv run sentinelueba features materialize --dataset synthetic
 uv run sentinelueba datasets create --kind synthetic
 uv run sentinelueba datasets verify <dataset-id>
 uv run sentinelueba data-quality
-uv run sentinelueba ml train --dataset synthetic --families isolation-forest
+uv run sentinelueba ml train --dataset synthetic --families autoencoder,isolation-forest --autoencoder-epochs 20 --if-n-estimators 32
 uv run sentinelueba ml models list
 uv run sentinelueba ml models verify <model-id>
-uv run sentinelueba ml score --dataset <dataset-id> --model <model-id>
+uv run sentinelueba ml models compare <model-id> <other-model-id>
+uv run sentinelueba ml score --dataset <dataset-id> --model <model-id> --batch-size 64
 ```
 
 Generated SQLite databases, Parquet snapshots, manifests, checksums, model bundles, logs,

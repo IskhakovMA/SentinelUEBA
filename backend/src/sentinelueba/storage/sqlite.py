@@ -1543,6 +1543,51 @@ class SQLiteStorage:
                 ),
             )
 
+    def create_training_run_if_no_running(self, payload: dict[str, Any]) -> None:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            running = conn.execute(
+                """
+                SELECT training_run_id FROM training_runs
+                WHERE dataset_kind = ? AND profile_key = ? AND status = 'running'
+                LIMIT 1
+                """,
+                (payload["dataset_kind"], payload["profile_key"]),
+            ).fetchone()
+            if running is not None:
+                raise ValueError(
+                    "training is already running for this dataset kind and profile"
+                )
+            conn.execute(
+                """
+                INSERT INTO training_runs (
+                    training_run_id, dataset_id, dataset_manifest_sha256, dataset_kind,
+                    profile_key, split_id, split_manifest_sha256, effective_config_json,
+                    config_sha256, seed, status, started_at, completed_at,
+                    application_version, source_commit, error_class, safe_error_message
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    payload["training_run_id"],
+                    payload["dataset_id"],
+                    payload["dataset_manifest_sha256"],
+                    payload["dataset_kind"],
+                    payload["profile_key"],
+                    payload["split_id"],
+                    payload["split_manifest_sha256"],
+                    payload["effective_config_json"],
+                    payload["config_sha256"],
+                    payload["seed"],
+                    payload["status"],
+                    payload["started_at"],
+                    payload.get("completed_at"),
+                    payload["application_version"],
+                    payload.get("source_commit"),
+                    payload.get("error_class"),
+                    payload.get("safe_error_message"),
+                ),
+            )
+
     def complete_training_run(
         self,
         training_run_id: str,
@@ -1560,6 +1605,23 @@ class SQLiteStorage:
                 WHERE training_run_id = ?
                 """,
                 (status, completed_at, error_class, safe_error_message, training_run_id),
+            )
+
+    def update_training_run_split(
+        self,
+        training_run_id: str,
+        *,
+        split_id: str,
+        split_manifest_sha256: str,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE training_runs
+                SET split_id = ?, split_manifest_sha256 = ?
+                WHERE training_run_id = ?
+                """,
+                (split_id, split_manifest_sha256, training_run_id),
             )
 
     def register_model_version(self, payload: dict[str, Any]) -> None:
@@ -1614,6 +1676,33 @@ class SQLiteStorage:
                 params,
             )
 
+    def mark_model_verified(self, model_id: str, verified_at: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE model_versions SET verified_at = ? WHERE model_id = ?",
+                (verified_at, model_id),
+            )
+
+    def delete_models_for_training_run(self, training_run_id: str) -> None:
+        with self.connect() as conn:
+            model_ids = [
+                row["model_id"]
+                for row in conn.execute(
+                    "SELECT model_id FROM model_versions WHERE training_run_id = ?",
+                    (training_run_id,),
+                ).fetchall()
+            ]
+            if model_ids:
+                placeholders = ", ".join("?" for _ in model_ids)
+                conn.execute(
+                    f"DELETE FROM model_evaluations WHERE model_id IN ({placeholders})",
+                    model_ids,
+                )
+                conn.execute(
+                    f"DELETE FROM model_versions WHERE model_id IN ({placeholders})",
+                    model_ids,
+                )
+
     def record_model_evaluation(self, payload: dict[str, Any]) -> None:
         with self.connect() as conn:
             conn.execute(
@@ -1658,6 +1747,12 @@ class SQLiteStorage:
                 (model["dataset_kind"], model["profile_key"]),
             ).fetchone()
             previous_model_id = previous["model_id"] if previous is not None else None
+            if previous_model_id == model_id:
+                return {
+                    "previous_model_id": previous_model_id,
+                    "new_model_id": model_id,
+                    "action": "noop",
+                }
             if previous_model_id and previous_model_id != model_id:
                 conn.execute(
                     "UPDATE model_versions SET lifecycle_status = 'retired' WHERE model_id = ?",
@@ -1718,7 +1813,7 @@ class SQLiteStorage:
                     model["profile_key"],
                     model["dataset_kind"],
                     model_id,
-                    model_id,
+                    "",
                     "retire",
                     reason,
                     created_at,
@@ -1850,6 +1945,91 @@ class SQLiteStorage:
                     )
                     for row in rows
                 ],
+            )
+
+    def create_scoring_run_start(self, payload: dict[str, Any]) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO scoring_runs (
+                    scoring_run_id, model_id, dataset_id, dataset_manifest_sha256,
+                    split_range_json, status, threshold, started_at, completed_at,
+                    window_count, anomaly_count, safe_error
+                ) VALUES (?, ?, ?, ?, ?, 'running', ?, ?, NULL, 0, 0, NULL)
+                """,
+                (
+                    payload["scoring_run_id"],
+                    payload["model_id"],
+                    payload["dataset_id"],
+                    payload["dataset_manifest_sha256"],
+                    json.dumps(payload["split_range"], sort_keys=True),
+                    payload.get("threshold", 0.0),
+                    payload["started_at"],
+                ),
+            )
+
+    def complete_scoring_run_success(
+        self,
+        scoring_run_id: str,
+        *,
+        threshold: float,
+        completed_at: str,
+        rows: list[dict[str, Any]],
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            anomaly_count = sum(1 for row in rows if bool(row["is_anomaly"]))
+            conn.executemany(
+                """
+                INSERT INTO scored_windows (
+                    scoring_run_id, window_id, window_start, window_end, anomaly_score,
+                    threshold, is_anomaly, risk_level, explanation_kind, explanation_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        scoring_run_id,
+                        row["window_id"],
+                        row["window_start"],
+                        row["window_end"],
+                        row["anomaly_score"],
+                        row["threshold"],
+                        int(row["is_anomaly"]),
+                        row["risk_level"],
+                        row["explanation_kind"],
+                        json.dumps(row["explanation"], sort_keys=True),
+                    )
+                    for row in rows
+                ],
+            )
+            conn.execute(
+                """
+                UPDATE scoring_runs
+                SET status = 'success', threshold = ?, completed_at = ?,
+                    window_count = ?, anomaly_count = ?, safe_error = NULL
+                WHERE scoring_run_id = ?
+                """,
+                (threshold, completed_at, len(rows), anomaly_count, scoring_run_id),
+            )
+
+    def complete_scoring_run_failed(
+        self,
+        scoring_run_id: str,
+        *,
+        completed_at: str,
+        safe_error: str,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DELETE FROM scored_windows WHERE scoring_run_id = ?", (scoring_run_id,))
+            conn.execute(
+                """
+                UPDATE scoring_runs
+                SET status = 'failed', completed_at = ?, window_count = 0,
+                    anomaly_count = 0, safe_error = ?
+                WHERE scoring_run_id = ?
+                """,
+                (completed_at, safe_error, scoring_run_id),
             )
 
     def list_scoring_runs(self) -> list[dict[str, Any]]:

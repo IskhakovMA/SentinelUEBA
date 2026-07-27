@@ -66,10 +66,6 @@ class DemoPipeline:
 
     def train(self, seed: int = 42, dataset_kind: str = "synthetic") -> dict[str, object]:
         self.storage.initialize()
-        if dataset_kind == "real":
-            eligibility = self.training_eligibility("real")
-            if not eligibility["eligible"]:
-                raise ValueError(f"real training not eligible: {eligibility['reason']}")
         result = self._with_feature_lock(
             dataset_kind,
             lambda: self._train_from_latest_materialization(dataset_kind, seed),
@@ -308,6 +304,8 @@ class DemoPipeline:
         families: list[str] | None = None,
         seed: int = 42,
         target_fpr: float = 0.05,
+        autoencoder_config: dict[str, object] | None = None,
+        isolation_forest_config: dict[str, object] | None = None,
     ) -> dict[str, object]:
         self.storage.initialize()
         return self._with_feature_lock(
@@ -318,6 +316,8 @@ class DemoPipeline:
                 families=families,
                 seed=seed,
                 target_fpr=target_fpr,
+                autoencoder_config=autoencoder_config,
+                isolation_forest_config=isolation_forest_config,
             ),
         )
 
@@ -332,6 +332,16 @@ class DemoPipeline:
     def ml_verify_model(self, model_id: str) -> dict[str, object]:
         self.storage.initialize()
         return self.ml().verify_model(model_id)
+
+    def ml_recommend_model(
+        self,
+        model_id: str,
+        *,
+        confirm: bool,
+        reason: str = "manual recommendation",
+    ) -> dict[str, object]:
+        self.storage.initialize()
+        return self.ml().recommend(model_id, confirm=confirm, reason=reason)
 
     def ml_promote_model(
         self,
@@ -377,9 +387,15 @@ class DemoPipeline:
         dataset_id: str,
         model_id: str | None = None,
         dataset_kind: str | None = None,
+        batch_size: int = 256,
     ) -> dict[str, object]:
         self.storage.initialize()
-        return self.ml().score(dataset_id=dataset_id, model_id=model_id, dataset_kind=dataset_kind)
+        return self.ml().score(
+            dataset_id=dataset_id,
+            model_id=model_id,
+            dataset_kind=dataset_kind,
+            batch_size=batch_size,
+        )
 
     def ml_scoring_runs(self) -> list[dict[str, object]]:
         self.storage.initialize()
@@ -421,6 +437,8 @@ class DemoPipeline:
         families: list[str] | None,
         seed: int,
         target_fpr: float,
+        autoencoder_config: dict[str, object] | None,
+        isolation_forest_config: dict[str, object] | None,
     ) -> dict[str, object]:
         if dataset_id is None:
             self.materializer().materialize(dataset_kind)
@@ -430,6 +448,9 @@ class DemoPipeline:
             families=families,
             seed=seed,
             target_fpr=target_fpr,
+            autoencoder_config=autoencoder_config,
+            isolation_forest_config=isolation_forest_config,
+            auto_promote_synthetic=False,
         )
 
     def _with_feature_lock(

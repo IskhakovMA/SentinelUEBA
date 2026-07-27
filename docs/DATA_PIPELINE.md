@@ -68,6 +68,8 @@ Snapshots are written through a temporary directory and atomically renamed after
 
 ## Stage 3 Registry Consumers
 
-Stage 3 does not train from arbitrary current SQLite feature windows after a snapshot is created. Model bundles store the source dataset id, dataset manifest SHA-256, feature schema, feature order, split id, threshold, metrics, and artifact hashes. Offline scoring checks dataset kind, profile, feature schema, feature order, model bundle checksums, and SQLite registry hashes before writing `scoring_runs` and `scored_windows`.
+Stage 3 does not train from arbitrary current SQLite feature windows after a snapshot is created. Model bundles store the source dataset id, dataset manifest SHA-256, feature schema, feature order, split id, threshold, metrics, and manifest-anchored artifact hashes for split, preprocessor, metrics, model card, and model artifact. Public verify/load/promote/rollback/score/detect/drift/compare require the source dataset snapshot registry row and verified files.
+
+Offline scoring checks dataset kind, profile, feature schema, feature order, model bundle checksums, manifest artifact hashes, SQLite registry hashes, and source/target snapshot compatibility before writing `scoring_runs` and `scored_windows`. Scoring runs start as `running`, finish as `success` with atomically inserted rows, or finish as `failed` with a sanitized error and no partial rows.
 
 Schema initialization follows the normal v0-to-v7 migration chain. Fresh databases and historical v1/v2/v3/v4/v5/v6 fixtures migrate to v7. A database already at v7 is checked for required tables and columns; missing required schema raises an integrity error instead of rerunning old migrations as self-healing DDL.

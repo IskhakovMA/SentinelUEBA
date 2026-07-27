@@ -76,11 +76,12 @@ uv run sentinelueba quarantine summary
 ## ML Pipeline
 
 ```bash
-uv run sentinelueba ml train --dataset synthetic --seed 42
+uv run sentinelueba ml train --dataset synthetic --seed 42 --autoencoder-epochs 20 --if-n-estimators 32
 uv run sentinelueba ml models list
 uv run sentinelueba ml models verify <model-id>
+uv run sentinelueba ml models recommend <model-id> --confirm
 uv run sentinelueba ml models promote <model-id> --confirm
-uv run sentinelueba ml score --dataset <dataset-id> --model <model-id>
+uv run sentinelueba ml score --dataset <dataset-id> --model <model-id> --batch-size 64
 uv run sentinelueba ml drift --model <model-id> --dataset <dataset-id>
 ```
 

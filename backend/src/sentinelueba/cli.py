@@ -37,6 +37,23 @@ def _print(payload: object) -> None:
     typer.echo(json.dumps(payload, indent=2, default=str))
 
 
+def _parse_if_max_samples(value: str) -> str | int | float:
+    if value == "auto":
+        return value
+    try:
+        if "." in value:
+            parsed_float = float(value)
+            if 0 < parsed_float <= 1:
+                return parsed_float
+        else:
+            parsed_int = int(value)
+            if parsed_int >= 1:
+                return parsed_int
+    except ValueError as exc:
+        raise typer.BadParameter("must be auto, a positive int, or a float in (0, 1]") from exc
+    raise typer.BadParameter("must be auto, a positive int, or a float in (0, 1]")
+
+
 @app.command()
 def init() -> None:
     """Initialize local SQLite schema and artifact directories."""
@@ -241,6 +258,38 @@ def ml_train(
     families: str = typer.Option("autoencoder,isolation-forest", "--families"),
     seed: int = 42,
     target_fpr: float = typer.Option(0.05, "--target-fpr"),
+    autoencoder_epochs: int = typer.Option(80, "--autoencoder-epochs", min=1, max=300),
+    autoencoder_batch_size: int = typer.Option(
+        16,
+        "--autoencoder-batch-size",
+        min=1,
+        max=4096,
+    ),
+    autoencoder_learning_rate: float = typer.Option(
+        0.005,
+        "--autoencoder-learning-rate",
+        min=0.000001,
+        max=1.0,
+    ),
+    autoencoder_weight_decay: float = typer.Option(
+        0.0001,
+        "--autoencoder-weight-decay",
+        min=0.0,
+        max=1.0,
+    ),
+    autoencoder_hidden_dim: int = typer.Option(10, "--autoencoder-hidden-dim", min=2, max=256),
+    autoencoder_latent_dim: int = typer.Option(4, "--autoencoder-latent-dim", min=1, max=128),
+    autoencoder_plateau_patience: int = typer.Option(
+        12,
+        "--autoencoder-plateau-patience",
+        min=1,
+        max=100,
+    ),
+    if_n_estimators: int = typer.Option(80, "--if-n-estimators", min=10, max=500),
+    if_max_samples: str = typer.Option("auto", "--if-max-samples"),
+    if_max_features: float = typer.Option(1.0, "--if-max-features", min=0.000001, max=1.0),
+    if_bootstrap: bool = typer.Option(False, "--if-bootstrap"),
+    if_n_jobs: int = typer.Option(1, "--if-n-jobs", min=1, max=2),
 ) -> None:
     """Train Stage 3 candidate model families from a registered snapshot."""
     try:
@@ -252,6 +301,22 @@ def ml_train(
                 families=selected,
                 seed=seed,
                 target_fpr=target_fpr,
+                autoencoder_config={
+                    "epochs": autoencoder_epochs,
+                    "batch_size": autoencoder_batch_size,
+                    "learning_rate": autoencoder_learning_rate,
+                    "weight_decay": autoencoder_weight_decay,
+                    "hidden_dim": autoencoder_hidden_dim,
+                    "latent_dim": autoencoder_latent_dim,
+                    "plateau_patience": autoencoder_plateau_patience,
+                },
+                isolation_forest_config={
+                    "n_estimators": if_n_estimators,
+                    "max_samples": _parse_if_max_samples(if_max_samples),
+                    "max_features": if_max_features,
+                    "bootstrap": if_bootstrap,
+                    "n_jobs": if_n_jobs,
+                },
             )
         )
     except ValueError as exc:
@@ -321,6 +386,20 @@ def ml_models_promote(
         raise typer.Exit(code=2) from exc
 
 
+@ml_models_app.command("recommend")
+def ml_models_recommend(
+    model_id: str,
+    confirm: bool = typer.Option(False, "--confirm"),
+    reason: str = typer.Option("manual recommendation", "--reason"),
+) -> None:
+    """Mark a verified candidate as recommended."""
+    try:
+        _print(_pipeline().ml_recommend_model(model_id, confirm=confirm, reason=reason))
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+
+
 @ml_models_app.command("retire")
 def ml_models_retire(
     model_id: str,
@@ -359,10 +438,17 @@ def ml_evaluate(model_id: str) -> None:
 def ml_score(
     dataset_id: str = typer.Option(..., "--dataset"),
     model_id: str | None = typer.Option(None, "--model"),
+    batch_size: int = typer.Option(256, "--batch-size", min=1, max=4096),
 ) -> None:
     """Run controlled offline scoring against a registered snapshot."""
     try:
-        _print(_pipeline().ml_score(dataset_id=dataset_id, model_id=model_id))
+        _print(
+            _pipeline().ml_score(
+                dataset_id=dataset_id,
+                model_id=model_id,
+                batch_size=batch_size,
+            )
+        )
     except ValueError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=2) from exc

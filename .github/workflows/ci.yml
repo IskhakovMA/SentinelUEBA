@@ -29,13 +29,45 @@ jobs:
           uv run sentinelueba datasets create --kind synthetic
           DATASET_ID="$(ls -1t data/datasets | head -n 1)"
           uv run sentinelueba datasets verify "$DATASET_ID"
-          uv run sentinelueba ml train --dataset synthetic --dataset-id "$DATASET_ID" --families isolation-forest
+          TRAIN_JSON="$(
+            uv run sentinelueba ml train \
+              --dataset synthetic \
+              --dataset-id "$DATASET_ID" \
+              --families autoencoder,isolation-forest \
+              --autoencoder-epochs 6 \
+              --if-n-estimators 16
+          )"
+          TRAIN_JSON="$TRAIN_JSON" uv run python - <<'PY'
+          import json
+          import os
+          train = json.loads(os.environ["TRAIN_JSON"])
+          assert train["split"]["train"]["count"] == 50, train["split"]
+          assert train["split"]["calibration"]["count"] == 22, train["split"]
+          assert train["split"]["test"]["count"] == 24, train["split"]
+          assert len(train["split"]["scenario_window_ids"]) == 5, train["split"]
+          metrics = [candidate["metrics"] for candidate in train["candidates"]]
+          assert len(metrics) == 2, metrics
+          assert any(
+              item.get("scenario_recall") == 1.0
+              and item.get("false_positive_rate", 1.0) <= 0.15
+              for item in metrics
+          ), metrics
+          PY
           MODEL_ID="$(
-            uv run sentinelueba ml models list \
-              | uv run python -c 'import json, sys; print(json.load(sys.stdin)["models"][0]["model_id"])'
+            TRAIN_JSON="$TRAIN_JSON" uv run python -c 'import json, os; train=json.loads(os.environ["TRAIN_JSON"]); passing=[c for c in train["candidates"] if c["metrics"].get("scenario_recall") == 1.0 and c["metrics"].get("false_positive_rate", 1.0) <= 0.15]; print((passing or train["candidates"])[0]["model_id"])'
+          )"
+          OTHER_ID="$(
+            TRAIN_JSON="$TRAIN_JSON" MODEL_ID="$MODEL_ID" uv run python -c 'import json, os; train=json.loads(os.environ["TRAIN_JSON"]); print(next(c["model_id"] for c in train["candidates"] if c["model_id"] != os.environ["MODEL_ID"]))'
           )"
           uv run sentinelueba ml models verify "$MODEL_ID"
+          uv run sentinelueba ml models verify "$OTHER_ID"
+          uv run sentinelueba ml evaluate "$MODEL_ID"
+          uv run sentinelueba ml models compare "$MODEL_ID" "$OTHER_ID"
+          uv run sentinelueba ml models promote "$MODEL_ID" --confirm
           uv run sentinelueba ml score --dataset "$DATASET_ID" --model "$MODEL_ID"
+          uv run sentinelueba ml drift --dataset "$DATASET_ID" --model "$MODEL_ID"
+          uv run sentinelueba features materialize
+          test -z "$(git ls-files data artifacts || true)"
 
   frontend:
     runs-on: ubuntu-latest
@@ -77,10 +109,20 @@ jobs:
           uv run sentinelueba datasets create --kind synthetic
           $dataset = Get-ChildItem data/datasets | Sort-Object LastWriteTime -Descending | Select-Object -First 1
           uv run sentinelueba datasets verify $dataset.Name
-          $train = uv run sentinelueba ml train --dataset synthetic --dataset-id $dataset.Name --families isolation-forest | ConvertFrom-Json
-          $modelId = $train.candidates[0].model_id
+          $train = uv run sentinelueba ml train --dataset synthetic --dataset-id $dataset.Name --families autoencoder,isolation-forest --autoencoder-epochs 6 --if-n-estimators 16 | ConvertFrom-Json
+          if ($train.split.train.count -ne 50 -or $train.split.calibration.count -ne 22 -or $train.split.test.count -ne 24) { throw "unexpected split counts" }
+          if ($train.split.scenario_window_ids.Count -ne 5) { throw "unexpected scenario split" }
+          $passing = @($train.candidates | Where-Object { $_.metrics.scenario_recall -eq 1.0 -and $_.metrics.false_positive_rate -le 0.15 })
+          if ($passing.Count -eq 0) { throw "no passing candidate" }
+          $modelId = $passing[0].model_id
+          $otherId = @($train.candidates | Where-Object { $_.model_id -ne $modelId })[0].model_id
           uv run sentinelueba ml models verify $modelId
+          uv run sentinelueba ml models verify $otherId
+          uv run sentinelueba ml evaluate $modelId
+          uv run sentinelueba ml models compare $modelId $otherId
+          uv run sentinelueba ml models promote $modelId --confirm
           uv run sentinelueba ml score --dataset $dataset.Name --model $modelId
+          uv run sentinelueba ml drift --dataset $dataset.Name --model $modelId
       - name: PowerShell syntax
         shell: pwsh
         run: |

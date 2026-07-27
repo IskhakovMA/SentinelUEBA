@@ -198,6 +198,13 @@ class AutoencoderV2Model:
             path,
         )
 
+    @property
+    def input_dimension(self) -> int:
+        if self.model is None:
+            raise ModelTrainingError("autoencoder is not fitted")
+        first_weight = next(iter(self.model.state_dict().values()))
+        return int(first_weight.shape[1])
+
     @classmethod
     def load_verified_artifact(cls, path: Path) -> AutoencoderV2Model:
         payload = torch.load(path, map_location="cpu", weights_only=True)
@@ -262,6 +269,12 @@ class IsolationForestV1Model:
         if self.model is None:
             raise ModelTrainingError("isolation forest is not fitted")
         sio.dump(self.model, path)
+
+    @property
+    def input_dimension(self) -> int:
+        if self.model is None:
+            raise ModelTrainingError("isolation forest is not fitted")
+        return int(self.model.n_features_in_)
 
     @classmethod
     def load_verified_artifact(cls, path: Path) -> IsolationForestV1Model:
