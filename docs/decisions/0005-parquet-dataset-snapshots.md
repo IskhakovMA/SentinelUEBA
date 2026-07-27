@@ -11,11 +11,14 @@ requires immutable local datasets with manifest metadata and checksums.
 
 ## Decision
 
-Use Parquet snapshots written with `pyarrow`, plus `manifest.json` and
-`checksums.sha256`.
+Use Parquet snapshots written with `pyarrow`, plus `manifest.json`, `checksums.sha256`,
+and a SQLite registry row containing the manifest and file hashes.
 
 ## Consequences
 
 Parquet is portable across Windows and Linux and is efficient for feature matrices.
 Snapshots are generated local artifacts and are excluded from Git and CI artifacts.
-Snapshot verification is required before training.
+Snapshot verification is required before training and snapshot-backed detection. The
+verification path rejects checksum, manifest, registry, path safety, schema/order, row
+count, profile/kind, ordering, duplicate window, and NaN/Infinity failures before rows are
+used by ML code.

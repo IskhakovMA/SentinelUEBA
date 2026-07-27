@@ -11,6 +11,13 @@ Stage 1 adds opt-in Windows telemetry collection. It is not a Windows Service an
 
 Collected process summaries intentionally exclude command line. General UI summaries do not show raw username, hostname, or full executable paths by default.
 
+Canonical Stage 2 payload actions match the real collectors:
+
+- Process: `started`, `stopped`, `snapshot`.
+- Network: `opened`, `closed`, `snapshot`.
+- Authentication: `login`, `logout`, `authentication`.
+- System metrics: `boot_time` is a finite non-negative epoch-seconds float when present.
+
 ## Event Log Cursor
 
 The authentication collector uses the modern Windows Event Log API through pywin32: `EvtQuery`, `EvtNext`, `EvtRender`, and `EvtClose`. On first start it initializes the cursor to the newest existing `EventRecordID`. Polling then queries records with `EventRecordID` greater than the cursor, so the first new event after start is eligible and already processed records are skipped after restart. Event Log handles are closed on success and error paths.
@@ -50,6 +57,11 @@ at least 24 cumulative hours of good 15-minute real feature windows in one user+
 profile. Process and system metrics are core sources, network is recommended, and
 authentication is optional. Missing authentication rights do not make the whole dataset
 unusable.
+
+Coverage comes from per-poll collector observations. A successful zero-event poll counts
+as coverage because it proves the collector ran and observed no changes. Gaps in
+observations reduce coverage, and session `started_at` to `stopped_at` is not counted as
+usable coverage by itself.
 
 ## Delete Local Telemetry
 

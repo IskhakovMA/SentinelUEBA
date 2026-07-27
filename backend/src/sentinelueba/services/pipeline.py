@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import threading
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 
 from sentinelueba.collectors.manager import (
@@ -16,8 +17,12 @@ from sentinelueba.datasets import DatasetSnapshotService
 from sentinelueba.detection.engine import detect_anomalies, summarize_scores
 from sentinelueba.detection.scenario_validation import validate_demo_scenarios
 from sentinelueba.domain.events import WindowFeatures
-from sentinelueba.features.materialization import FeatureMaterializer
-from sentinelueba.features.windows import build_feature_windows
+from sentinelueba.features.materialization import (
+    CORE_PROCESS_COLLECTOR,
+    CORE_SYSTEM_COLLECTOR,
+    FeatureMaterializer,
+)
+from sentinelueba.features.windows import FEATURE_NAMES, build_feature_windows
 from sentinelueba.ml.autoencoder import load_model, model_info, train_autoencoder
 from sentinelueba.normalization.normalizer import normalize_events
 from sentinelueba.quality import DataQualityService, RetentionService
@@ -72,15 +77,14 @@ class DemoPipeline:
             lambda: self._create_dataset_locked(dataset_kind),
         )
         dataset_id = str(snapshot["dataset_id"])
-        matrix, manifest = self.snapshots().load_matrix(dataset_id)
+        matrix, manifest, rows = self.snapshots().load_matrix(dataset_id)
         if len(matrix) < 12:
             raise ValueError(f"not enough {dataset_kind} feature windows for training")
         split = max(8, int(len(matrix) * 0.62))
         train_matrix = matrix[:split]
-        feature_windows = self.storage.list_feature_windows(dataset_kind=dataset_kind)
         training_range = {
-            "start": str(feature_windows[0]["window_start"]),
-            "end": str(feature_windows[split - 1]["window_end"]),
+            "start": str(rows[0]["window_start"]),
+            "end": str(rows[split - 1]["window_end"]),
         }
         _, preprocessor, losses = train_autoencoder(
             train_matrix,
@@ -92,6 +96,8 @@ class DemoPipeline:
             dataset_id=dataset_id,
             dataset_manifest_sha256=str(snapshot["manifest_sha256"]),
             quality_filters=list(manifest["quality_filters"]),
+            training_window_count=split,
+            evaluation_window_count=max(0, len(matrix) - split),
         )
         return {
             "trained": True,
@@ -109,10 +115,20 @@ class DemoPipeline:
 
     def detect(self, dataset_kind: str = "synthetic") -> dict[str, object]:
         self.storage.initialize()
-        events = self.storage.list_events(synthetic=(dataset_kind == "synthetic"))
-        windows = build_feature_windows(events)
         model, preprocessor = load_model(self.model_dir(dataset_kind))
-        evaluation_windows = self._evaluation_windows(windows, preprocessor.training_range)
+        if not preprocessor.dataset_id:
+            events = self.storage.list_events(synthetic=(dataset_kind == "synthetic"))
+            windows = build_feature_windows(events)
+            evaluation_windows = self._evaluation_windows(windows, preprocessor.training_range)
+        else:
+            _, manifest, rows = self.snapshots().load_matrix(preprocessor.dataset_id)
+            if preprocessor.dataset_manifest_sha256:
+                verification = manifest["verification"]
+                if verification["manifest_sha256"] != preprocessor.dataset_manifest_sha256:
+                    raise ValueError("model dataset manifest SHA-256 mismatch")
+            split = preprocessor.training_window_count or max(8, int(len(rows) * 0.62))
+            windows = [window_from_snapshot_row(row) for row in rows]
+            evaluation_windows = [window_from_snapshot_row(row) for row in rows[split:]]
         anomalies = detect_anomalies(
             model,
             preprocessor,
@@ -235,6 +251,21 @@ class DemoPipeline:
         enough_usable = usable_seconds >= 24 * 60 * 60
         enough_windows = len(good_windows) >= 96
         single_profile = len(profiles) == 1 if profiles else False
+        compatible_schema = all(
+            window["feature_schema_version"] == "feature-windows-v2" for window in windows
+        )
+        synthetic_mixed = any(window["dataset_kind"] != "real" for window in windows)
+        enough_system_coverage = self._average_collector_coverage(
+            good_windows,
+            CORE_SYSTEM_COLLECTOR,
+        ) >= 0.8
+        enough_process_coverage = self._average_collector_coverage(
+            good_windows,
+            CORE_PROCESS_COLLECTOR,
+        ) >= 0.8
+        duration_covers_usable = (
+            float(progress["cumulative_collected_seconds"]) >= usable_seconds
+        )
         reason = "ready"
         if not enough_duration:
             reason = "requires 24 cumulative hours of real collection"
@@ -244,9 +275,30 @@ class DemoPipeline:
             reason = "not enough good real feature windows"
         elif not single_profile:
             reason = "requires exactly one user+host profile"
+        elif not enough_system_coverage:
+            reason = "system metrics coverage is insufficient"
+        elif not enough_process_coverage:
+            reason = "process collector coverage is insufficient"
+        elif not compatible_schema:
+            reason = "feature schema is incompatible"
+        elif synthetic_mixed:
+            reason = "real eligibility cannot include synthetic windows"
+        elif not duration_covers_usable:
+            reason = "cumulative duration is less than usable coverage"
+        eligible = (
+            enough_duration
+            and enough_usable
+            and enough_windows
+            and single_profile
+            and enough_system_coverage
+            and enough_process_coverage
+            and compatible_schema
+            and not synthetic_mixed
+            and duration_covers_usable
+        )
         return {
             "dataset_kind": dataset_kind,
-            "eligible": enough_duration and enough_usable and enough_windows and single_profile,
+            "eligible": eligible,
             "reason": reason,
             "windows": len(windows),
             "good_windows": len(good_windows),
@@ -259,6 +311,14 @@ class DemoPipeline:
             "cumulative_collected_seconds": progress["cumulative_collected_seconds"],
             "usable_coverage_seconds": usable_seconds,
             "usable_coverage_hours": usable_seconds / 3600,
+            "avg_system_metrics_coverage": self._average_collector_coverage(
+                good_windows,
+                CORE_SYSTEM_COLLECTOR,
+            ),
+            "avg_process_coverage": self._average_collector_coverage(
+                good_windows,
+                CORE_PROCESS_COLLECTOR,
+            ),
             "longest_continuous_collection_seconds": progress[
                 "longest_continuous_session_seconds"
             ],
@@ -322,6 +382,22 @@ class DemoPipeline:
         self.materializer().materialize(dataset_kind)
         return self.snapshots().create(dataset_kind)
 
+    def _average_collector_coverage(
+        self,
+        windows: list[dict[str, object]],
+        collector_id: str,
+    ) -> float:
+        if not windows:
+            return 0.0
+        values = []
+        for window in windows:
+            coverage = window.get("collector_coverage", {})
+            if isinstance(coverage, dict):
+                per_collector = coverage.get("collector_coverage", {})
+                if isinstance(per_collector, dict):
+                    values.append(float(per_collector.get(collector_id, 0.0)))
+        return sum(values) / len(windows) if values else 0.0
+
     def _with_feature_lock(
         self,
         dataset_kind: str,
@@ -352,3 +428,17 @@ class DemoPipeline:
             for window in windows
             if window.window_start.isoformat() >= training_end
         ]
+
+
+def window_from_snapshot_row(row: dict[str, object]) -> WindowFeatures:
+    return WindowFeatures(
+        window_start=_parse_snapshot_time(str(row["window_start"])),
+        window_end=_parse_snapshot_time(str(row["window_end"])),
+        user_id=str(row["user_id"]),
+        host_id=str(row["host_id"]),
+        features={name: float(str(row[name])) for name in FEATURE_NAMES},
+    )
+
+
+def _parse_snapshot_time(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))

@@ -26,6 +26,9 @@ class DataQualityService:
             "synthetic": self.storage.get_materialization_state("synthetic"),
             "real": self.storage.get_materialization_state("real"),
         }
+        observations = self.storage.list_collector_observations()
+        late_events = self.storage.late_event_summary()
+        duplicates = self.storage.duplicate_event_summary()
         quality_counts = Counter(window["quality_status"] for window in windows)
         usable_real_windows = [
             window
@@ -35,8 +38,10 @@ class DataQualityService:
         summary = {
             "event_counts_by_type": dict(by_type),
             "event_counts_by_collector": dict(by_collector),
+            "received_events": len(events) + duplicates["count"],
+            "accepted_events": len(events),
             "quarantine": self.storage.quarantine_summary(),
-            "duplicate_events": 0,
+            "duplicate_events": duplicates,
             "time_range": {
                 "start": min(timestamps).isoformat() if timestamps else None,
                 "end": max(timestamps).isoformat() if timestamps else None,
@@ -51,7 +56,8 @@ class DataQualityService:
                 for row in events
                 if row.get("event_schema_version")
             ),
-            "late_events": 0,
+            "late_events": late_events,
+            "collector_observations": self._observation_summary(observations),
             "last_materialized_window": max(
                 (window["window_end"] for window in windows),
                 default=None,
@@ -66,7 +72,7 @@ class DataQualityService:
                     and window["quality_status"] in {"good", "degraded"}
                     for window in windows
                 ),
-                "real_snapshot": len(usable_real_windows) >= 96,
+                "real_snapshot": self._real_ready(windows),
             },
             "collection_progress": self.storage.collection_progress(),
             "dataset_snapshots": {
@@ -90,6 +96,26 @@ class DataQualityService:
             }
             for kind, values in by_kind.items()
         }
+
+    def _observation_summary(self, observations: list[dict[str, Any]]) -> dict[str, Any]:
+        by_collector: dict[str, dict[str, int]] = {}
+        for row in observations:
+            current = by_collector.setdefault(
+                str(row["collector_id"]),
+                {"total": 0, "successful": 0, "failed": 0},
+            )
+            current["total"] += 1
+            if bool(row["successful_poll"]):
+                current["successful"] += 1
+            else:
+                current["failed"] += 1
+        return {"total": len(observations), "by_collector": by_collector}
+
+    def _real_ready(self, windows: list[dict[str, Any]]) -> bool:
+        real = [window for window in windows if window["dataset_kind"] == "real"]
+        good = [window for window in real if window["quality_status"] == "good"]
+        profiles = {(window["user_id"], window["host_id"]) for window in real}
+        return len(good) >= 96 and len(profiles) == 1
 
 
 class RetentionService:

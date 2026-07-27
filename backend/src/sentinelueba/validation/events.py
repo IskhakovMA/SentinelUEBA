@@ -44,7 +44,7 @@ class StrictPayload(BaseModel):
 
 
 class ProcessPayload(StrictPayload):
-    action: Literal["start", "stop", "snapshot"] = "snapshot"
+    action: Literal["started", "stopped", "snapshot"] = "snapshot"
     process_name: str = Field(min_length=1, max_length=MAX_STRING_LENGTH)
     pid: int | None = Field(default=None, ge=0, le=4_294_967_295)
     executable_path: str | None = Field(default=None, max_length=MAX_STRING_LENGTH)
@@ -54,7 +54,7 @@ class ProcessPayload(StrictPayload):
 
 
 class NetworkPayload(StrictPayload):
-    action: Literal["open", "close", "snapshot"] = "snapshot"
+    action: Literal["opened", "closed", "snapshot"] = "snapshot"
     remote_address: str = Field(min_length=1, max_length=128)
     remote_port: int = Field(ge=0, le=65535)
     local_port: int | None = Field(default=None, ge=0, le=65535)
@@ -71,12 +71,12 @@ class SystemMetricsPayload(StrictPayload):
     disk_percent: float | None = Field(default=None, ge=0.0, le=100.0)
     network_bytes_sent_delta: int | None = Field(default=None, ge=0)
     network_bytes_recv_delta: int | None = Field(default=None, ge=0)
-    boot_time: str | None = Field(default=None, max_length=64)
+    boot_time: float | None = Field(default=None, ge=0.0)
     uptime_seconds: float | None = Field(default=None, ge=0.0)
 
 
 class AuthenticationPayload(StrictPayload):
-    action: Literal["logon", "logoff", "authentication"] = "authentication"
+    action: Literal["login", "logout", "authentication"] = "authentication"
     result: Literal["success", "failure"]
     method: str | None = Field(default=None, max_length=128)
     failure_reason: str | None = Field(default=None, max_length=MAX_STRING_LENGTH)

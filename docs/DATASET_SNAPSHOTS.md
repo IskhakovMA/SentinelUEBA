@@ -5,15 +5,23 @@ from arbitrary current SQLite contents. The flow is:
 
 1. Materialize feature windows.
 2. Create an immutable Parquet snapshot.
-3. Verify `manifest.json` and `features.parquet` checksums.
+3. Verify `manifest.json`, `features.parquet`, `checksums.sha256`, and the SQLite registry row.
 4. Train from the verified snapshot matrix.
 
 `manifest.json` records dataset id, kind, created time, application version, event schema
-versions, feature schema version, profile, range, window size, quality filters, feature
-names, event counts, coverage summary, Parquet SHA-256, and manifest version.
+versions observed in the selected source data, feature schema version, profile, range,
+window size, quality filters, feature names, source event counts, coverage summary,
+Parquet SHA-256, materialized quality counts, included quality counts, and manifest
+version.
 
 `checksums.sha256` includes `features.parquet` and `manifest.json`. Loading a damaged
 manifest, unreadable Parquet file, or checksum mismatch fails with a clear error.
+
+Snapshot creation writes to a temporary directory and atomically renames it only after the
+files verify. Verification rejects unsafe dataset ids, path traversal, manifest/checksum
+tampering, SQLite registry mismatches, wrong manifest version or feature order, missing or
+reordered Parquet columns, row count mismatches, profile/kind mismatches, duplicate or
+unsorted windows, and NaN/Infinity feature values.
 
 Commands:
 
@@ -26,3 +34,7 @@ sentinelueba datasets verify <dataset-id>
 
 Synthetic scenario metadata may appear in the manifest for demo evaluation, but scenario
 labels are never feature columns.
+
+Model training stores the dataset id and manifest SHA-256. Later detection reloads and
+verifies that same snapshot before scoring evaluation rows, so raw SQLite changes after
+training do not silently change the offline detection input.

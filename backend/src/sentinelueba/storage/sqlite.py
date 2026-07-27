@@ -16,7 +16,7 @@ from sentinelueba.validation import (
     validate_event,
 )
 
-DB_SCHEMA_VERSION = 4
+DB_SCHEMA_VERSION = 5
 
 
 class SQLiteStorage:
@@ -58,6 +58,13 @@ class SQLiteStorage:
                 version = 3
             if version < 4:
                 self._apply_v4(conn)
+                version = 4
+            if version < 5:
+                self._apply_v5(conn)
+            if version >= DB_SCHEMA_VERSION:
+                self._apply_v3(conn)
+                self._apply_v4(conn)
+                self._apply_v5(conn)
 
     def _record_migration(self, conn: sqlite3.Connection, version: int) -> None:
         conn.execute(
@@ -321,6 +328,86 @@ class SQLiteStorage:
     def _columns(self, conn: sqlite3.Connection, table: str) -> set[str]:
         return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
+    def _apply_v5(self, conn: sqlite3.Connection) -> None:
+        state_columns = self._columns(conn, "feature_materialization_state")
+        state_metadata_columns = {
+            "last_ingested_at": "TEXT",
+            "last_event_id": "TEXT",
+            "event_time_watermark": "TEXT",
+            "last_observation_at": "TEXT",
+            "last_successful_run_at": "TEXT",
+            "late_events_within_policy": "INTEGER NOT NULL DEFAULT 0",
+            "late_events_outside_policy": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for column, column_type in state_metadata_columns.items():
+            if column not in state_columns:
+                conn.execute(
+                    f"ALTER TABLE feature_materialization_state ADD COLUMN {column} {column_type}"
+                )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS collector_observations (
+                observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT,
+                collector_id TEXT NOT NULL,
+                user_id TEXT,
+                host_id TEXT,
+                observed_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                successful_poll INTEGER NOT NULL,
+                error_class TEXT,
+                configured_interval_seconds REAL NOT NULL,
+                returned_events INTEGER NOT NULL,
+                saved_events INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS late_event_records (
+                late_event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                dataset_kind TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                event_timestamp TEXT NOT NULL,
+                ingested_at TEXT NOT NULL,
+                policy_boundary TEXT NOT NULL,
+                within_policy INTEGER NOT NULL,
+                recorded_at TEXT NOT NULL,
+                UNIQUE(dataset_kind, event_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS duplicate_event_records (
+                duplicate_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL,
+                dataset_kind TEXT NOT NULL,
+                first_seen_at TEXT,
+                duplicate_seen_at TEXT NOT NULL,
+                collector_id TEXT,
+                source TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_observations_kind_time "
+            "ON collector_observations(observed_at, collector_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_observations_session "
+            "ON collector_observations(session_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_late_events_kind_time "
+            "ON late_event_records(dataset_kind, event_timestamp)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_duplicate_events_kind "
+            "ON duplicate_event_records(dataset_kind, duplicate_seen_at)"
+        )
+        self._record_migration(conn, 5)
+
     def insert_events(self, events: list[TelemetryEvent]) -> int:
         inserted, _ = self.insert_events_detailed(events)
         return inserted
@@ -387,6 +474,8 @@ class SQLiteStorage:
                 if cursor.rowcount == 1:
                     inserted += 1
                     by_type[event.event_type.value] = by_type.get(event.event_type.value, 0) + 1
+                else:
+                    self._insert_duplicate_row(conn, event, collector_id or event.source)
             return inserted, by_type
 
     def insert_events_and_update_collector_state(
@@ -447,6 +536,8 @@ class SQLiteStorage:
                 if row.rowcount == 1:
                     inserted += 1
                     by_type[event.event_type.value] = by_type.get(event.event_type.value, 0) + 1
+                else:
+                    self._insert_duplicate_row(conn, event, collector_id)
             conn.execute(
                 """
                 INSERT INTO collector_state (
@@ -467,6 +558,33 @@ class SQLiteStorage:
                 ),
             )
             return inserted, by_type
+
+    def _insert_duplicate_row(
+        self,
+        conn: sqlite3.Connection,
+        event: TelemetryEvent,
+        collector_id: str,
+    ) -> None:
+        existing = conn.execute(
+            "SELECT ingested_at FROM telemetry_events WHERE event_id = ?",
+            (event.event_id,),
+        ).fetchone()
+        conn.execute(
+            """
+            INSERT INTO duplicate_event_records (
+                event_id, dataset_kind, first_seen_at, duplicate_seen_at,
+                collector_id, source
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event.event_id,
+                "synthetic" if event.synthetic else "real",
+                existing["ingested_at"] if existing is not None else None,
+                datetime.now(UTC).isoformat(),
+                collector_id,
+                event.source,
+            ),
+        )
 
     def _insert_quarantine_row(
         self,
@@ -545,6 +663,10 @@ class SQLiteStorage:
         *,
         synthetic: bool | None = None,
         since: datetime | None = None,
+        ingested_after: str | None = None,
+        after_event_id: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
     ) -> list[dict[str, Any]]:
         clauses: list[str] = []
         params: list[object] = []
@@ -554,10 +676,24 @@ class SQLiteStorage:
         if since is not None:
             clauses.append("timestamp >= ?")
             params.append(since.isoformat())
+        if start is not None:
+            clauses.append("timestamp >= ?")
+            params.append(start.isoformat())
+        if end is not None:
+            clauses.append("timestamp < ?")
+            params.append(end.isoformat())
+        if ingested_after is not None:
+            if after_event_id is None:
+                clauses.append("ingested_at > ?")
+                params.append(ingested_after)
+            else:
+                clauses.append("(ingested_at > ? OR (ingested_at = ? AND event_id > ?))")
+                params.extend([ingested_after, ingested_after, after_event_id])
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         with self.connect() as conn:
             rows = conn.execute(
-                f"SELECT * FROM telemetry_events {where} ORDER BY timestamp ASC, event_id ASC",
+                f"SELECT * FROM telemetry_events {where} "
+                "ORDER BY timestamp ASC, event_id ASC",
                 params,
             ).fetchall()
         output: list[dict[str, Any]] = []
@@ -585,6 +721,72 @@ class SQLiteStorage:
                 }
             )
         return output
+
+    def record_collector_observation(
+        self,
+        *,
+        session_id: str | None,
+        collector_id: str,
+        user_id: str | None,
+        host_id: str | None,
+        observed_at: datetime,
+        status: str,
+        successful_poll: bool,
+        error_class: str | None,
+        configured_interval_seconds: float,
+        returned_events: int,
+        saved_events: int,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO collector_observations (
+                    session_id, collector_id, user_id, host_id, observed_at, status,
+                    successful_poll, error_class, configured_interval_seconds,
+                    returned_events, saved_events
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    collector_id,
+                    user_id,
+                    host_id,
+                    observed_at.astimezone(UTC).isoformat(),
+                    status,
+                    int(successful_poll),
+                    error_class,
+                    configured_interval_seconds,
+                    returned_events,
+                    saved_events,
+                ),
+            )
+
+    def list_collector_observations(
+        self,
+        *,
+        since: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if since is not None:
+            clauses.append("observed_at > ?")
+            params.append(since)
+        if start is not None:
+            clauses.append("observed_at >= ?")
+            params.append(start.isoformat())
+        if end is not None:
+            clauses.append("observed_at < ?")
+            params.append(end.isoformat())
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM collector_observations {where} "
+                "ORDER BY observed_at ASC, observation_id ASC",
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def upsert_feature_windows(self, windows: list[dict[str, Any]]) -> int:
         with self.connect() as conn:
@@ -647,18 +849,80 @@ class SQLiteStorage:
         dataset_kind: str,
         *,
         from_start: datetime | None = None,
+        before_start: datetime | None = None,
     ) -> int:
         clauses = ["dataset_kind = ?"]
         params: list[object] = [dataset_kind]
         if from_start is not None:
             clauses.append("window_start >= ?")
             params.append(from_start.isoformat())
+        if before_start is not None:
+            clauses.append("window_start < ?")
+            params.append(before_start.isoformat())
         with self.connect() as conn:
             row = conn.execute(
                 f"DELETE FROM feature_windows WHERE {' AND '.join(clauses)}",
                 params,
             )
             return int(row.rowcount)
+
+    def record_late_event(
+        self,
+        *,
+        dataset_kind: str,
+        event_id: str,
+        event_timestamp: datetime,
+        ingested_at: str,
+        policy_boundary: datetime,
+        within_policy: bool,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO late_event_records (
+                    dataset_kind, event_id, event_timestamp, ingested_at,
+                    policy_boundary, within_policy, recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    dataset_kind,
+                    event_id,
+                    event_timestamp.isoformat(),
+                    ingested_at,
+                    policy_boundary.isoformat(),
+                    int(within_policy),
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+
+    def late_event_summary(self) -> dict[str, int]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT within_policy, COUNT(*) AS count
+                FROM late_event_records
+                GROUP BY within_policy
+                """
+            ).fetchall()
+        return {
+            "within_policy": sum(row["count"] for row in rows if int(row["within_policy"]) == 1),
+            "outside_policy": sum(row["count"] for row in rows if int(row["within_policy"]) == 0),
+        }
+
+    def duplicate_event_summary(self) -> dict[str, Any]:
+        with self.connect() as conn:
+            total = conn.execute("SELECT COUNT(*) FROM duplicate_event_records").fetchone()[0]
+            rows = conn.execute(
+                """
+                SELECT dataset_kind, COUNT(*) AS count
+                FROM duplicate_event_records
+                GROUP BY dataset_kind
+                """
+            ).fetchall()
+        return {
+            "count": total,
+            "by_dataset_kind": {row["dataset_kind"]: row["count"] for row in rows},
+        }
 
     def list_feature_windows(
         self,
@@ -708,11 +972,18 @@ class SQLiteStorage:
         return {
             "dataset_kind": row["dataset_kind"],
             "watermark": row["watermark"],
+            "event_time_watermark": row["event_time_watermark"],
+            "last_ingested_at": row["last_ingested_at"],
+            "last_event_id": row["last_event_id"],
+            "last_observation_at": row["last_observation_at"],
             "last_materialized_at": row["last_materialized_at"],
+            "last_successful_run_at": row["last_successful_run_at"],
             "late_event_interval_minutes": row["late_event_interval_minutes"],
             "window_size_minutes": row["window_size_minutes"],
             "baseline_state": json.loads(row["baseline_state_json"]),
             "last_rebuild_at": row["last_rebuild_at"],
+            "late_events_within_policy": row["late_events_within_policy"],
+            "late_events_outside_policy": row["late_events_outside_policy"],
         }
 
     def upsert_materialization_state(
@@ -723,6 +994,12 @@ class SQLiteStorage:
         late_event_interval_minutes: int,
         window_size_minutes: int,
         baseline_state: dict[str, Any],
+        event_time_watermark: datetime | None = None,
+        last_ingested_at: str | None = None,
+        last_event_id: str | None = None,
+        last_observation_at: str | None = None,
+        late_events_within_policy: int = 0,
+        late_events_outside_policy: int = 0,
         rebuilt: bool = False,
     ) -> None:
         now = datetime.now(UTC).isoformat()
@@ -732,15 +1009,25 @@ class SQLiteStorage:
                 INSERT INTO feature_materialization_state (
                     dataset_kind, watermark, last_materialized_at,
                     late_event_interval_minutes, window_size_minutes,
-                    baseline_state_json, last_rebuild_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    baseline_state_json, last_rebuild_at, last_ingested_at,
+                    last_event_id, event_time_watermark, last_observation_at,
+                    last_successful_run_at, late_events_within_policy,
+                    late_events_outside_policy
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(dataset_kind) DO UPDATE SET
                     watermark = excluded.watermark,
                     last_materialized_at = excluded.last_materialized_at,
                     late_event_interval_minutes = excluded.late_event_interval_minutes,
                     window_size_minutes = excluded.window_size_minutes,
                     baseline_state_json = excluded.baseline_state_json,
-                    last_rebuild_at = COALESCE(excluded.last_rebuild_at, last_rebuild_at)
+                    last_rebuild_at = COALESCE(excluded.last_rebuild_at, last_rebuild_at),
+                    last_ingested_at = excluded.last_ingested_at,
+                    last_event_id = excluded.last_event_id,
+                    event_time_watermark = excluded.event_time_watermark,
+                    last_observation_at = excluded.last_observation_at,
+                    last_successful_run_at = excluded.last_successful_run_at,
+                    late_events_within_policy = excluded.late_events_within_policy,
+                    late_events_outside_policy = excluded.late_events_outside_policy
                 """,
                 (
                     dataset_kind,
@@ -750,8 +1037,38 @@ class SQLiteStorage:
                     window_size_minutes,
                     json.dumps(baseline_state, sort_keys=True),
                     now if rebuilt else None,
+                    last_ingested_at,
+                    last_event_id,
+                    event_time_watermark.isoformat() if event_time_watermark else None,
+                    last_observation_at,
+                    now,
+                    late_events_within_policy,
+                    late_events_outside_policy,
                 ),
             )
+
+    def get_dataset_snapshot(self, dataset_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM dataset_snapshots WHERE dataset_id = ?",
+                (dataset_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "dataset_id": row["dataset_id"],
+            "dataset_kind": row["dataset_kind"],
+            "created_at": row["created_at"],
+            "manifest": json.loads(row["manifest_json"]),
+            "manifest_sha256": row["manifest_sha256"],
+            "parquet_sha256": row["parquet_sha256"],
+            "feature_schema_version": row["feature_schema_version"],
+            "profile": json.loads(row["profile_json"]),
+            "start": row["start_at"],
+            "end": row["end_at"],
+            "window_count": row["window_count"],
+            "status": row["status"],
+        }
 
     def register_dataset_snapshot(self, manifest: dict[str, Any], manifest_sha256: str) -> None:
         with self.connect() as conn:

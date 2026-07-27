@@ -8,7 +8,7 @@ SentinelUEBA is a local-first Windows-focused UEBA portfolio project. Stage 2 ke
 
 - Safe synthetic 24-hour-equivalent demo telemetry.
 - Opt-in Windows collectors for process, network, system metrics, and optional Security Event Log authentication metadata.
-- SQLite storage with sequential migrations, indexes, duplicate protection, collection sessions, and collector cursors.
+- SQLite storage with sequential migrations, indexes, duplicate protection, collection sessions, collector observations, and collector cursors.
 - Payload validation, quarantine, and ingestion metadata.
 - Persistent 15-minute UTC feature windows for user + host behavior.
 - Immutable Parquet dataset snapshots with manifests and SHA-256 verification.
@@ -46,7 +46,7 @@ uv run sentinelueba collection-sessions
 uv run sentinelueba training-eligibility --dataset real
 ```
 
-Real training is gated by 24 cumulative hours of usable real coverage from good feature windows in one user + host profile. Cumulative collection is tracked separately from strict continuous 24-hour validation; the project does not claim continuous validation unless the longest session actually reaches 24 hours.
+Real training is gated by 24 cumulative hours of usable real coverage from good feature windows in one user + host profile. Coverage comes from successful collector observations, not from raw session duration. Cumulative collection is tracked separately from strict continuous 24-hour validation; the project does not claim continuous validation unless the longest session actually reaches 24 hours.
 
 See [Windows collection](docs/WINDOWS_COLLECTION.md).
 
@@ -63,7 +63,7 @@ uv run sentinelueba retention preview
 uv run sentinelueba quarantine summary
 ```
 
-Training now uses verified dataset snapshots instead of arbitrary current SQLite contents.
+Training and snapshot-backed detection use verified dataset snapshots instead of arbitrary current SQLite contents.
 See [data pipeline](docs/DATA_PIPELINE.md), [data quality](docs/DATA_QUALITY.md), and [dataset snapshots](docs/DATASET_SNAPSHOTS.md).
 
 ## Architecture

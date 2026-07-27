@@ -12,10 +12,13 @@ and dataset snapshot metadata without adding infrastructure.
 
 ## Decision
 
-Use SQLite v4 tables for the feature store:
+Use SQLite v5 tables for the feature store:
 
 - `feature_windows`
 - `feature_materialization_state`
+- `collector_observations`
+- `late_event_records`
+- `duplicate_event_records`
 - `data_quality_runs`
 - `quarantined_events`
 - `dataset_snapshots`
@@ -24,4 +27,6 @@ Use SQLite v4 tables for the feature store:
 
 SQLite keeps Windows setup simple and CI portable. It is not a streaming framework; late
 event handling is implemented by deterministic invalidation and rebuild of affected
-window ranges.
+window ranges. Real coverage is derived from collector observations so a quiet but
+successfully polled host can still produce usable windows without inventing change
+events.
