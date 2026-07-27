@@ -88,6 +88,7 @@ button:hover {
 
 .metrics article,
 .panel,
+.collectionPanel,
 .details,
 .log {
   border: 1px solid #2f3b46;
@@ -111,6 +112,46 @@ button:hover {
   display: grid;
   grid-template-columns: 1.1fr 1fr;
   gap: 14px;
+}
+
+.collectionPanel {
+  max-width: 1280px;
+  margin: 0 auto 18px;
+  padding: 16px;
+}
+
+.collectionActions,
+.progressLine,
+.eventCounts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.collectorGrid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.collectorGrid article {
+  border: 1px solid #34414d;
+  border-radius: 7px;
+  padding: 10px;
+  display: grid;
+  gap: 6px;
+  min-height: 112px;
+}
+
+.collectorGrid strong,
+.collectorGrid small {
+  overflow-wrap: anywhere;
+}
+
+.warning {
+  color: #f4a261;
 }
 
 .panel {
@@ -221,8 +262,8 @@ button:hover {
   }
 
   .metrics,
-  .grid {
+  .grid,
+  .collectorGrid {
     grid-template-columns: 1fr;
   }
 }
-

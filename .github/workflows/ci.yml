@@ -43,3 +43,28 @@ jobs:
         run: pnpm --dir frontend typecheck
       - name: Build
         run: pnpm --dir frontend build
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: Install backend
+        run: uv sync --all-extras --dev
+      - name: Unit tests
+        run: uv run pytest
+      - name: PowerShell syntax
+        shell: pwsh
+        run: |
+          Get-ChildItem scripts -Filter *.ps1 | ForEach-Object {
+            [scriptblock]::Create((Get-Content $_.FullName -Raw)) | Out-Null
+          }
+      - name: Safe collector smoke
+        shell: pwsh
+        run: |
+          uv run sentinelueba init
+          uv run sentinelueba capabilities
+          uv run sentinelueba collect --duration 3 --interval 1
+          uv run sentinelueba collector-status

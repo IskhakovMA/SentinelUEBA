@@ -5,7 +5,7 @@ from datetime import datetime
 import numpy as np
 
 from sentinelueba.domain.events import AnomalyRecord, AnomalyRisk, WindowFeatures
-from sentinelueba.ml.autoencoder import MODEL_VERSION, Autoencoder, Preprocessor, score_matrix
+from sentinelueba.ml.autoencoder import MODEL_VERSION, Autoencoder, Preprocessor, reconstruct_matrix
 
 
 def classify_risk(score: float, threshold: float) -> AnomalyRisk:
@@ -25,16 +25,31 @@ def detect_anomalies(
     model: Autoencoder,
     preprocessor: Preprocessor,
     windows: list[WindowFeatures],
+    range_kind: str = "evaluation",
 ) -> list[AnomalyRecord]:
     matrix = [[window.features[name] for name in preprocessor.feature_names] for window in windows]
+    raw = np.asarray(matrix, dtype=np.float32)
     scaled = preprocessor.transform(matrix)
-    scores = score_matrix(model, scaled)
+    scores, reconstructed_scaled, residuals = reconstruct_matrix(model, scaled)
     records: list[AnomalyRecord] = []
-    for window, score, scaled_row in zip(windows, scores, scaled, strict=True):
+    for window, score, raw_row, reconstructed_row, residual_row in zip(
+        windows,
+        scores,
+        raw,
+        reconstructed_scaled,
+        residuals,
+        strict=True,
+    ):
         risk = classify_risk(score, preprocessor.threshold)
         if risk == AnomalyRisk.NORMAL:
             continue
-        top = top_deviating_features(preprocessor, scaled_row)
+        contributions = feature_contributions(
+            preprocessor,
+            raw_row,
+            reconstructed_row,
+            residual_row,
+        )
+        top = [str(item["feature_name"]) for item in contributions[:3]]
         records.append(
             AnomalyRecord(
                 timestamp=window.window_start,
@@ -44,10 +59,12 @@ def detect_anomalies(
                 threshold=preprocessor.threshold,
                 risk_level=risk,
                 top_features=top,
-                explanation=make_explanation(risk, top),
+                feature_contributions=contributions[:5],
+                explanation=make_explanation(risk, contributions[:3]),
                 model_version=MODEL_VERSION,
                 window_start=window.window_start,
                 window_end=window.window_end,
+                range_kind=range_kind,
             )
         )
     return sorted(records, key=lambda item: item.anomaly_score, reverse=True)
@@ -66,8 +83,33 @@ def top_deviating_features(
     return [name for name, _ in pairs[:limit]]
 
 
-def make_explanation(risk: AnomalyRisk, top_features: list[str]) -> str:
-    readable = ", ".join(top_features)
+def feature_contributions(
+    preprocessor: Preprocessor,
+    raw_row: np.ndarray,
+    reconstructed_scaled_row: np.ndarray,
+    residual_row: np.ndarray,
+) -> list[dict[str, float | str]]:
+    mean = np.asarray(preprocessor.mean, dtype=np.float32)
+    std = np.asarray(preprocessor.std, dtype=np.float32)
+    reconstructed_raw = reconstructed_scaled_row * std + mean
+    rows: list[dict[str, float | str]] = []
+    for index, feature_name in enumerate(preprocessor.feature_names):
+        observed = float(raw_row[index])
+        expected = float(reconstructed_raw[index])
+        rows.append(
+            {
+                "feature_name": feature_name,
+                "observed_value": observed,
+                "expected_value": expected,
+                "contribution": float(residual_row[index]),
+                "direction": "above" if observed > expected else "below",
+            }
+        )
+    return sorted(rows, key=lambda item: float(item["contribution"]), reverse=True)
+
+
+def make_explanation(risk: AnomalyRisk, contributions: list[dict[str, float | str]]) -> str:
+    readable = ", ".join(str(item["feature_name"]) for item in contributions)
     return (
         f"Statistical anomaly classified as {risk.value}. The strongest deviations from the "
         f"normal synthetic profile are: {readable}. This is not proof of malicious activity."

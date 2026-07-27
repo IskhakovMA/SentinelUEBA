@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
+from importlib.metadata import version
 from pathlib import Path
 from typing import cast
 
@@ -13,6 +16,7 @@ from torch import nn
 from sentinelueba.features.windows import FEATURE_NAMES
 
 MODEL_VERSION = "autoencoder-stage0-v1"
+FEATURE_SCHEMA_VERSION = "feature-windows-v1"
 
 
 @dataclass(frozen=True)
@@ -21,6 +25,10 @@ class Preprocessor:
     mean: list[float]
     std: list[float]
     threshold: float
+    feature_schema_version: str = FEATURE_SCHEMA_VERSION
+    dataset_kind: str = "synthetic"
+    profile: dict[str, str] | None = None
+    training_range: dict[str, str] | None = None
 
     def transform(self, matrix: list[list[float]]) -> np.ndarray:
         data = np.asarray(matrix, dtype=np.float32)
@@ -61,6 +69,9 @@ def train_autoencoder(
     seed: int = 42,
     epochs: int = 120,
     learning_rate: float = 0.01,
+    dataset_kind: str = "synthetic",
+    profile: dict[str, str] | None = None,
+    training_range: dict[str, str] | None = None,
 ) -> tuple[Autoencoder, Preprocessor, list[float]]:
     if len(matrix) < 8:
         raise ValueError("at least 8 feature windows are required for training")
@@ -90,27 +101,53 @@ def train_autoencoder(
         mean=mean.astype(float).tolist(),
         std=std.astype(float).tolist(),
         threshold=threshold,
+        dataset_kind=dataset_kind,
+        profile=profile,
+        training_range=training_range,
     )
     save_model(model, preprocessor, model_dir)
     return model, preprocessor, losses
 
 
 def score_matrix(model: Autoencoder, scaled_matrix: np.ndarray) -> list[float]:
+    scores, _, _ = reconstruct_matrix(model, scaled_matrix)
+    return scores
+
+
+def reconstruct_matrix(
+    model: Autoencoder,
+    scaled_matrix: np.ndarray,
+) -> tuple[list[float], np.ndarray, np.ndarray]:
     with torch.no_grad():
         tensor = torch.tensor(scaled_matrix, dtype=torch.float32)
         reconstructed = model(tensor)
-        errors = torch.mean((reconstructed - tensor) ** 2, dim=1)
-    return [float(value) for value in errors.numpy()]
+        residuals = (reconstructed - tensor) ** 2
+        errors = torch.mean(residuals, dim=1)
+    return [float(value) for value in errors.numpy()], reconstructed.numpy(), residuals.numpy()
 
 
 def save_model(model: Autoencoder, preprocessor: Preprocessor, model_dir: Path) -> None:
     model_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(model.state_dict(), model_dir / "autoencoder.pt")
+    model_path = model_dir / "autoencoder.pt"
+    torch.save(model.state_dict(), model_path)
+    model_sha256 = hashlib.sha256(model_path.read_bytes()).hexdigest()
     (model_dir / "preprocessor.json").write_text(json.dumps(asdict(preprocessor), indent=2))
     (model_dir / "model_info.json").write_text(
         json.dumps(
             {
                 "model_version": MODEL_VERSION,
+                "feature_schema_version": preprocessor.feature_schema_version,
+                "dataset_kind": preprocessor.dataset_kind,
+                "profile": preprocessor.profile,
+                "training_time_range": preprocessor.training_range,
+                "created_at": datetime.now(UTC).isoformat(),
+                "threshold_method": "quantile_0.98_plus_std",
+                "model_sha256": model_sha256,
+                "library_versions": {
+                    "torch": torch.__version__,
+                    "numpy": np.__version__,
+                    "sentinelueba": version("sentinelueba"),
+                },
                 "framework": "pytorch",
                 "input_features": preprocessor.feature_names,
             },
@@ -122,6 +159,13 @@ def save_model(model: Autoencoder, preprocessor: Preprocessor, model_dir: Path) 
 def load_model(model_dir: Path) -> tuple[Autoencoder, Preprocessor]:
     payload = json.loads((model_dir / "preprocessor.json").read_text())
     preprocessor = Preprocessor(**payload)
+    if preprocessor.feature_schema_version != FEATURE_SCHEMA_VERSION:
+        raise ValueError(
+            f"incompatible feature schema: {preprocessor.feature_schema_version}; "
+            f"expected {FEATURE_SCHEMA_VERSION}"
+        )
+    if preprocessor.feature_names != FEATURE_NAMES:
+        raise ValueError("incompatible feature list in saved preprocessor")
     model = Autoencoder(len(preprocessor.feature_names))
     state = torch.load(model_dir / "autoencoder.pt", map_location="cpu", weights_only=True)
     model.load_state_dict(state)

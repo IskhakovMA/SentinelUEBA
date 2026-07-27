@@ -65,10 +65,12 @@ class AnomalyRecord(BaseModel):
     threshold: float
     risk_level: AnomalyRisk
     top_features: list[str]
+    feature_contributions: list[dict[str, float | str]] = []
     explanation: str
     model_version: str
     window_start: datetime
     window_end: datetime
+    range_kind: str = "evaluation"
 
 
 class WindowFeatures(BaseModel):
@@ -84,4 +86,3 @@ def deterministic_event_id(parts: list[str]) -> str:
 
 
 RiskName = Literal["normal", "low", "medium", "high", "critical"]
-

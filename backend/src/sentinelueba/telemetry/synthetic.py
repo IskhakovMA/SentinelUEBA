@@ -16,6 +16,7 @@ class SyntheticGenerationSummary:
     start: datetime
     end: datetime
     anomaly_scenarios: list[str]
+    scenario_manifest: list[dict[str, str]]
 
 
 NORMAL_PROCESSES = [
@@ -118,6 +119,7 @@ def generate_synthetic_events(
             )
 
     scenarios: list[str] = []
+    scenario_manifest: list[dict[str, str]] = []
     if include_anomalies:
         scenarios = [
             "rare_process",
@@ -126,6 +128,7 @@ def generate_synthetic_events(
             "cpu_ram_spike",
             "failed_login_series",
         ]
+        scenario_manifest = _scenario_manifest(start_time)
         _inject_anomalies(events, start_time, seed, user_id, host_id)
 
     events.sort(key=lambda event: (event.timestamp, event.event_id))
@@ -137,8 +140,27 @@ def generate_synthetic_events(
         start=start_time,
         end=start_time + timedelta(hours=hours),
         anomaly_scenarios=scenarios,
+        scenario_manifest=scenario_manifest,
     )
     return events, summary
+
+
+def _scenario_manifest(start_time: datetime) -> list[dict[str, str]]:
+    scenarios = [
+        ("rare_process", start_time + timedelta(hours=18)),
+        ("outbound_connection_spike", start_time + timedelta(hours=19)),
+        ("atypical_time_activity", start_time + timedelta(hours=21, minutes=15)),
+        ("cpu_ram_spike", start_time + timedelta(hours=22)),
+        ("failed_login_series", start_time + timedelta(hours=23)),
+    ]
+    return [
+        {
+            "name": name,
+            "window_start": window_start.isoformat(),
+            "window_end": (window_start + timedelta(minutes=15)).isoformat(),
+        }
+        for name, window_start in scenarios
+    ]
 
 
 def _event(
@@ -269,4 +291,3 @@ def _inject_anomalies(
                 f"auth-fail-{index}",
             )
         )
-
