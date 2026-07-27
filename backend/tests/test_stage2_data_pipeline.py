@@ -176,29 +176,36 @@ def test_invalid_payload_for_each_event_type_is_quarantined(
     assert store.quarantine_summary()["count"] == 1
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4])
-def test_historical_schema_migrations_to_v5(tmp_path: Path, version: int) -> None:
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 5])
+def test_historical_schema_migrations_to_v6(tmp_path: Path, version: int) -> None:
     db = tmp_path / f"v{version}.sqlite3"
     create_historical_database(db, version)
     store = SQLiteStorage(db)
     store.initialize()
-    assert store.status()["schema_version"] == 5
+    assert store.status()["schema_version"] == 6
     assert store.status()["event_count"] == 1
     columns = {
         row[1] for row in sqlite3.connect(db).execute("PRAGMA table_info(telemetry_events)")
     }
     assert {"ingested_at", "collection_session_id", "payload_hash"}.issubset(columns)
     assert "collector_observations" in table_names(db)
+    state_columns = {
+        row[1]
+        for row in sqlite3.connect(db).execute(
+            "PRAGMA table_info(feature_materialization_state)"
+        )
+    }
+    assert "last_observation_id" in state_columns
 
 
-def test_fresh_schema_initializes_to_v5(tmp_path: Path) -> None:
+def test_fresh_schema_initializes_to_v6(tmp_path: Path) -> None:
     store = SQLiteStorage(tmp_path / "fresh.sqlite3")
     store.initialize()
-    assert store.status()["schema_version"] == 5
+    assert store.status()["schema_version"] == 6
     assert "collector_observations" in table_names(store.database_path)
 
 
-def test_repeated_initialize_v5_runs_no_migrations_or_event_updates(
+def test_repeated_initialize_v6_runs_no_migrations_or_event_updates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -213,11 +220,11 @@ def test_repeated_initialize_v5_runs_no_migrations_or_event_updates(
 
     def fail_migration(method_name: str):
         def fail(conn: sqlite3.Connection) -> None:
-            pytest.fail(f"{method_name} should not run for schema v5")
+            pytest.fail(f"{method_name} should not run for schema v6")
 
         return fail
 
-    for name in ["_apply_v1", "_apply_v2", "_apply_v3", "_apply_v4", "_apply_v5"]:
+    for name in ["_apply_v1", "_apply_v2", "_apply_v3", "_apply_v4", "_apply_v5", "_apply_v6"]:
         monkeypatch.setattr(store, name, fail_migration(name))
     store.initialize()
 
@@ -228,8 +235,8 @@ def test_repeated_initialize_v5_runs_no_migrations_or_event_updates(
     assert after == before
 
 
-def test_v5_missing_required_table_raises_schema_integrity_error(tmp_path: Path) -> None:
-    store = SQLiteStorage(tmp_path / "corrupt-v5.sqlite3")
+def test_v6_missing_required_table_raises_schema_integrity_error(tmp_path: Path) -> None:
+    store = SQLiteStorage(tmp_path / "corrupt-v6.sqlite3")
     store.initialize()
     with sqlite3.connect(store.database_path) as conn:
         conn.execute("DROP TABLE collector_observations")
@@ -380,11 +387,143 @@ def test_incremental_materialization_reads_only_new_and_affected_ranges(
     assert store.unrestricted_event_reads == 0
     assert store.unrestricted_observation_reads == 0
     assert any(call.get("start") is not None for call in store.event_row_calls)
-    assert any(call.get("start") is not None for call in store.observation_calls)
+    assert any(call.get("after_observation_id") is not None for call in store.observation_calls)
+    assert any(
+        call.get("overlapping") and call.get("start") is not None
+        for call in store.observation_calls
+    )
     before_by_start = {window["window_start"]: window for window in windows_before}
     after_by_start = {window["window_start"]: window for window in windows_after}
     for window_start, before_window in before_by_start.items():
         assert after_by_start[window_start]["updated_at"] == before_window["updated_at"]
+
+
+def test_same_timestamp_observation_watermark_uses_observation_id(tmp_path: Path) -> None:
+    store = SQLiteStorage(tmp_path / "same-observed-at.sqlite3")
+    store.initialize()
+    start = datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
+    add_session(store, start, start + timedelta(minutes=15))
+    store.record_collector_observation(
+        session_id="fixture-session",
+        collector_id="windows.system_metrics.psutil",
+        user_id="user-a",
+        host_id="host-a",
+        observed_at=start,
+        status="ok",
+        successful_poll=True,
+        error_class=None,
+        configured_interval_seconds=15 * 60,
+        returned_events=0,
+        saved_events=0,
+    )
+    materializer = FeatureMaterializer(store)
+
+    first = materializer.materialize("real")
+    first_state = store.get_materialization_state("real")
+    store.record_collector_observation(
+        session_id="fixture-session",
+        collector_id="windows.process.psutil",
+        user_id="user-a",
+        host_id="host-a",
+        observed_at=start,
+        status="ok",
+        successful_poll=True,
+        error_class=None,
+        configured_interval_seconds=15 * 60,
+        returned_events=0,
+        saved_events=0,
+    )
+    second = materializer.materialize("real")
+    second_state = store.get_materialization_state("real")
+    third = materializer.materialize("real")
+
+    assert first["processed_observations"] == 1
+    assert first_state is not None
+    assert first_state["last_observation_at"] == start.isoformat()
+    assert first_state["last_observation_id"] == 1
+    assert second["processed_observations"] == 1
+    assert second["upserted_windows"] == 1
+    assert second_state is not None
+    assert second_state["last_observation_at"] == start.isoformat()
+    assert second_state["last_observation_id"] == 2
+    assert third["processed_observations"] == 0
+    assert third["upserted_windows"] == 0
+
+
+def test_incremental_materialization_uses_overlapping_3600s_observation_range(
+    tmp_path: Path,
+) -> None:
+    store = InstrumentedStorage(tmp_path / "overlap-3600.sqlite3")
+    store.initialize()
+    start = datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
+    add_session(store, start, start + timedelta(hours=1))
+    add_observations(store, start, windows=1, interval_seconds=60 * 60)
+    store.insert_events(real_profile_events(start, windows=3, synthetic=False))
+    materializer = FeatureMaterializer(store)
+    materializer.materialize("real", rebuild=True)
+    store.reset_instrumentation()
+    store.insert_events(
+        real_profile_events(
+            start + timedelta(minutes=45),
+            windows=1,
+            synthetic=False,
+        )
+    )
+
+    result = materializer.materialize("real")
+    incremental_windows = comparable_feature_windows(
+        store.list_feature_windows(dataset_kind="real")
+    )
+    materializer.materialize("real", rebuild=True)
+    rebuilt_windows = comparable_feature_windows(store.list_feature_windows(dataset_kind="real"))
+    late_window = next(
+        window
+        for window in rebuilt_windows
+        if window["window_start"] == (start + timedelta(minutes=45)).isoformat()
+    )
+
+    assert result["processed_events"] == 2
+    assert result["upserted_windows"] == 1
+    assert any(call.get("overlapping") for call in store.observation_calls)
+    assert max(store.observation_rows_read, default=0) <= 3
+    assert incremental_windows == rebuilt_windows
+    assert late_window["quality_status"] == "good"
+
+
+def test_incremental_materialization_respects_short_observation_interval(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteStorage(tmp_path / "overlap-5s.sqlite3")
+    store.initialize()
+    start = datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
+    add_session(store, start, start + timedelta(minutes=30))
+    add_observations(store, start, windows=1, interval_seconds=5)
+    store.insert_events(real_profile_events(start, windows=1, synthetic=False))
+    materializer = FeatureMaterializer(store)
+    materializer.materialize("real", rebuild=True)
+    store.insert_events(
+        real_profile_events(
+            start + timedelta(minutes=15),
+            windows=1,
+            synthetic=False,
+        )
+    )
+
+    result = materializer.materialize("real")
+    incremental_windows = comparable_feature_windows(
+        store.list_feature_windows(dataset_kind="real")
+    )
+    materializer.materialize("real", rebuild=True)
+    rebuilt_windows = comparable_feature_windows(store.list_feature_windows(dataset_kind="real"))
+    later_window = next(
+        window
+        for window in rebuilt_windows
+        if window["window_start"] == (start + timedelta(minutes=15)).isoformat()
+    )
+
+    assert result["processed_events"] == 2
+    assert incremental_windows == rebuilt_windows
+    assert later_window["quality_status"] == "insufficient"
 
 
 def test_late_event_recomputation_and_full_rebuild_equivalence(tmp_path: Path) -> None:
@@ -673,6 +812,32 @@ def test_detection_uses_model_dataset_snapshot_not_mutated_sqlite_windows(tmp_pa
     assert trained["dataset_id"] == model_info(pipe.model_dir("synthetic"))["dataset_id"]
     assert detected_after["windows"] == original_windows
     assert detected_after["evaluation_windows"] == detected_before["evaluation_windows"]
+
+
+def test_unregistered_public_snapshot_is_rejected_by_verify_load_and_detection(
+    tmp_path: Path,
+) -> None:
+    pipe = DemoPipeline(settings(tmp_path))
+    pipe.initialize()
+    pipe.generate_demo_data(seed=72)
+    pipe.materialize_features("synthetic")
+    trained = pipe.train(seed=72)
+    dataset_id = str(trained["dataset_id"])
+    assert pipe.detect()["windows"] > 0
+
+    with pipe.storage.connect() as conn:
+        conn.execute("DELETE FROM dataset_snapshots WHERE dataset_id = ?", (dataset_id,))
+
+    with pytest.raises(SnapshotVerificationError, match="dataset snapshot is not registered"):
+        pipe.verify_dataset(dataset_id)
+    with pytest.raises(SnapshotVerificationError, match="dataset snapshot is not registered"):
+        pipe.snapshots().load_matrix(dataset_id)
+    with pytest.raises(SnapshotVerificationError, match="dataset snapshot is not registered"):
+        pipe.detect()
+
+    retrained = pipe.train(seed=73)
+    assert retrained["dataset_id"] != dataset_id
+    assert pipe.storage.get_dataset_snapshot(str(retrained["dataset_id"])) is not None
 
 
 def test_damaged_manifest_is_rejected(tmp_path: Path) -> None:
@@ -1034,6 +1199,81 @@ def create_historical_database(db: Path, version: int) -> None:
             )
             """
         )
+    if version >= 5:
+        for column, column_type in {
+            "last_ingested_at": "TEXT",
+            "last_event_id": "TEXT",
+            "event_time_watermark": "TEXT",
+            "last_observation_at": "TEXT",
+            "last_successful_run_at": "TEXT",
+            "late_events_within_policy": "INTEGER NOT NULL DEFAULT 0",
+            "late_events_outside_policy": "INTEGER NOT NULL DEFAULT 0",
+        }.items():
+            conn.execute(
+                f"ALTER TABLE feature_materialization_state ADD COLUMN {column} {column_type}"
+            )
+        conn.execute(
+            """
+            CREATE TABLE collector_observations (
+                observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT,
+                collector_id TEXT NOT NULL,
+                user_id TEXT,
+                host_id TEXT,
+                observed_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                successful_poll INTEGER NOT NULL,
+                error_class TEXT,
+                configured_interval_seconds REAL NOT NULL,
+                returned_events INTEGER NOT NULL,
+                saved_events INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE late_event_records (
+                late_event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                dataset_kind TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                event_timestamp TEXT NOT NULL,
+                ingested_at TEXT NOT NULL,
+                policy_boundary TEXT NOT NULL,
+                within_policy INTEGER NOT NULL,
+                recorded_at TEXT NOT NULL,
+                UNIQUE(dataset_kind, event_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE duplicate_event_records (
+                duplicate_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL,
+                dataset_kind TEXT NOT NULL,
+                first_seen_at TEXT,
+                duplicate_seen_at TEXT NOT NULL,
+                collector_id TEXT,
+                source TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX idx_observations_kind_time "
+            "ON collector_observations(observed_at, collector_id)"
+        )
+        conn.execute(
+            "CREATE INDEX idx_observations_session "
+            "ON collector_observations(session_id)"
+        )
+        conn.execute(
+            "CREATE INDEX idx_late_events_kind_time "
+            "ON late_event_records(dataset_kind, event_timestamp)"
+        )
+        conn.execute(
+            "CREATE INDEX idx_duplicate_events_kind "
+            "ON duplicate_event_records(dataset_kind, duplicate_seen_at)"
+        )
     insert_historical_event(conn, version)
     conn.commit()
     conn.close()
@@ -1126,9 +1366,21 @@ class InstrumentedStorage(SQLiteStorage):
 
     def list_collector_observations(self, **kwargs: object) -> list[dict[str, object]]:
         self.observation_calls.append(dict(kwargs))
-        if not any(kwargs.get(key) is not None for key in ["since", "start", "end"]):
+        if not any(
+            kwargs.get(key) is not None
+            for key in ["since", "after_observation_id", "start", "end"]
+        ):
             self.unrestricted_observation_reads += 1
         rows = super().list_collector_observations(**kwargs)  # type: ignore[arg-type]
+        self.observation_rows_read.append(len(rows))
+        return rows
+
+    def list_collector_observations_overlapping(
+        self,
+        **kwargs: object,
+    ) -> list[dict[str, object]]:
+        self.observation_calls.append({"overlapping": True, **dict(kwargs)})
+        rows = super().list_collector_observations_overlapping(**kwargs)  # type: ignore[arg-type]
         self.observation_rows_read.append(len(rows))
         return rows
 
@@ -1138,6 +1390,7 @@ def add_observations(
     start: datetime,
     *,
     windows: int,
+    interval_seconds: int = 15 * 60,
     gap_start: int | None = None,
     gap_windows: int = 0,
     failed_collectors: set[str] | None = None,
@@ -1162,7 +1415,7 @@ def add_observations(
                 status="ok" if successful else "error",
                 successful_poll=successful,
                 error_class=None if successful else "FixturePollError",
-                configured_interval_seconds=15 * 60,
+                configured_interval_seconds=interval_seconds,
                 returned_events=0,
                 saved_events=0,
             )
@@ -1215,6 +1468,16 @@ def real_profile_events(
                 )
             )
     return events
+
+
+def comparable_feature_windows(windows: list[dict[str, object]]) -> list[dict[str, object]]:
+    comparable: list[dict[str, object]] = []
+    for window in windows:
+        copy = dict(window)
+        copy.pop("created_at", None)
+        copy.pop("updated_at", None)
+        comparable.append(copy)
+    return sorted(comparable, key=lambda item: str(item["window_start"]))
 
 
 def event(

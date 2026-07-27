@@ -48,7 +48,8 @@ class FeatureMaterializer:
             )
             if dataset_kind == "real":
                 new_observations = self.storage.list_collector_observations(
-                    since=state.get("last_observation_at")
+                    since=state.get("last_observation_at"),
+                    after_observation_id=state.get("last_observation_id"),
                 )
             if not new_events and not new_observations:
                 return self._no_op_result(dataset_kind, state)
@@ -69,10 +70,9 @@ class FeatureMaterializer:
                 start=affected_start,
                 end=bounded_end,
             )
-            observation_start = affected_start - timedelta(minutes=self.window_minutes)
             affected_observations = (
-                self.storage.list_collector_observations(
-                    start=observation_start,
+                self.storage.list_collector_observations_overlapping(
+                    start=affected_start,
                     end=bounded_end,
                 )
                 if dataset_kind == "real"
@@ -438,9 +438,20 @@ class FeatureMaterializer:
             [value for value in [previous_watermark, current_watermark] if value is not None],
             default=None,
         )
-        last_observation_at = max(
-            (str(row["observed_at"]) for row in observations),
-            default=previous_state.get("last_observation_at") if previous_state else None,
+        latest_observation_row = max(
+            observations,
+            key=lambda row: (str(row["observed_at"]), int(row["observation_id"])),
+            default=None,
+        )
+        last_observation_at = (
+            str(latest_observation_row["observed_at"])
+            if latest_observation_row
+            else (previous_state.get("last_observation_at") if previous_state else None)
+        )
+        last_observation_id = (
+            int(latest_observation_row["observation_id"])
+            if latest_observation_row
+            else (previous_state.get("last_observation_id") if previous_state else None)
         )
         if baseline_state is not None:
             state_baseline = baseline_state
@@ -459,6 +470,7 @@ class FeatureMaterializer:
             if latest_event_row
             else (previous_state.get("last_event_id") if previous_state else None),
             "last_observation_at": last_observation_at,
+            "last_observation_id": last_observation_id,
             "late_events_within_policy": late_within,
             "late_events_outside_policy": late_outside,
             "late_event_interval_minutes": self.late_event_minutes,

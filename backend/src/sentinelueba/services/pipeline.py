@@ -20,7 +20,6 @@ from sentinelueba.domain.events import WindowFeatures
 from sentinelueba.features.materialization import FeatureMaterializer
 from sentinelueba.features.windows import FEATURE_NAMES, build_feature_windows
 from sentinelueba.ml.autoencoder import load_model, model_info, train_autoencoder
-from sentinelueba.normalization.normalizer import normalize_events
 from sentinelueba.quality import DataQualityService, RetentionService
 from sentinelueba.services.eligibility import EligibilityService
 from sentinelueba.storage.sqlite import SQLiteStorage
@@ -51,8 +50,7 @@ class DemoPipeline:
     def generate_demo_data(self, seed: int = 42) -> dict[str, object]:
         self.storage.initialize()
         events, summary = generate_synthetic_events(seed=seed)
-        normalized = normalize_events(events)
-        inserted = self.storage.insert_events(normalized)
+        inserted = self.storage.insert_events(events)
         return {
             "seed": summary.seed,
             "generated_events": summary.events,

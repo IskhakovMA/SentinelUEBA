@@ -135,6 +135,8 @@ class DatasetSnapshotService:
         dataset_dir = self._dataset_dir(dataset_id)
         manifest = self._read_manifest(dataset_id)
         registry = self.storage.get_dataset_snapshot(dataset_id)
+        if registry is None:
+            raise SnapshotVerificationError("dataset snapshot is not registered")
         table = self._verify_files(dataset_id, dataset_dir, manifest, registry=registry)
         return {
             "dataset_id": dataset_id,

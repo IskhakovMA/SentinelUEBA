@@ -14,7 +14,6 @@ from sentinelueba.collectors.process import ProcessCollector
 from sentinelueba.collectors.system_metrics import SystemMetricsCollector
 from sentinelueba.collectors.windows_auth import WindowsAuthCollector
 from sentinelueba.config import Settings
-from sentinelueba.normalization.normalizer import normalize_events
 from sentinelueba.storage.sqlite import SQLiteStorage
 
 
@@ -217,7 +216,7 @@ class CollectorManager:
                         status="ok",
                     )
                 )
-                events = normalize_events(poll_result.events)
+                events = poll_result.events
                 cursor = collector.cursor if hasattr(collector, "cursor") else None
                 if isinstance(cursor, dict):
                     inserted, by_type = self.storage.insert_events_and_update_collector_state(

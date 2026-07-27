@@ -16,7 +16,7 @@ from sentinelueba.validation import (
     validate_event,
 )
 
-DB_SCHEMA_VERSION = 5
+DB_SCHEMA_VERSION = 6
 
 
 class SchemaIntegrityError(RuntimeError):
@@ -72,6 +72,9 @@ class SQLiteStorage:
                 version = 4
             if version < 5:
                 self._apply_v5(conn)
+                version = 5
+            if version < 6:
+                self._apply_v6(conn)
             self._assert_schema_integrity(conn)
 
     def _record_migration(self, conn: sqlite3.Connection, version: int) -> None:
@@ -382,6 +385,7 @@ class SQLiteStorage:
                 "last_event_id",
                 "event_time_watermark",
                 "last_observation_at",
+                "last_observation_id",
                 "last_successful_run_at",
             },
             "collector_observations": {
@@ -481,6 +485,19 @@ class SQLiteStorage:
             "ON duplicate_event_records(dataset_kind, duplicate_seen_at)"
         )
         self._record_migration(conn, 5)
+
+    def _apply_v6(self, conn: sqlite3.Connection) -> None:
+        state_columns = self._columns(conn, "feature_materialization_state")
+        if "last_observation_id" not in state_columns:
+            conn.execute(
+                "ALTER TABLE feature_materialization_state "
+                "ADD COLUMN last_observation_id INTEGER"
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_observations_watermark "
+            "ON collector_observations(observed_at, observation_id)"
+        )
+        self._record_migration(conn, 6)
 
     def insert_events(self, events: list[TelemetryEvent]) -> int:
         inserted, _ = self.insert_events_detailed(events)
@@ -839,14 +856,19 @@ class SQLiteStorage:
         self,
         *,
         since: str | None = None,
+        after_observation_id: int | None = None,
         start: datetime | None = None,
         end: datetime | None = None,
     ) -> list[dict[str, Any]]:
         clauses: list[str] = []
         params: list[object] = []
         if since is not None:
-            clauses.append("observed_at > ?")
-            params.append(since)
+            if after_observation_id is None:
+                clauses.append("observed_at > ?")
+                params.append(since)
+            else:
+                clauses.append("(observed_at > ? OR (observed_at = ? AND observation_id > ?))")
+                params.extend([since, since, after_observation_id])
         if start is not None:
             clauses.append("observed_at >= ?")
             params.append(start.isoformat())
@@ -857,6 +879,27 @@ class SQLiteStorage:
         with self.connect() as conn:
             rows = conn.execute(
                 f"SELECT * FROM collector_observations {where} "
+                "ORDER BY observed_at ASC, observation_id ASC",
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_collector_observations_overlapping(
+        self,
+        *,
+        start: datetime,
+        end: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = [
+            "julianday(observed_at) < "
+            "COALESCE(julianday(?), julianday('9999-12-31T23:59:59+00:00'))",
+            "julianday(observed_at) + (configured_interval_seconds / 86400.0) > julianday(?)",
+        ]
+        params: list[object] = [end.isoformat() if end is not None else None, start.isoformat()]
+        where = " AND ".join(clauses)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM collector_observations WHERE {where} "
                 "ORDER BY observed_at ASC, observation_id ASC",
                 params,
             ).fetchall()
@@ -1137,6 +1180,7 @@ class SQLiteStorage:
             "last_ingested_at": row["last_ingested_at"],
             "last_event_id": row["last_event_id"],
             "last_observation_at": row["last_observation_at"],
+            "last_observation_id": row["last_observation_id"],
             "last_materialized_at": row["last_materialized_at"],
             "last_successful_run_at": row["last_successful_run_at"],
             "late_event_interval_minutes": row["late_event_interval_minutes"],
@@ -1159,6 +1203,7 @@ class SQLiteStorage:
         last_ingested_at: str | None = None,
         last_event_id: str | None = None,
         last_observation_at: str | None = None,
+        last_observation_id: int | None = None,
         late_events_within_policy: int = 0,
         late_events_outside_policy: int = 0,
         rebuilt: bool = False,
@@ -1175,6 +1220,7 @@ class SQLiteStorage:
                 last_ingested_at=last_ingested_at,
                 last_event_id=last_event_id,
                 last_observation_at=last_observation_at,
+                last_observation_id=last_observation_id,
                 late_events_within_policy=late_events_within_policy,
                 late_events_outside_policy=late_events_outside_policy,
                 rebuilt=rebuilt,
@@ -1193,6 +1239,7 @@ class SQLiteStorage:
         last_ingested_at: str | None = None,
         last_event_id: str | None = None,
         last_observation_at: str | None = None,
+        last_observation_id: int | None = None,
         late_events_within_policy: int = 0,
         late_events_outside_policy: int = 0,
         rebuilt: bool = False,
@@ -1204,10 +1251,10 @@ class SQLiteStorage:
                 dataset_kind, watermark, last_materialized_at,
                 late_event_interval_minutes, window_size_minutes,
                 baseline_state_json, last_rebuild_at, last_ingested_at,
-                last_event_id, event_time_watermark, last_observation_at,
+                last_event_id, event_time_watermark, last_observation_at, last_observation_id,
                 last_successful_run_at, late_events_within_policy,
                 late_events_outside_policy
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(dataset_kind) DO UPDATE SET
                 watermark = excluded.watermark,
                 last_materialized_at = excluded.last_materialized_at,
@@ -1219,6 +1266,7 @@ class SQLiteStorage:
                 last_event_id = excluded.last_event_id,
                 event_time_watermark = excluded.event_time_watermark,
                 last_observation_at = excluded.last_observation_at,
+                last_observation_id = excluded.last_observation_id,
                 last_successful_run_at = excluded.last_successful_run_at,
                 late_events_within_policy = excluded.late_events_within_policy,
                 late_events_outside_policy = excluded.late_events_outside_policy
@@ -1235,6 +1283,7 @@ class SQLiteStorage:
                 last_event_id,
                 event_time_watermark.isoformat() if event_time_watermark else None,
                 last_observation_at,
+                last_observation_id,
                 now,
                 late_events_within_policy,
                 late_events_outside_policy,

@@ -256,7 +256,7 @@ def test_migration_v1_to_current_preserves_events(tmp_path: Path) -> None:
     conn.close()
     store = SQLiteStorage(db)
     store.initialize()
-    assert store.status()["schema_version"] == 5
+    assert store.status()["schema_version"] == 6
     assert store.status()["event_count"] == 1
     assert "collection_sessions" in {
         row[0] for row in sqlite3.connect(db).execute("SELECT name FROM sqlite_master")
@@ -275,6 +275,7 @@ def test_migration_v2_to_current_adds_heartbeat(tmp_path: Path) -> None:
     conn.execute("DELETE FROM schema_version WHERE version = 3")
     conn.execute("DELETE FROM schema_version WHERE version = 4")
     conn.execute("DELETE FROM schema_version WHERE version = 5")
+    conn.execute("DELETE FROM schema_version WHERE version = 6")
     columns = [row[1] for row in conn.execute("PRAGMA table_info(collection_sessions)")]
     if "last_heartbeat_at" in columns:
         conn.execute("ALTER TABLE collection_sessions RENAME TO collection_sessions_old")
@@ -296,7 +297,7 @@ def test_migration_v2_to_current_adds_heartbeat(tmp_path: Path) -> None:
         row[1] for row in sqlite3.connect(db).execute("PRAGMA table_info(collection_sessions)")
     }
     assert "last_heartbeat_at" in columns
-    assert store.status()["schema_version"] == 5
+    assert store.status()["schema_version"] == 6
 
 
 def test_downtime_after_heartbeat_is_not_counted(tmp_path: Path) -> None:
@@ -396,6 +397,34 @@ class FailedPollCollector(FakeCollector):
         )
 
 
+class UnknownFieldPollCollector(FakeCollector):
+    collector_id = "fake.unknown-field"
+    user_id = "user-a"
+    host_id = "host-a"
+
+    def poll(self) -> CollectorPollResult:
+        return CollectorPollResult(
+            events=[
+                TelemetryEvent(
+                    event_id=deterministic_event_id(["unknown-field", "1"]),
+                    timestamp=datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
+                    event_type=EventType.SYSTEM_METRICS,
+                    user_id=self.user_id,
+                    host_id=self.host_id,
+                    source=self.collector_id,
+                    payload={
+                        "cpu_percent": 10.0,
+                        "ram_percent": 40.0,
+                        "unexpected": "secret-value",
+                    },
+                    synthetic=False,
+                )
+            ],
+            successful=True,
+            status="ok",
+        )
+
+
 def test_collector_failure_isolation_and_collection_smoke(tmp_path: Path) -> None:
     manager = CollectorManager(settings(tmp_path))
     manager.build_collectors = lambda enabled=None: [  # type: ignore[method-assign]
@@ -424,6 +453,30 @@ def test_failed_poll_result_records_failed_observation(tmp_path: Path) -> None:
     assert observation["error_class"] == "SyntheticPollError"
     assert observation["returned_events"] == 0
     assert observation["saved_events"] == 0
+
+
+def test_manager_quarantines_unknown_payload_fields_without_pre_normalizing(
+    tmp_path: Path,
+) -> None:
+    manager = CollectorManager(settings(tmp_path))
+    manager._collectors = [UnknownFieldPollCollector()]
+
+    assert manager._collect_once(interval_seconds=5.0) is True
+
+    observation = manager.storage.list_collector_observations()[0]
+    assert observation["collector_id"] == "fake.unknown-field"
+    assert observation["successful_poll"] == 1
+    assert observation["returned_events"] == 1
+    assert observation["saved_events"] == 0
+    assert manager.storage.status()["event_count"] == 0
+    summary = manager.storage.quarantine_summary()
+    assert summary["count"] == 1
+    with manager.storage.connect() as conn:
+        safe_event_json = conn.execute(
+            "SELECT safe_event_json FROM quarantined_events"
+        ).fetchone()["safe_event_json"]
+    assert "unexpected" not in safe_event_json
+    assert "secret-value" not in safe_event_json
 
 
 def test_network_access_denied_records_failed_observation(
