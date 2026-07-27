@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+import psutil
 import pytest
 from fastapi.testclient import TestClient
 
@@ -14,6 +15,7 @@ from sentinelueba.api.main import app
 from sentinelueba.collectors.base import (
     CollectorCapability,
     CollectorHealth,
+    CollectorPollResult,
     CollectorStatus,
     PrivilegeLevel,
 )
@@ -23,8 +25,16 @@ from sentinelueba.collectors.manager import (
     CollectorManager,
     NoAvailableCollectorsError,
 )
-from sentinelueba.collectors.network import NetworkSnapshot, diff_network_snapshots
-from sentinelueba.collectors.process import ProcessSnapshot, diff_process_snapshots
+from sentinelueba.collectors.network import (
+    NetworkCollector,
+    NetworkSnapshot,
+    diff_network_snapshots,
+)
+from sentinelueba.collectors.process import (
+    ProcessCollector,
+    ProcessSnapshot,
+    diff_process_snapshots,
+)
 from sentinelueba.collectors.system_metrics import SystemMetricsCollector
 from sentinelueba.collectors.windows_auth import WindowsAuthCollector, parse_auth_fixture
 from sentinelueba.config import Settings
@@ -246,11 +256,15 @@ def test_migration_v1_to_current_preserves_events(tmp_path: Path) -> None:
     conn.close()
     store = SQLiteStorage(db)
     store.initialize()
-    assert store.status()["schema_version"] == 3
+    assert store.status()["schema_version"] == 6
     assert store.status()["event_count"] == 1
     assert "collection_sessions" in {
         row[0] for row in sqlite3.connect(db).execute("SELECT name FROM sqlite_master")
     }
+    columns = {
+        row[1] for row in sqlite3.connect(db).execute("PRAGMA table_info(telemetry_events)")
+    }
+    assert {"ingested_at", "payload_hash", "event_schema_version"}.issubset(columns)
 
 
 def test_migration_v2_to_current_adds_heartbeat(tmp_path: Path) -> None:
@@ -259,6 +273,9 @@ def test_migration_v2_to_current_adds_heartbeat(tmp_path: Path) -> None:
     store.initialize()
     conn = sqlite3.connect(db)
     conn.execute("DELETE FROM schema_version WHERE version = 3")
+    conn.execute("DELETE FROM schema_version WHERE version = 4")
+    conn.execute("DELETE FROM schema_version WHERE version = 5")
+    conn.execute("DELETE FROM schema_version WHERE version = 6")
     columns = [row[1] for row in conn.execute("PRAGMA table_info(collection_sessions)")]
     if "last_heartbeat_at" in columns:
         conn.execute("ALTER TABLE collection_sessions RENAME TO collection_sessions_old")
@@ -280,7 +297,7 @@ def test_migration_v2_to_current_adds_heartbeat(tmp_path: Path) -> None:
         row[1] for row in sqlite3.connect(db).execute("PRAGMA table_info(collection_sessions)")
     }
     assert "last_heartbeat_at" in columns
-    assert store.status()["schema_version"] == 3
+    assert store.status()["schema_version"] == 6
 
 
 def test_downtime_after_heartbeat_is_not_counted(tmp_path: Path) -> None:
@@ -360,6 +377,54 @@ class UnavailableCollector(FakeCollector):
         )
 
 
+class FailedPollCollector(FakeCollector):
+    collector_id = "fake.failed-poll"
+
+    def health(self) -> CollectorHealth:
+        return CollectorHealth(
+            self.collector_id,
+            CollectorStatus.ERROR,
+            errors=["poll failed"],
+            events_collected=self.events,
+        )
+
+    def poll(self) -> CollectorPollResult:
+        return CollectorPollResult(
+            events=[],
+            successful=False,
+            status="error",
+            error_class="SyntheticPollError",
+        )
+
+
+class UnknownFieldPollCollector(FakeCollector):
+    collector_id = "fake.unknown-field"
+    user_id = "user-a"
+    host_id = "host-a"
+
+    def poll(self) -> CollectorPollResult:
+        return CollectorPollResult(
+            events=[
+                TelemetryEvent(
+                    event_id=deterministic_event_id(["unknown-field", "1"]),
+                    timestamp=datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
+                    event_type=EventType.SYSTEM_METRICS,
+                    user_id=self.user_id,
+                    host_id=self.host_id,
+                    source=self.collector_id,
+                    payload={
+                        "cpu_percent": 10.0,
+                        "ram_percent": 40.0,
+                        "unexpected": "secret-value",
+                    },
+                    synthetic=False,
+                )
+            ],
+            successful=True,
+            status="ok",
+        )
+
+
 def test_collector_failure_isolation_and_collection_smoke(tmp_path: Path) -> None:
     manager = CollectorManager(settings(tmp_path))
     manager.build_collectors = lambda enabled=None: [  # type: ignore[method-assign]
@@ -375,6 +440,97 @@ def test_collector_failure_isolation_and_collection_smoke(tmp_path: Path) -> Non
     assert status["counters"]["fake.collector"] >= 1
     assert status["errors"]
     assert manager.progress()["cumulative_collected_seconds"] > 0
+
+
+def test_failed_poll_result_records_failed_observation(tmp_path: Path) -> None:
+    manager = CollectorManager(settings(tmp_path))
+    manager._collectors = [FailedPollCollector()]
+    assert manager._collect_once(interval_seconds=5.0) is False
+    observation = manager.storage.list_collector_observations()[0]
+    assert observation["collector_id"] == "fake.failed-poll"
+    assert observation["status"] == "error"
+    assert observation["successful_poll"] == 0
+    assert observation["error_class"] == "SyntheticPollError"
+    assert observation["returned_events"] == 0
+    assert observation["saved_events"] == 0
+
+
+def test_manager_quarantines_unknown_payload_fields_without_pre_normalizing(
+    tmp_path: Path,
+) -> None:
+    manager = CollectorManager(settings(tmp_path))
+    manager._collectors = [UnknownFieldPollCollector()]
+
+    assert manager._collect_once(interval_seconds=5.0) is True
+
+    observation = manager.storage.list_collector_observations()[0]
+    assert observation["collector_id"] == "fake.unknown-field"
+    assert observation["successful_poll"] == 1
+    assert observation["returned_events"] == 1
+    assert observation["saved_events"] == 0
+    assert manager.storage.status()["event_count"] == 0
+    summary = manager.storage.quarantine_summary()
+    assert summary["count"] == 1
+    with manager.storage.connect() as conn:
+        safe_event_json = conn.execute(
+            "SELECT safe_event_json FROM quarantined_events"
+        ).fetchone()["safe_event_json"]
+    assert "unexpected" not in safe_event_json
+    assert "secret-value" not in safe_event_json
+
+
+def test_network_access_denied_records_failed_observation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_access_denied(kind: str) -> None:
+        raise psutil.AccessDenied()
+
+    monkeypatch.setattr("psutil.net_connections", raise_access_denied)
+    collector = NetworkCollector("u", "h")
+    manager = CollectorManager(settings(tmp_path))
+    manager._collectors = [collector]
+    assert manager._collect_once(interval_seconds=5.0) is False
+    observation = manager.storage.list_collector_observations()[0]
+    assert observation["collector_id"] == NetworkCollector.collector_id
+    assert observation["successful_poll"] == 0
+    assert observation["error_class"] == "AccessDenied"
+
+
+def test_system_metrics_oserror_records_failed_observation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_oserror(interval: object = None) -> None:
+        raise OSError()
+
+    monkeypatch.setattr("psutil.cpu_percent", raise_oserror)
+    collector = SystemMetricsCollector("u", "h")
+    manager = CollectorManager(settings(tmp_path))
+    manager._collectors = [collector]
+    assert manager._collect_once(interval_seconds=5.0) is False
+    observation = manager.storage.list_collector_observations()[0]
+    assert observation["collector_id"] == SystemMetricsCollector.collector_id
+    assert observation["successful_poll"] == 0
+    assert observation["error_class"] == "OSError"
+
+
+def test_successful_zero_change_process_and_network_polls_record_coverage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("psutil.process_iter", lambda attrs: iter([]))
+    monkeypatch.setattr("psutil.net_connections", lambda kind: [])
+    manager = CollectorManager(settings(tmp_path))
+    manager._collectors = [ProcessCollector("u", "h"), NetworkCollector("u", "h")]
+    assert manager._collect_once(interval_seconds=5.0) is True
+    observations = manager.storage.list_collector_observations()
+    assert {row["collector_id"] for row in observations} == {
+        ProcessCollector.collector_id,
+        NetworkCollector.collector_id,
+    }
+    assert {row["successful_poll"] for row in observations} == {1}
+    assert {row["returned_events"] for row in observations} == {0}
 
 
 def test_empty_collection_session_is_rejected(tmp_path: Path) -> None:

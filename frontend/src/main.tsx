@@ -1,6 +1,6 @@
 import React, { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Activity, Database, Languages, Play, Radar, Shield, Sparkles, Square } from 'lucide-react';
+import { Activity, Archive, Database, Languages, Play, Radar, RefreshCw, Shield, Sparkles, Square } from 'lucide-react';
 import './styles.css';
 
 type Risk = 'low' | 'medium' | 'high' | 'critical';
@@ -17,9 +17,16 @@ type Anomaly = {
 };
 
 type Status = {
-  storage: { event_count: number; anomaly_count: number; database_path: string };
+  storage: {
+    event_count: number;
+    anomaly_count: number;
+    database_path: string;
+    quarantine_count?: number;
+    feature_window_count?: number;
+  };
   model: { trained?: boolean; model_version?: string };
   collection?: CollectionStatus;
+  data_pipeline?: DataPipelineStatus;
 };
 
 type Locale = 'en' | 'ru';
@@ -45,6 +52,35 @@ type CollectionStatus = {
     strict_continuous_24h_validated: boolean;
   };
   event_summary?: { real?: Record<string, number>; synthetic?: Record<string, number> };
+};
+
+type DataQuality = {
+  quarantine: { count: number };
+  window_quality: Record<string, Record<string, number>>;
+  usable_coverage_seconds: number;
+  readiness: {
+    synthetic_snapshot: boolean;
+    real_snapshot: boolean;
+    synthetic?: Record<string, unknown>;
+    real?: Record<string, unknown>;
+  };
+  watermark: { synthetic?: string | null; real?: string | null };
+  dataset_snapshots: {
+    synthetic: Array<{ dataset_id: string; manifest_sha256: string; created_at: string }>;
+    real: Array<{ dataset_id: string; manifest_sha256: string; created_at: string }>;
+  };
+  collection_progress: CollectionStatus['progress'];
+};
+
+type DataPipelineStatus = {
+  quarantine: { count: number };
+  features: {
+    windows?: {
+      synthetic?: Record<string, number>;
+      real?: Record<string, number>;
+    };
+  };
+  snapshots: DataQuality['dataset_snapshots'];
 };
 
 type ScenarioValidation = {
@@ -76,6 +112,15 @@ const copy = {
     current: 'Current',
     warning: 'Cumulative collection is not the same as strict continuous 24-hour validation.',
     scenarios: 'Demo scenarios',
+    dataPipeline: 'Data Pipeline',
+    materialize: 'Materialize',
+    snapshot: 'Synthetic snapshot',
+    retention: 'Retention preview',
+    usable: 'Usable real coverage',
+    watermark: 'Watermark',
+    latestSynthetic: 'Latest synthetic snapshot',
+    latestReal: 'Latest real snapshot',
+    realDisabled: 'Real snapshot requires 24 usable hours in one profile.',
   },
   ru: {
     title: 'SentinelUEBA',
@@ -97,6 +142,15 @@ const copy = {
     current: 'Текущий',
     warning: 'Накопительный сбор не равен строгой непрерывной 24-часовой проверке.',
     scenarios: 'Demo-сценарии',
+    dataPipeline: 'Data Pipeline',
+    materialize: 'Материализовать',
+    snapshot: 'Synthetic snapshot',
+    retention: 'Retention preview',
+    usable: 'Полезное real-покрытие',
+    watermark: 'Watermark',
+    latestSynthetic: 'Последний synthetic snapshot',
+    latestReal: 'Последний real snapshot',
+    realDisabled: 'Real snapshot требует 24 полезных часа в одном профиле.',
   },
 };
 
@@ -118,15 +172,18 @@ export function App() {
   const [message, setMessage] = React.useState<string>('Ready');
   const [capabilities, setCapabilities] = React.useState<CollectorCapability[]>([]);
   const [scenarioValidation, setScenarioValidation] = React.useState<ScenarioValidation[]>([]);
+  const [dataQuality, setDataQuality] = React.useState<DataQuality | null>(null);
   const t = copy[locale];
 
   const refresh = React.useCallback(async () => {
     const statusResponse = await api<{ data: Status }>('/status');
     const anomalyResponse = await api<{ anomalies: Anomaly[] }>('/anomalies');
     const capabilityResponse = await api<{ data: { collectors: CollectorCapability[] } }>('/collectors/capabilities');
+    const qualityResponse = await api<{ data: DataQuality }>('/data-quality');
     setStatus(statusResponse.data);
     setAnomalies(anomalyResponse.anomalies);
     setCapabilities(capabilityResponse.data.collectors);
+    setDataQuality(qualityResponse.data);
   }, []);
 
   React.useEffect(() => {
@@ -236,6 +293,61 @@ export function App() {
         </article>
       </section>
 
+      <section className="pipelinePanel">
+        <div className="panelTitle">
+          <Archive size={18} />
+          <span>{t.dataPipeline}</span>
+        </div>
+        <div className="pipelineActions">
+          <button onClick={() => run('materialize', () => api('/features/materialize', { method: 'POST', body: JSON.stringify({ dataset_kind: 'synthetic' }) }))}>
+            <RefreshCw size={17} /> {t.materialize}
+          </button>
+          <button onClick={() => run('snapshot', () => api('/datasets', { method: 'POST', body: JSON.stringify({ dataset_kind: 'synthetic' }) }))}>
+            <Database size={17} /> {t.snapshot}
+          </button>
+          <button disabled title={t.realDisabled}>
+            <Database size={17} /> Real snapshot
+          </button>
+          <button onClick={() => run('retention', () => api('/retention/preview'))}>
+            <Shield size={17} /> {t.retention}
+          </button>
+        </div>
+        <div className="pipelineGrid">
+          <article>
+            <span>{t.events}</span>
+            <strong>{status?.storage.event_count ?? 0}</strong>
+          </article>
+          <article>
+            <span>Quarantine</span>
+            <strong>{dataQuality?.quarantine.count ?? status?.storage.quarantine_count ?? 0}</strong>
+          </article>
+          <article>
+            <span>Good / degraded / insufficient</span>
+            <strong>{qualityText(dataQuality?.window_quality)}</strong>
+          </article>
+          <article>
+            <span>{t.usable}</span>
+            <strong>{formatDuration(dataQuality?.usable_coverage_seconds ?? 0)}</strong>
+          </article>
+          <article>
+            <span>24h progress</span>
+            <strong>{Math.round((dataQuality?.collection_progress.progress_to_24h ?? 0) * 100)}%</strong>
+          </article>
+          <article>
+            <span>{t.watermark}</span>
+            <strong>{shortValue(dataQuality?.watermark.synthetic)}</strong>
+          </article>
+          <article>
+            <span>{t.latestSynthetic}</span>
+            <strong>{shortValue(dataQuality?.dataset_snapshots.synthetic[0]?.dataset_id)}</strong>
+          </article>
+          <article>
+            <span>{t.latestReal}</span>
+            <strong>{shortValue(dataQuality?.dataset_snapshots.real[0]?.dataset_id)}</strong>
+          </article>
+        </div>
+      </section>
+
       <section className="grid">
         <div className="panel chartPanel">
           <div className="panelTitle">
@@ -324,4 +436,22 @@ function formatDuration(seconds: number): string {
 
 function isApiData(value: unknown): value is { data: { scenario_validation?: unknown } } {
   return typeof value === 'object' && value !== null && 'data' in value;
+}
+
+function qualityText(quality?: Record<string, Record<string, number>>): string {
+  if (!quality) return '0 / 0 / 0';
+  const totals = Object.values(quality).reduce(
+    (acc, item) => ({
+      good: acc.good + (item.good ?? 0),
+      degraded: acc.degraded + (item.degraded ?? 0),
+      insufficient: acc.insufficient + (item.insufficient ?? 0),
+    }),
+    { good: 0, degraded: 0, insufficient: 0 },
+  );
+  return `${totals.good} / ${totals.degraded} / ${totals.insufficient}`;
+}
+
+function shortValue(value: unknown): string {
+  if (typeof value !== 'string' || !value) return 'none';
+  return value.length > 24 ? `${value.slice(0, 24)}...` : value;
 }

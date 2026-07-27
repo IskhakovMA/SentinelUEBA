@@ -13,10 +13,9 @@ import numpy as np
 import torch
 from torch import nn
 
-from sentinelueba.features.windows import FEATURE_NAMES
+from sentinelueba.features.windows import FEATURE_NAMES, FEATURE_SCHEMA_VERSION
 
-MODEL_VERSION = "autoencoder-stage1-v1"
-FEATURE_SCHEMA_VERSION = "feature-windows-v1"
+MODEL_VERSION = "autoencoder-stage2-v1"
 
 
 @dataclass(frozen=True)
@@ -29,6 +28,11 @@ class Preprocessor:
     dataset_kind: str = "synthetic"
     profile: dict[str, str] | None = None
     training_range: dict[str, str] | None = None
+    dataset_id: str | None = None
+    dataset_manifest_sha256: str | None = None
+    quality_filters: list[str] | None = None
+    training_window_count: int | None = None
+    evaluation_window_count: int | None = None
 
     def transform(self, matrix: list[list[float]]) -> np.ndarray:
         data = np.asarray(matrix, dtype=np.float32)
@@ -72,6 +76,11 @@ def train_autoencoder(
     dataset_kind: str = "synthetic",
     profile: dict[str, str] | None = None,
     training_range: dict[str, str] | None = None,
+    dataset_id: str | None = None,
+    dataset_manifest_sha256: str | None = None,
+    quality_filters: list[str] | None = None,
+    training_window_count: int | None = None,
+    evaluation_window_count: int | None = None,
 ) -> tuple[Autoencoder, Preprocessor, list[float]]:
     if len(matrix) < 8:
         raise ValueError("at least 8 feature windows are required for training")
@@ -104,6 +113,11 @@ def train_autoencoder(
         dataset_kind=dataset_kind,
         profile=profile,
         training_range=training_range,
+        dataset_id=dataset_id,
+        dataset_manifest_sha256=dataset_manifest_sha256,
+        quality_filters=quality_filters,
+        training_window_count=training_window_count,
+        evaluation_window_count=evaluation_window_count,
     )
     save_model(model, preprocessor, model_dir)
     return model, preprocessor, losses
@@ -138,8 +152,13 @@ def save_model(model: Autoencoder, preprocessor: Preprocessor, model_dir: Path) 
                 "model_version": MODEL_VERSION,
                 "feature_schema_version": preprocessor.feature_schema_version,
                 "dataset_kind": preprocessor.dataset_kind,
+                "dataset_id": preprocessor.dataset_id,
+                "dataset_manifest_sha256": preprocessor.dataset_manifest_sha256,
                 "profile": preprocessor.profile,
                 "training_time_range": preprocessor.training_range,
+                "quality_filters": preprocessor.quality_filters,
+                "training_window_count": preprocessor.training_window_count,
+                "evaluation_window_count": preprocessor.evaluation_window_count,
                 "created_at": datetime.now(UTC).isoformat(),
                 "threshold_method": "quantile_0.98_plus_std",
                 "model_sha256": model_sha256,

@@ -11,8 +11,16 @@ Synthetic local demo pipeline, PyTorch autoencoder, FastAPI, React, tests, CI, a
 - Reconstruction residual explanations.
 - Real training eligibility gate.
 
-## Recommended Stage 2
+## Stage 2
 
-- Add Isolation Forest as a baseline comparison.
-- Add model calibration controls in the UI.
-- Add signed local artifact metadata.
+- Payload validation and quarantine.
+- SQLite feature store with incremental 15-minute window materialization.
+- Data quality summary and usable coverage eligibility.
+- Immutable Parquet dataset snapshots with manifests and checksums.
+- Retention preview/apply controls.
+
+## Recommended Stage 3
+
+- Add richer model evaluation without changing the local-first privacy stance.
+- Add controlled inference workflows after dataset snapshot compatibility checks.
+- Consider signed local artifact metadata.

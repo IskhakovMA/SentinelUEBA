@@ -10,7 +10,15 @@ from sentinelueba.api.main import app as fastapi_app
 from sentinelueba.config import get_settings
 from sentinelueba.services.pipeline import DemoPipeline
 
-app = typer.Typer(help="SentinelUEBA local-first Stage 0 demo CLI.")
+app = typer.Typer(help="SentinelUEBA local-first UEBA CLI.")
+features_app = typer.Typer(help="Materialized feature store commands.")
+datasets_app = typer.Typer(help="Immutable dataset snapshot commands.")
+retention_app = typer.Typer(help="Local retention policy commands.")
+quarantine_app = typer.Typer(help="Quarantine inspection commands.")
+app.add_typer(features_app, name="features")
+app.add_typer(datasets_app, name="datasets")
+app.add_typer(retention_app, name="retention")
+app.add_typer(quarantine_app, name="quarantine")
 
 
 def _pipeline() -> DemoPipeline:
@@ -129,6 +137,87 @@ def training_eligibility(dataset: str = "real") -> None:
     _print(result)
     if not bool(result["eligible"]):
         raise typer.Exit(code=1)
+
+
+@app.command("data-quality")
+def data_quality() -> None:
+    """Compute data quality, coverage, quarantine, and readiness summary."""
+    _print(_pipeline().data_quality())
+
+
+@features_app.command("materialize")
+def features_materialize(dataset: str = "synthetic") -> None:
+    """Incrementally materialize 15-minute feature windows."""
+    _print(_pipeline().materialize_features(dataset))
+
+
+@features_app.command("rebuild")
+def features_rebuild(dataset: str = "synthetic") -> None:
+    """Fully rebuild feature windows for one dataset kind."""
+    _print(_pipeline().rebuild_features(dataset))
+
+
+@features_app.command("status")
+def features_status() -> None:
+    """Show materialization watermark and feature window counts."""
+    _print(_pipeline().features_status())
+
+
+@datasets_app.command("create")
+def datasets_create(kind: str = typer.Option("synthetic", "--kind")) -> None:
+    """Create an immutable Parquet dataset snapshot."""
+    try:
+        _print(_pipeline().create_dataset(kind))
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+
+
+@datasets_app.command("list")
+def datasets_list(kind: str | None = typer.Option(None, "--kind")) -> None:
+    """List known dataset snapshots."""
+    _print(_pipeline().list_datasets(kind))
+
+
+@datasets_app.command("show")
+def datasets_show(dataset_id: str) -> None:
+    """Show dataset snapshot manifest."""
+    try:
+        _print(_pipeline().show_dataset(dataset_id))
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+
+
+@datasets_app.command("verify")
+def datasets_verify(dataset_id: str) -> None:
+    """Verify snapshot manifest and Parquet checksums."""
+    try:
+        _print(_pipeline().verify_dataset(dataset_id))
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+
+
+@retention_app.command("preview")
+def retention_preview() -> None:
+    """Preview local retention policy without deleting data."""
+    _print(_pipeline().retention_preview())
+
+
+@retention_app.command("apply")
+def retention_apply(confirm: bool = typer.Option(False, "--confirm")) -> None:
+    """Apply local retention policy; snapshots and models are never deleted."""
+    if not confirm:
+        typer.echo("retention apply requires --confirm", err=True)
+        raise typer.Exit(code=2)
+    _print(_pipeline().retention_apply())
+
+
+@quarantine_app.command("summary")
+def quarantine_summary() -> None:
+    """Summarize quarantined validation failures."""
+    _print(_pipeline().quarantine_summary())
 
 
 @app.command("run-api")

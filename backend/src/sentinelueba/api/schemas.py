@@ -18,6 +18,14 @@ class TrainingEligibilityRequest(BaseModel):
     dataset_kind: str = Field(default="real", pattern="^(synthetic|real)$")
 
 
+class DatasetKindRequest(BaseModel):
+    dataset_kind: str = Field(default="synthetic", pattern="^(synthetic|real)$")
+
+
+class RetentionApplyRequest(BaseModel):
+    confirm: bool = False
+
+
 class ApiResponse(BaseModel):
     data: dict[str, Any]
 

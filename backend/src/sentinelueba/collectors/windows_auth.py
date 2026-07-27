@@ -8,6 +8,7 @@ from typing import Any
 from sentinelueba.collectors.base import (
     CollectorCapability,
     CollectorHealth,
+    CollectorPollResult,
     CollectorStatus,
     PrivilegeLevel,
 )
@@ -143,17 +144,31 @@ class WindowsAuthCollector:
         )
 
     def collect(self) -> list[TelemetryEvent]:
+        return self.poll().events
+
+    def poll(self) -> CollectorPollResult:
         capability = self.check_availability()
         if capability.status != CollectorStatus.AVAILABLE:
             self._errors.extend(capability.errors)
-            return []
+            return CollectorPollResult(
+                events=[],
+                successful=False,
+                status=capability.status.value,
+                error_class=capability.errors[-1] if capability.errors else capability.status.value,
+            )
         try:
             events = self._read_live_events()
             self._events += len(events)
-            return events
+            return CollectorPollResult(events=events, successful=True, status="ok")
         except Exception as exc:  # noqa: BLE001
-            self._errors.append(type(exc).__name__)
-            return []
+            error_class = type(exc).__name__
+            self._errors.append(error_class)
+            return CollectorPollResult(
+                events=[],
+                successful=False,
+                status="error",
+                error_class=error_class,
+            )
 
     def _latest_record_id(self) -> int:
         evt = _evt_module()

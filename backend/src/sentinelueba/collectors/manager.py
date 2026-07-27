@@ -7,14 +7,13 @@ from typing import Any
 from uuid import uuid4
 
 from sentinelueba import __version__
-from sentinelueba.collectors.base import CollectorStatus, TelemetryCollector
+from sentinelueba.collectors.base import CollectorPollResult, CollectorStatus, TelemetryCollector
 from sentinelueba.collectors.identity import IdentityProvider
 from sentinelueba.collectors.network import NetworkCollector
 from sentinelueba.collectors.process import ProcessCollector
 from sentinelueba.collectors.system_metrics import SystemMetricsCollector
 from sentinelueba.collectors.windows_auth import WindowsAuthCollector
 from sentinelueba.config import Settings
-from sentinelueba.normalization.normalizer import normalize_events
 from sentinelueba.storage.sqlite import SQLiteStorage
 
 
@@ -160,7 +159,7 @@ class CollectorManager:
             while not self._stop_event.is_set():
                 if deadline is not None and datetime.now(UTC) >= deadline:
                     break
-                successful = self._collect_once()
+                successful = self._collect_once(interval_seconds)
                 if self._session_id is not None:
                     self.storage.update_session_heartbeat(
                         self._session_id,
@@ -202,31 +201,82 @@ class CollectorManager:
                     self._errors,
                 )
 
-    def _collect_once(self) -> bool:
+    def _collect_once(self, interval_seconds: float) -> bool:
         any_success = False
         for collector in self._collectors:
+            observed_at = datetime.now(UTC)
             try:
-                events = normalize_events(collector.collect())
+                poll = getattr(collector, "poll", None)
+                poll_result = (
+                    poll()
+                    if callable(poll)
+                    else CollectorPollResult(
+                        events=collector.collect(),
+                        successful=True,
+                        status="ok",
+                    )
+                )
+                events = poll_result.events
                 cursor = collector.cursor if hasattr(collector, "cursor") else None
                 if isinstance(cursor, dict):
                     inserted, by_type = self.storage.insert_events_and_update_collector_state(
                         events,
                         collector.collector_id,
-                        "running",
+                        poll_result.status,
                         cursor,
-                        None,
+                        poll_result.error_class,
+                        collection_session_id=self._session_id,
+                        collector_version=collector.version,
                     )
                 else:
-                    inserted, by_type = self.storage.insert_events_detailed(events)
+                    inserted, by_type = self.storage._insert_events_with_metadata(
+                        events,
+                        collection_session_id=self._session_id,
+                        collector_id=collector.collector_id,
+                        collector_version=collector.version,
+                    )
                 self._counters[collector.collector_id] += inserted
                 for event_type, count in by_type.items():
                     self._counters[event_type] += count
+                if poll_result.warnings:
+                    self._errors.extend(
+                        f"{collector.collector_id}: warning:{warning}"
+                        for warning in poll_result.warnings
+                    )
+                if poll_result.error_class:
+                    self._errors.append(f"{collector.collector_id}: {poll_result.error_class}")
                 self._status[collector.collector_id] = collector.health().__dict__
-                any_success = True
+                self.storage.record_collector_observation(
+                    session_id=self._session_id,
+                    collector_id=collector.collector_id,
+                    user_id=getattr(collector, "user_id", None),
+                    host_id=getattr(collector, "host_id", None),
+                    observed_at=observed_at,
+                    status=poll_result.status,
+                    successful_poll=poll_result.successful,
+                    error_class=poll_result.error_class,
+                    configured_interval_seconds=interval_seconds,
+                    returned_events=len(poll_result.events),
+                    saved_events=inserted,
+                )
+                any_success = any_success or poll_result.successful
             except Exception as exc:  # noqa: BLE001
                 message = f"{collector.collector_id}: {type(exc).__name__}"
                 self._errors.append(message)
                 self.storage.upsert_collector_state(collector.collector_id, "error", {}, message)
+                self.storage.record_collector_observation(
+                    session_id=self._session_id,
+                    collector_id=collector.collector_id,
+                    user_id=getattr(collector, "user_id", None),
+                    host_id=getattr(collector, "host_id", None),
+                    observed_at=observed_at,
+                    status="error",
+                    successful_poll=False,
+                    error_class=type(exc).__name__,
+                    configured_interval_seconds=interval_seconds,
+                    returned_events=0,
+                    saved_events=0,
+                )
         return any_success
 
 

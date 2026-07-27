@@ -9,6 +9,7 @@ import psutil
 from sentinelueba.collectors.base import (
     CollectorCapability,
     CollectorHealth,
+    CollectorPollResult,
     CollectorStatus,
     PrivilegeLevel,
 )
@@ -97,21 +98,39 @@ class NetworkCollector:
         )
 
     def collect(self) -> list[TelemetryEvent]:
+        return self.poll().events
+
+    def poll(self) -> CollectorPollResult:
         now = datetime.now(UTC)
-        current = self.snapshot()
+        errors_before = len(self._errors)
+        try:
+            current = self.snapshot()
+        except (psutil.AccessDenied, OSError) as exc:
+            error_class = type(exc).__name__
+            self._errors.append(error_class)
+            return CollectorPollResult(
+                events=[],
+                successful=False,
+                status="error",
+                error_class=error_class,
+            )
         changes = diff_network_snapshots(self._previous, current)
         self._previous = current
         events = [self._event(now, action, snapshot) for action, snapshot in changes]
         self._events += len(events)
-        return events
+        return CollectorPollResult(
+            events=events,
+            successful=True,
+            status="ok",
+            warnings=self._errors[errors_before:],
+        )
 
     def snapshot(self) -> dict[tuple[object, ...], NetworkSnapshot]:
         snapshots: dict[tuple[object, ...], NetworkSnapshot] = {}
         try:
             connections = psutil.net_connections(kind="inet")
-        except (psutil.AccessDenied, OSError) as exc:
-            self._errors.append(type(exc).__name__)
-            return snapshots
+        except (psutil.AccessDenied, OSError):
+            raise
         for conn in connections:
             try:
                 protocol = "tcp" if conn.type.name == "SOCK_STREAM" else "udp"

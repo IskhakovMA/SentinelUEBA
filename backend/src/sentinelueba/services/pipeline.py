@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import shutil
+import threading
+from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 
 from sentinelueba.collectors.manager import (
@@ -10,14 +13,19 @@ from sentinelueba.collectors.manager import (
     get_manager,
 )
 from sentinelueba.config import Settings
+from sentinelueba.datasets import DatasetSnapshotService
 from sentinelueba.detection.engine import detect_anomalies, summarize_scores
 from sentinelueba.detection.scenario_validation import validate_demo_scenarios
 from sentinelueba.domain.events import WindowFeatures
-from sentinelueba.features.windows import build_feature_windows, windows_to_matrix
+from sentinelueba.features.materialization import FeatureMaterializer
+from sentinelueba.features.windows import FEATURE_NAMES, build_feature_windows
 from sentinelueba.ml.autoencoder import load_model, model_info, train_autoencoder
-from sentinelueba.normalization.normalizer import normalize_events
+from sentinelueba.quality import DataQualityService, RetentionService
+from sentinelueba.services.eligibility import EligibilityService
 from sentinelueba.storage.sqlite import SQLiteStorage
 from sentinelueba.telemetry.synthetic import generate_synthetic_events, scenario_manifest_for_start
+
+_FEATURE_LOCKS = {"synthetic": threading.Lock(), "real": threading.Lock()}
 
 
 class DemoPipeline:
@@ -29,6 +37,12 @@ class DemoPipeline:
     def model_dir(self, dataset_kind: str = "synthetic") -> Path:
         return self.settings.model_dir / dataset_kind
 
+    def snapshots(self) -> DatasetSnapshotService:
+        return DatasetSnapshotService(self.storage, self.settings.data_dir)
+
+    def materializer(self) -> FeatureMaterializer:
+        return FeatureMaterializer(self.storage)
+
     def initialize(self) -> dict[str, object]:
         self.storage.initialize()
         return self.status()
@@ -36,8 +50,7 @@ class DemoPipeline:
     def generate_demo_data(self, seed: int = 42) -> dict[str, object]:
         self.storage.initialize()
         events, summary = generate_synthetic_events(seed=seed)
-        normalized = normalize_events(events)
-        inserted = self.storage.insert_events(normalized)
+        inserted = self.storage.insert_events(events)
         return {
             "seed": summary.seed,
             "generated_events": summary.events,
@@ -54,32 +67,41 @@ class DemoPipeline:
             eligibility = self.training_eligibility("real")
             if not eligibility["eligible"]:
                 raise ValueError(f"real training not eligible: {eligibility['reason']}")
-        events = self.storage.list_events(synthetic=(dataset_kind == "synthetic"))
-        windows = build_feature_windows(events)
-        if len(windows) < 12:
+        snapshot = self._with_feature_lock(
+            dataset_kind,
+            lambda: self._create_dataset_locked(dataset_kind),
+        )
+        dataset_id = str(snapshot["dataset_id"])
+        matrix, manifest, rows = self.snapshots().load_matrix(dataset_id)
+        if len(matrix) < 12:
             raise ValueError(f"not enough {dataset_kind} feature windows for training")
-        split = max(8, int(len(windows) * 0.62))
-        train_windows = windows[:split]
-        matrix = windows_to_matrix(train_windows)
-        profile = {"user_id": train_windows[0].user_id, "host_id": train_windows[0].host_id}
+        split = max(8, int(len(matrix) * 0.62))
+        train_matrix = matrix[:split]
         training_range = {
-            "start": train_windows[0].window_start.isoformat(),
-            "end": train_windows[-1].window_end.isoformat(),
+            "start": str(rows[0]["window_start"]),
+            "end": str(rows[split - 1]["window_end"]),
         }
         _, preprocessor, losses = train_autoencoder(
-            matrix,
+            train_matrix,
             self.model_dir(dataset_kind),
             seed=seed,
             dataset_kind=dataset_kind,
-            profile=profile,
+            profile=manifest["profile"],
             training_range=training_range,
+            dataset_id=dataset_id,
+            dataset_manifest_sha256=str(snapshot["manifest_sha256"]),
+            quality_filters=list(manifest["quality_filters"]),
+            training_window_count=split,
+            evaluation_window_count=max(0, len(matrix) - split),
         )
         return {
             "trained": True,
             "dataset_kind": dataset_kind,
-            "training_windows": len(train_windows),
-            "total_windows": len(windows),
-            "evaluation_windows": max(0, len(windows) - split),
+            "dataset_id": dataset_id,
+            "dataset_manifest_sha256": snapshot["manifest_sha256"],
+            "training_windows": len(train_matrix),
+            "total_windows": len(matrix),
+            "evaluation_windows": max(0, len(matrix) - split),
             "threshold": preprocessor.threshold,
             "final_loss": losses[-1],
             "training_range": training_range,
@@ -88,10 +110,20 @@ class DemoPipeline:
 
     def detect(self, dataset_kind: str = "synthetic") -> dict[str, object]:
         self.storage.initialize()
-        events = self.storage.list_events(synthetic=(dataset_kind == "synthetic"))
-        windows = build_feature_windows(events)
         model, preprocessor = load_model(self.model_dir(dataset_kind))
-        evaluation_windows = self._evaluation_windows(windows, preprocessor.training_range)
+        if not preprocessor.dataset_id:
+            events = self.storage.list_events(synthetic=(dataset_kind == "synthetic"))
+            windows = build_feature_windows(events)
+            evaluation_windows = self._evaluation_windows(windows, preprocessor.training_range)
+        else:
+            _, manifest, rows = self.snapshots().load_matrix(preprocessor.dataset_id)
+            if preprocessor.dataset_manifest_sha256:
+                verification = manifest["verification"]
+                if verification["manifest_sha256"] != preprocessor.dataset_manifest_sha256:
+                    raise ValueError("model dataset manifest SHA-256 mismatch")
+            split = preprocessor.training_window_count or max(8, int(len(rows) * 0.62))
+            windows = [window_from_snapshot_row(row) for row in rows]
+            evaluation_windows = [window_from_snapshot_row(row) for row in rows[split:]]
         anomalies = detect_anomalies(
             model,
             preprocessor,
@@ -121,11 +153,19 @@ class DemoPipeline:
         info = model_info(self.model_dir("synthetic"))
         return {
             "project": "SentinelUEBA",
-            "stage": "Stage 1",
+            "stage": "Stage 2",
             "windows_only": True,
             "storage": storage_status,
             "model": info,
             "collection": self.collection_status(),
+            "data_pipeline": {
+                "features": self.materializer().status(),
+                "snapshots": {
+                    "synthetic": self.storage.list_dataset_snapshots("synthetic")[:1],
+                    "real": self.storage.list_dataset_snapshots("real")[:1],
+                },
+                "quarantine": self.storage.quarantine_summary(),
+            },
         }
 
     def anomalies(self) -> list[dict[str, object]]:
@@ -190,32 +230,80 @@ class DemoPipeline:
 
     def training_eligibility(self, dataset_kind: str = "real") -> dict[str, object]:
         self.storage.initialize()
-        synthetic = dataset_kind == "synthetic"
-        events = self.storage.list_events(synthetic=synthetic)
-        windows = build_feature_windows(events)
-        if dataset_kind == "synthetic":
-            return {
-                "dataset_kind": dataset_kind,
-                "eligible": len(windows) >= 12,
-                "reason": "ready" if len(windows) >= 12 else "not enough synthetic windows",
-                "windows": len(windows),
-            }
-        progress = self.storage.collection_progress()
-        enough_duration = float(progress["cumulative_collected_seconds"]) >= 24 * 60 * 60
-        enough_windows = len(windows) >= 96
-        reason = "ready"
-        if not enough_duration:
-            reason = "requires 24 cumulative hours of real collection"
-        elif not enough_windows:
-            reason = "not enough real feature windows"
-        return {
-            "dataset_kind": dataset_kind,
-            "eligible": enough_duration and enough_windows,
-            "reason": reason,
-            "windows": len(windows),
-            "cumulative_collected_seconds": progress["cumulative_collected_seconds"],
-            "strict_continuous_24h_validated": progress["strict_continuous_24h_validated"],
-        }
+        return EligibilityService(self.storage).training_eligibility(dataset_kind)
+
+    def data_quality(self) -> dict[str, object]:
+        self.storage.initialize()
+        return DataQualityService(self.storage).summary()
+
+    def materialize_features(self, dataset_kind: str = "synthetic") -> dict[str, object]:
+        self.storage.initialize()
+        return self._with_feature_lock(
+            dataset_kind,
+            lambda: self.materializer().materialize(dataset_kind),
+        )
+
+    def rebuild_features(self, dataset_kind: str = "synthetic") -> dict[str, object]:
+        self.storage.initialize()
+        return self._with_feature_lock(
+            dataset_kind,
+            lambda: self.materializer().materialize(dataset_kind, rebuild=True),
+        )
+
+    def features_status(self) -> dict[str, object]:
+        self.storage.initialize()
+        return self.materializer().status()
+
+    def create_dataset(self, dataset_kind: str = "synthetic") -> dict[str, object]:
+        self.storage.initialize()
+        return self._with_feature_lock(
+            dataset_kind,
+            lambda: self._create_dataset_locked(dataset_kind),
+        )
+
+    def list_datasets(self, dataset_kind: str | None = None) -> dict[str, object]:
+        self.storage.initialize()
+        return {"datasets": self.snapshots().list_snapshots(dataset_kind)}
+
+    def show_dataset(self, dataset_id: str) -> dict[str, object]:
+        self.storage.initialize()
+        return self.snapshots().show(dataset_id)
+
+    def verify_dataset(self, dataset_id: str) -> dict[str, object]:
+        self.storage.initialize()
+        return self.snapshots().verify(dataset_id)
+
+    def retention_preview(self) -> dict[str, object]:
+        self.storage.initialize()
+        return RetentionService(self.storage).preview()
+
+    def retention_apply(self) -> dict[str, object]:
+        self.storage.initialize()
+        return RetentionService(self.storage).apply()
+
+    def quarantine_summary(self) -> dict[str, object]:
+        self.storage.initialize()
+        return self.storage.quarantine_summary()
+
+    def _create_dataset_locked(self, dataset_kind: str) -> dict[str, object]:
+        self.materializer().materialize(dataset_kind)
+        return self.snapshots().create(dataset_kind)
+
+    def _with_feature_lock(
+        self,
+        dataset_kind: str,
+        action: Callable[[], dict[str, object]],
+    ) -> dict[str, object]:
+        if dataset_kind not in _FEATURE_LOCKS:
+            raise ValueError("dataset_kind must be synthetic or real")
+        lock = _FEATURE_LOCKS[dataset_kind]
+        if not lock.acquire(blocking=False):
+            raise ValueError(f"{dataset_kind} materialization is already running")
+        try:
+            result = action()
+        finally:
+            lock.release()
+        return result
 
     @staticmethod
     def _evaluation_windows(
@@ -231,3 +319,17 @@ class DemoPipeline:
             for window in windows
             if window.window_start.isoformat() >= training_end
         ]
+
+
+def window_from_snapshot_row(row: dict[str, object]) -> WindowFeatures:
+    return WindowFeatures(
+        window_start=_parse_snapshot_time(str(row["window_start"])),
+        window_end=_parse_snapshot_time(str(row["window_end"])),
+        user_id=str(row["user_id"]),
+        host_id=str(row["host_id"]),
+        features={name: float(str(row[name])) for name in FEATURE_NAMES},
+    )
+
+
+def _parse_snapshot_time(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))

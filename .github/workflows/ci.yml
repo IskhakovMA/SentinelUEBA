@@ -22,6 +22,13 @@ jobs:
         run: uv run mypy backend/src
       - name: Pytest
         run: uv run pytest
+      - name: Dataset pipeline smoke
+        run: |
+          uv run sentinelueba generate-demo
+          uv run sentinelueba features materialize
+          uv run sentinelueba datasets create --kind synthetic
+          DATASET_ID="$(ls -1t data/datasets | head -n 1)"
+          uv run sentinelueba datasets verify "$DATASET_ID"
 
   frontend:
     runs-on: ubuntu-latest
@@ -55,6 +62,14 @@ jobs:
         run: uv sync --all-extras --dev
       - name: Unit tests
         run: uv run pytest
+      - name: Dataset pipeline smoke
+        shell: pwsh
+        run: |
+          uv run sentinelueba generate-demo
+          uv run sentinelueba features materialize
+          uv run sentinelueba datasets create --kind synthetic
+          $dataset = Get-ChildItem data/datasets | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          uv run sentinelueba datasets verify $dataset.Name
       - name: PowerShell syntax
         shell: pwsh
         run: |
@@ -68,3 +83,64 @@ jobs:
           uv run sentinelueba capabilities
           uv run sentinelueba collect --duration 3 --interval 1
           uv run sentinelueba collector-status
+          @'
+          import json
+          from datetime import UTC, datetime, timedelta
+
+          from sentinelueba.config import get_settings
+          from sentinelueba.features.materialization import collector_coverage_for_window
+          from sentinelueba.storage.sqlite import SQLiteStorage
+
+          settings = get_settings()
+          storage = SQLiteStorage(settings.database_path)
+          storage.initialize()
+
+          quarantine = storage.quarantine_summary()
+          assert quarantine["count"] == 0, quarantine
+
+          observations = storage.list_collector_observations()
+          assert observations, "collector_observations is empty"
+
+          by_collector = {}
+          for observation in observations:
+              by_collector.setdefault(observation["collector_id"], []).append(observation)
+              int(observation["returned_events"])
+              int(observation["saved_events"])
+
+          process = by_collector.get("windows.process.psutil", [])
+          system = by_collector.get("windows.system_metrics.psutil", [])
+          network = by_collector.get("windows.network.psutil", [])
+          auth = by_collector.get("windows.auth.security_event_log", [])
+
+          assert any(row["successful_poll"] for row in process), process
+          assert any(row["successful_poll"] for row in system), system
+          assert network, "network observation is missing"
+          assert not any(row["error_class"] == "AccessDenied" for row in auth), auth
+
+          for row in network:
+              if row["successful_poll"]:
+                  continue
+              observed_at = datetime.fromisoformat(row["observed_at"]).astimezone(UTC)
+              coverage = collector_coverage_for_window(
+                  [row],
+                  window_start=observed_at,
+                  window_end=observed_at
+                  + timedelta(seconds=float(row["configured_interval_seconds"])),
+                  user_id=row["user_id"],
+                  host_id=row["host_id"],
+              )
+              assert "windows.network.psutil" not in coverage, json.dumps(row, default=str)
+
+          print(
+              json.dumps(
+                  {
+                      "quarantine_count": quarantine["count"],
+                      "observations": len(observations),
+                      "process_success": sum(1 for row in process if row["successful_poll"]),
+                      "system_success": sum(1 for row in system if row["successful_poll"]),
+                      "network_statuses": [row["status"] for row in network],
+                  },
+                  sort_keys=True,
+              )
+          )
+          '@ | uv run python -

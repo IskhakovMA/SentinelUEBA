@@ -1,6 +1,6 @@
 # SentinelUEBA
 
-SentinelUEBA is a local-first Windows-focused UEBA portfolio project. Stage 1 keeps the synthetic demo from Stage 0 and adds opt-in Windows telemetry collection, collection sessions, cumulative 24-hour progress, FastAPI, CLI, and a React interface.
+SentinelUEBA is a local-first Windows-focused UEBA portfolio project. Stage 2 keeps the synthetic demo and opt-in Windows telemetry from earlier stages, then adds validation, data quality, materialized feature windows, immutable Parquet dataset snapshots, retention controls, FastAPI, CLI, and a React interface.
 
 [Русская версия](README.ru.md)
 
@@ -8,8 +8,10 @@ SentinelUEBA is a local-first Windows-focused UEBA portfolio project. Stage 1 ke
 
 - Safe synthetic 24-hour-equivalent demo telemetry.
 - Opt-in Windows collectors for process, network, system metrics, and optional Security Event Log authentication metadata.
-- SQLite storage with sequential migrations, indexes, duplicate protection, collection sessions, and collector cursors.
-- 15-minute feature windows for user + host behavior.
+- SQLite storage with sequential migrations, indexes, duplicate protection, collection sessions, collector observations, and collector cursors.
+- Payload validation, quarantine, and ingestion metadata.
+- Persistent 15-minute UTC feature windows for user + host behavior.
+- Immutable Parquet dataset snapshots with manifests and SHA-256 verification.
 - CPU-friendly PyTorch autoencoder with saved preprocessing and model metadata.
 - Per-feature reconstruction residual explanations.
 - Post-inference validation for all five canonical synthetic demo scenarios.
@@ -23,6 +25,8 @@ An anomaly is a statistical deviation from the learned profile. It is not proof 
 ```powershell
 uv sync --all-extras --dev
 uv run sentinelueba generate-demo --seed 42
+uv run sentinelueba features materialize --dataset synthetic
+uv run sentinelueba datasets create --kind synthetic
 uv run sentinelueba train --seed 42
 uv run sentinelueba detect
 uv run sentinelueba run-api
@@ -42,11 +46,25 @@ uv run sentinelueba collection-sessions
 uv run sentinelueba training-eligibility --dataset real
 ```
 
-Real training is gated by 24 cumulative hours of real non-synthetic telemetry and enough feature windows. Cumulative collection is tracked separately from strict continuous 24-hour validation; the project does not claim continuous validation unless the longest session actually reaches 24 hours.
+Real training is gated by 24 cumulative hours of usable real coverage from good feature windows in one user + host profile. Coverage comes from successful collector observations, not from raw session duration. Cumulative collection is tracked separately from strict continuous 24-hour validation; the project does not claim continuous validation unless the longest session actually reaches 24 hours.
 
 See [Windows collection](docs/WINDOWS_COLLECTION.md).
 
 Stage 1 persists collection heartbeats. If the application or computer stops, recovery closes the stale session at the last heartbeat, so powered-off time is not counted as collected duration.
+
+## Data Pipeline
+
+```bash
+uv run sentinelueba data-quality
+uv run sentinelueba features status
+uv run sentinelueba datasets list
+uv run sentinelueba datasets verify <dataset-id>
+uv run sentinelueba retention preview
+uv run sentinelueba quarantine summary
+```
+
+Training and snapshot-backed detection use verified dataset snapshots instead of arbitrary current SQLite contents.
+See [data pipeline](docs/DATA_PIPELINE.md), [data quality](docs/DATA_QUALITY.md), and [dataset snapshots](docs/DATASET_SNAPSHOTS.md).
 
 ## Architecture
 
@@ -57,14 +75,16 @@ The repository is a full-stack monorepo with a modular monolith backend:
 - `backend/src/sentinelueba/collectors`: Windows collector contracts and psutil/Event Log collectors.
 - `backend/src/sentinelueba/normalization`: event normalization.
 - `backend/src/sentinelueba/storage`: SQLite persistence and migrations.
-- `backend/src/sentinelueba/features`: feature windows.
+- `backend/src/sentinelueba/features`: feature windows and materialization.
+- `backend/src/sentinelueba/datasets`: immutable Parquet snapshots.
+- `backend/src/sentinelueba/validation`: event payload validation and quarantine support.
 - `backend/src/sentinelueba/ml`: PyTorch autoencoder training and inference.
 - `backend/src/sentinelueba/detection`: scoring and risk classification.
 - `backend/src/sentinelueba/api`: FastAPI app.
 - `frontend`: React, TypeScript, Vite dashboard.
 - `docs`: architecture, privacy, threat model, and development notes.
 
-## Stage 1 Limits
+## Stage 2 Limits
 
 No Windows Service, Linux collectors, ETW, kernel driver, cloud backend, SIEM integration, alerts, packet capture, keylogging, clipboard, browser history, traffic payload inspection, Isolation Forest, or manual threshold calibration are implemented. Generated databases, models, identity secrets, logs, and reports are excluded from Git.
 
@@ -84,4 +104,4 @@ Python dependencies are managed with `uv`; frontend dependencies use `pnpm`.
 
 ## Roadmap
 
-Stage 2 should harden Windows collection UX, add richer model evaluation, and introduce an Isolation Forest baseline without replacing the autoencoder.
+Stage 3 should focus on richer evaluation and controlled inference workflows. Isolation Forest, live alerts, Windows Service packaging, SIEM export, and cloud backends remain out of scope for Stage 2.
