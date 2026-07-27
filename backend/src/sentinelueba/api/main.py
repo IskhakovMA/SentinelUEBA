@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+from functools import partial
 from typing import Any
 
 import anyio
@@ -11,6 +13,12 @@ from sentinelueba.api.schemas import (
     ApiResponse,
     CollectionStartRequest,
     DatasetKindRequest,
+    MLCompareRequest,
+    MLConfirmRequest,
+    MLDriftRequest,
+    MLEvaluateRequest,
+    MLScoreRequest,
+    MLTrainRequest,
     RetentionApplyRequest,
     SeedRequest,
     TrainingEligibilityRequest,
@@ -31,8 +39,8 @@ def pipeline() -> DemoPipeline:
     return DemoPipeline(get_settings())
 
 
-async def run_blocking(fn: Any, *args: Any) -> Any:
-    return await anyio.to_thread.run_sync(fn, *args)
+async def run_blocking(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    return await anyio.to_thread.run_sync(partial(fn, *args, **kwargs))
 
 
 @app.get("/health", response_model=ApiResponse)
@@ -77,6 +85,181 @@ async def get_model() -> ApiResponse:
     if not isinstance(model, dict):
         model = {}
     return ApiResponse(data=model)
+
+
+@app.get("/ml/status", response_model=ApiResponse)
+async def ml_status() -> ApiResponse:
+    return ApiResponse(data=pipeline().ml_status())
+
+
+@app.post("/ml/train", response_model=ApiResponse)
+async def ml_train(request: MLTrainRequest) -> ApiResponse:
+    try:
+        return ApiResponse(
+            data=await run_blocking(
+                pipeline().ml_train,
+                dataset_kind=request.dataset_kind,
+                dataset_id=request.dataset_id,
+                families=request.families,
+                seed=request.seed,
+                target_fpr=request.target_fpr,
+                autoencoder_config=(
+                    request.autoencoder.model_dump() if request.autoencoder else None
+                ),
+                isolation_forest_config=(
+                    request.isolation_forest.model_dump() if request.isolation_forest else None
+                ),
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/ml/training-runs", response_model=ApiResponse)
+async def ml_training_runs() -> ApiResponse:
+    return ApiResponse(data={"training_runs": pipeline().ml_training_runs()})
+
+
+@app.get("/ml/training-runs/{training_run_id}", response_model=ApiResponse)
+async def ml_training_run(training_run_id: str) -> ApiResponse:
+    run = pipeline().ml_training_run(training_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="training run not found")
+    return ApiResponse(data=run)
+
+
+@app.get("/ml/models", response_model=ApiResponse)
+async def ml_models() -> ApiResponse:
+    return ApiResponse(data={"models": pipeline().ml_models()})
+
+
+@app.get("/ml/models/{model_id}", response_model=ApiResponse)
+async def ml_model(model_id: str) -> ApiResponse:
+    try:
+        return ApiResponse(data=pipeline().ml_model(model_id))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/ml/models/{model_id}/verify", response_model=ApiResponse)
+async def ml_verify_model(model_id: str) -> ApiResponse:
+    try:
+        return ApiResponse(data=await run_blocking(pipeline().ml_verify_model, model_id))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/ml/models/{model_id}/recommend", response_model=ApiResponse)
+async def ml_recommend_model(model_id: str, request: MLConfirmRequest) -> ApiResponse:
+    try:
+        return ApiResponse(
+            data=await run_blocking(
+                pipeline().ml_recommend_model,
+                model_id,
+                confirm=request.confirm,
+                reason=request.reason,
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/ml/models/{model_id}/promote", response_model=ApiResponse)
+async def ml_promote_model(model_id: str, request: MLConfirmRequest) -> ApiResponse:
+    try:
+        return ApiResponse(
+            data=await run_blocking(
+                pipeline().ml_promote_model,
+                model_id,
+                confirm=request.confirm,
+                reason=request.reason,
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/ml/models/{model_id}/retire", response_model=ApiResponse)
+async def ml_retire_model(model_id: str, request: MLConfirmRequest) -> ApiResponse:
+    try:
+        return ApiResponse(
+            data=await run_blocking(
+                pipeline().ml_retire_model,
+                model_id,
+                confirm=request.confirm,
+                reason=request.reason,
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/ml/models/{model_id}/rollback", response_model=ApiResponse)
+async def ml_rollback_model(model_id: str, request: MLConfirmRequest) -> ApiResponse:
+    try:
+        return ApiResponse(
+            data=await run_blocking(
+                pipeline().ml_rollback_model,
+                model_id,
+                confirm=request.confirm,
+                reason=request.reason,
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/ml/models/compare", response_model=ApiResponse)
+async def ml_compare(request: MLCompareRequest) -> ApiResponse:
+    return ApiResponse(data=pipeline().ml_compare_models(request.model_ids))
+
+
+@app.post("/ml/evaluate", response_model=ApiResponse)
+async def ml_evaluate(request: MLEvaluateRequest) -> ApiResponse:
+    return ApiResponse(data=pipeline().ml_evaluate_model(request.model_id))
+
+
+@app.post("/ml/score", response_model=ApiResponse)
+async def ml_score(request: MLScoreRequest) -> ApiResponse:
+    try:
+        return ApiResponse(
+            data=await run_blocking(
+                pipeline().ml_score,
+                dataset_id=request.dataset_id,
+                model_id=request.model_id,
+                dataset_kind=request.dataset_kind,
+                batch_size=request.batch_size,
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/ml/scoring-runs", response_model=ApiResponse)
+async def ml_scoring_runs() -> ApiResponse:
+    return ApiResponse(data={"scoring_runs": pipeline().ml_scoring_runs()})
+
+
+@app.get("/ml/scoring-runs/{scoring_run_id}", response_model=ApiResponse)
+async def ml_scoring_run(scoring_run_id: str) -> ApiResponse:
+    run = pipeline().ml_scoring_run(scoring_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="scoring run not found")
+    return ApiResponse(data=run)
+
+
+@app.post("/ml/drift", response_model=ApiResponse)
+async def ml_drift(request: MLDriftRequest) -> ApiResponse:
+    try:
+        return ApiResponse(
+            data=await run_blocking(
+                pipeline().ml_drift,
+                model_id=request.model_id,
+                dataset_id=request.dataset_id,
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/detect", response_model=ApiResponse)

@@ -22,13 +22,115 @@ jobs:
         run: uv run mypy backend/src
       - name: Pytest
         run: uv run pytest
-      - name: Dataset pipeline smoke
+      - name: Dataset and ML pipeline smoke
         run: |
           uv run sentinelueba generate-demo
           uv run sentinelueba features materialize
           uv run sentinelueba datasets create --kind synthetic
           DATASET_ID="$(ls -1t data/datasets | head -n 1)"
           uv run sentinelueba datasets verify "$DATASET_ID"
+          TRAIN_JSON="$(
+            uv run sentinelueba ml train \
+              --dataset synthetic \
+              --dataset-id "$DATASET_ID" \
+              --families autoencoder,isolation-forest \
+              --autoencoder-epochs 6 \
+              --if-n-estimators 16
+          )"
+          TRAIN_JSON="$TRAIN_JSON" uv run python - <<'PY'
+          import json
+          import os
+          train = json.loads(os.environ["TRAIN_JSON"])
+          assert train["split"]["train"]["count"] == 50, train["split"]
+          assert train["split"]["calibration"]["count"] == 22, train["split"]
+          assert train["split"]["test"]["count"] == 24, train["split"]
+          assert len(train["split"]["scenario_window_ids"]) == 5, train["split"]
+          metrics = [candidate["metrics"] for candidate in train["candidates"]]
+          assert len(metrics) == 2, metrics
+          assert any(
+              item.get("scenario_recall") == 1.0
+              and item.get("false_positive_rate", 1.0) <= 0.15
+              for item in metrics
+          ), metrics
+          PY
+          MODEL_ID="$(
+            TRAIN_JSON="$TRAIN_JSON" uv run python -c 'import json, os; train=json.loads(os.environ["TRAIN_JSON"]); passing=[c for c in train["candidates"] if c["metrics"].get("scenario_recall") == 1.0 and c["metrics"].get("false_positive_rate", 1.0) <= 0.15]; print((passing or train["candidates"])[0]["model_id"])'
+          )"
+          OTHER_ID="$(
+            TRAIN_JSON="$TRAIN_JSON" MODEL_ID="$MODEL_ID" uv run python -c 'import json, os; train=json.loads(os.environ["TRAIN_JSON"]); print(next(c["model_id"] for c in train["candidates"] if c["model_id"] != os.environ["MODEL_ID"]))'
+          )"
+          uv run sentinelueba ml models verify "$MODEL_ID"
+          uv run sentinelueba ml models verify "$OTHER_ID"
+          uv run sentinelueba ml evaluate "$MODEL_ID"
+          COMPARE_JSON="$(uv run sentinelueba ml models compare "$MODEL_ID" "$OTHER_ID")"
+          COMPARE_JSON="$COMPARE_JSON" MODEL_ID="$MODEL_ID" uv run python - <<'PY'
+          import json
+          import os
+          compare = json.loads(os.environ["COMPARE_JSON"])
+          assert compare["recommendation_order"][0] == os.environ["MODEL_ID"], compare
+          PY
+          uv run sentinelueba ml models promote "$MODEL_ID" --confirm
+          MODEL_ID="$MODEL_ID" uv run python - <<'PY'
+          from sentinelueba.config import get_settings
+          from sentinelueba.storage.sqlite import SQLiteStorage
+          storage = SQLiteStorage(get_settings().database_path)
+          models = storage.list_model_versions(lifecycle_status="champion")
+          assert len(models) == 1, models
+          assert models[0]["model_id"] == __import__("os").environ["MODEL_ID"], models
+          PY
+          uv run sentinelueba ml models promote "$OTHER_ID" --confirm
+          MODEL_ID="$MODEL_ID" OTHER_ID="$OTHER_ID" uv run python - <<'PY'
+          import os
+          from sentinelueba.config import get_settings
+          from sentinelueba.storage.sqlite import SQLiteStorage
+          storage = SQLiteStorage(get_settings().database_path)
+          models = {item["model_id"]: item for item in storage.list_model_versions()}
+          assert models[os.environ["MODEL_ID"]]["lifecycle_status"] == "retired", models
+          assert models[os.environ["OTHER_ID"]]["lifecycle_status"] == "champion", models
+          assert len(storage.list_model_versions(lifecycle_status="champion")) == 1
+          PY
+          uv run sentinelueba ml models rollback "$MODEL_ID" --confirm
+          MODEL_ID="$MODEL_ID" OTHER_ID="$OTHER_ID" uv run python - <<'PY'
+          import os
+          from sentinelueba.config import get_settings
+          from sentinelueba.storage.sqlite import SQLiteStorage
+          storage = SQLiteStorage(get_settings().database_path)
+          models = {item["model_id"]: item for item in storage.list_model_versions()}
+          assert models[os.environ["MODEL_ID"]]["lifecycle_status"] == "champion", models
+          assert models[os.environ["OTHER_ID"]]["lifecycle_status"] == "retired", models
+          assert len(storage.list_model_versions(lifecycle_status="champion")) == 1
+          assert storage.list_model_promotions()[0]["action"] == "rollback"
+          PY
+          SCORE_JSON="$(uv run sentinelueba ml score --dataset "$DATASET_ID" --model "$MODEL_ID")"
+          SCORE_JSON="$SCORE_JSON" uv run python - <<'PY'
+          import json
+          import os
+          score = json.loads(os.environ["SCORE_JSON"])
+          assert score["window_count"] == 96, score
+          from sentinelueba.config import get_settings
+          from sentinelueba.storage.sqlite import SQLiteStorage
+          run = SQLiteStorage(get_settings().database_path).get_scoring_run(score["scoring_run_id"])
+          assert run["status"] == "success", run
+          assert len(run["windows"]) == 96, run
+          PY
+          DRIFT_JSON="$(uv run sentinelueba ml drift --dataset "$DATASET_ID" --model "$MODEL_ID")"
+          DRIFT_JSON="$DRIFT_JSON" uv run python - <<'PY'
+          import json
+          import os
+          drift = json.loads(os.environ["DRIFT_JSON"])
+          assert drift["status"] == "ok", drift
+          PY
+          NOOP_JSON="$(uv run sentinelueba features materialize)"
+          NOOP_JSON="$NOOP_JSON" uv run python - <<'PY'
+          import json
+          import os
+          noop = json.loads(os.environ["NOOP_JSON"])
+          assert noop["processed_events"] == 0, noop
+          assert noop["processed_observations"] == 0, noop
+          assert noop["upserted_windows"] == 0, noop
+          assert noop["deleted_windows"] == 0, noop
+          PY
+          test -z "$(git ls-files data artifacts || true)"
 
   frontend:
     runs-on: ubuntu-latest
@@ -62,7 +164,7 @@ jobs:
         run: uv sync --all-extras --dev
       - name: Unit tests
         run: uv run pytest
-      - name: Dataset pipeline smoke
+      - name: Dataset and ML pipeline smoke
         shell: pwsh
         run: |
           uv run sentinelueba generate-demo
@@ -70,6 +172,40 @@ jobs:
           uv run sentinelueba datasets create --kind synthetic
           $dataset = Get-ChildItem data/datasets | Sort-Object LastWriteTime -Descending | Select-Object -First 1
           uv run sentinelueba datasets verify $dataset.Name
+          $train = uv run sentinelueba ml train --dataset synthetic --dataset-id $dataset.Name --families autoencoder,isolation-forest --autoencoder-epochs 6 --if-n-estimators 16 | ConvertFrom-Json
+          if ($train.split.train.count -ne 50 -or $train.split.calibration.count -ne 22 -or $train.split.test.count -ne 24) { throw "unexpected split counts" }
+          if ($train.split.scenario_window_ids.Count -ne 5) { throw "unexpected scenario split" }
+          $passing = @($train.candidates | Where-Object { $_.metrics.scenario_recall -eq 1.0 -and $_.metrics.false_positive_rate -le 0.15 })
+          if ($passing.Count -eq 0) { throw "no passing candidate" }
+          $modelId = $passing[0].model_id
+          $otherId = @($train.candidates | Where-Object { $_.model_id -ne $modelId })[0].model_id
+          uv run sentinelueba ml models verify $modelId
+          uv run sentinelueba ml models verify $otherId
+          uv run sentinelueba ml evaluate $modelId
+          uv run sentinelueba ml models compare $modelId $otherId
+          uv run sentinelueba ml models promote $modelId --confirm
+          @'
+          import os
+          from sentinelueba.config import get_settings
+          from sentinelueba.storage.sqlite import SQLiteStorage
+          storage = SQLiteStorage(get_settings().database_path)
+          champions = storage.list_model_versions(lifecycle_status="champion")
+          assert len(champions) == 1, champions
+          '@ | uv run python -
+          uv run sentinelueba ml models promote $otherId --confirm
+          uv run sentinelueba ml models rollback $modelId --confirm
+          @'
+          from sentinelueba.config import get_settings
+          from sentinelueba.storage.sqlite import SQLiteStorage
+          storage = SQLiteStorage(get_settings().database_path)
+          assert len(storage.list_model_versions(lifecycle_status="champion")) == 1
+          assert storage.list_model_promotions()[0]["action"] == "rollback"
+          '@ | uv run python -
+          $score = uv run sentinelueba ml score --dataset $dataset.Name --model $modelId | ConvertFrom-Json
+          if ($score.window_count -ne 96) { throw "unexpected scoring count" }
+          uv run sentinelueba ml drift --dataset $dataset.Name --model $modelId
+          $noop = uv run sentinelueba features materialize | ConvertFrom-Json
+          if ($noop.processed_events -ne 0 -or $noop.processed_observations -ne 0 -or $noop.upserted_windows -ne 0 -or $noop.deleted_windows -ne 0) { throw "unexpected no-op materialization" }
       - name: PowerShell syntax
         shell: pwsh
         run: |

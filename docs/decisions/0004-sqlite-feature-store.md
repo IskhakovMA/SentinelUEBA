@@ -1,4 +1,4 @@
-# ADR 0004: SQLite Feature Store
+# ADR 0004: SQLite Feature Store And Model Registry
 
 ## Status
 
@@ -6,13 +6,11 @@ Accepted.
 
 ## Context
 
-SentinelUEBA is local-first and currently runs as a modular monolith. Stage 2 needs
-persistent feature windows, materialization state, quarantine records, quality summaries,
-and dataset snapshot metadata without adding infrastructure.
+SentinelUEBA is local-first and currently runs as a modular monolith. Stage 2 needed persistent feature windows, materialization state, quarantine records, quality summaries, and dataset snapshot metadata without adding infrastructure. Stage 3 needs durable model registry, evaluation, promotion, and offline scoring audit rows while keeping the same local deployment model.
 
 ## Decision
 
-Use SQLite v6 tables for the feature store:
+Use SQLite v8 as the local feature store and model registry. Stage 2 feature-store tables remain:
 
 - `feature_windows`
 - `feature_materialization_state`
@@ -23,15 +21,17 @@ Use SQLite v6 tables for the feature store:
 - `quarantined_events`
 - `dataset_snapshots`
 
+Stage 3 adds:
+
+- `training_runs`
+- `model_versions`
+- `model_evaluations`
+- `model_promotions`
+- `scoring_runs`
+- `scored_windows`
+
 ## Consequences
 
-SQLite keeps Windows setup simple and CI portable. It is not a streaming framework; late
-event handling is implemented by deterministic invalidation and rebuild of affected
-window ranges. Real coverage is derived from collector observations so a quiet but
-successfully polled host can still produce usable windows without inventing change
-events. Incremental materialization reads observations with the composite
-`observed_at + observation_id` watermark and selects affected observations by
-coverage-interval overlap. Fresh databases and historical v1/v2/v3/v4/v5 databases
-migrate to v6. Databases already at schema v6 are verified for required structure;
-missing tables or columns are treated as integrity failures instead of triggering old
-migrations again.
+SQLite keeps Windows setup simple and CI portable. It is not a streaming framework; late event handling is implemented by deterministic invalidation and rebuild of affected window ranges. Real coverage is derived from collector observations so a quiet but successfully polled host can still produce usable windows without inventing change events. Incremental materialization reads observations with the composite `observed_at + observation_id` watermark and selects affected observations by coverage-interval overlap.
+
+The model registry can enforce one champion per dataset kind/profile, preserve model lifecycle transitions, and keep offline scoring auditable without introducing a second database. Schema v8 keeps `model_promotions.new_model_id` nullable so retirement history records a real `NULL` successor. Fresh databases and historical v1/v2/v3/v4/v5/v6/v7 databases migrate to v8. Databases already at schema v8 are verified for required structure; missing tables or columns are treated as integrity failures instead of triggering old migrations again.

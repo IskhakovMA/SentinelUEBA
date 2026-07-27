@@ -1,14 +1,10 @@
 # Architecture
 
-SentinelUEBA Stage 2 is a local modular monolith. The backend owns telemetry generation,
-opt-in Windows collectors, validation, canonical normalization, storage, feature
-materialization, dataset snapshots, model training, inference, detection, and collection
-accounting. The frontend calls FastAPI endpoints and renders pipeline status plus anomaly
-and collector results.
+SentinelUEBA Stage 3 is a local modular monolith. The backend owns telemetry generation, opt-in Windows collectors, validation, canonical normalization, storage, feature materialization, dataset snapshots, model training, calibration, registry-backed promotion, offline scoring, drift reports, and collection accounting. The frontend calls FastAPI endpoints and renders pipeline, collector, anomaly, and ML Lab results.
 
 The primary identity boundary is `user_id + host_id`. Synthetic events use safe demo identifiers. Real Windows events use pseudonymous local identifiers by default; raw identity mode is explicit configuration only.
 
-Stage 2 uses 15-minute non-overlapping UTC windows. This keeps the demo fast and gives enough density for process, network, metrics, and authentication features. Synthetic and real events are filtered separately for training and detection.
+Stage 3 uses 15-minute non-overlapping UTC windows. Synthetic and real data are partitioned by dataset kind and profile for snapshots, training, scoring, and drift checks.
 
 ```mermaid
 flowchart LR
@@ -17,11 +13,16 @@ flowchart LR
   B --> D["original-key and payload validation"]
   D -->|accepted| E["canonical normalization + SQLite telemetry_events"]
   D -->|rejected| Q["safe quarantined_events"]
-  E --> F["Feature windows"]
+  E --> F["Feature materialization"]
   F --> J["Verified registered Parquet snapshot"]
-  J --> K["PyTorch autoencoder"]
-  K --> G["Snapshot-backed detection"]
-  G --> H["FastAPI / CLI / React"]
+  J --> K["Leakage-safe split"]
+  K --> L["Train Autoencoder v2 / Isolation Forest"]
+  L --> M["Calibration-only threshold"]
+  M --> N["Pending bundle verification"]
+  N --> O["Atomic training finalize + verified_at"]
+  O --> P["Promotion / rollback lifecycle"]
+  P --> R["Controlled offline scoring"]
+  R --> H["FastAPI / CLI / React ML Lab"]
   I["Collector state, cursors, observations, heartbeats"] --> F
   I --> H
 ```
@@ -32,17 +33,18 @@ Demo scenario validation is a post-inference reporting step. It compares the ful
 
 ## Stage 2 Data Pipeline
 
-Stage 2 keeps the modular monolith and adds explicit boundaries for validation,
-ingestion, data quality, feature materialization, dataset snapshots, and retention.
-SQLite schema v6 stores ingestion metadata, `quarantined_events`, `feature_windows`,
-`feature_materialization_state`, `collector_observations`, late/duplicate event records,
-`data_quality_runs`, and `dataset_snapshots`. The v6 materialization state includes the
-composite observation watermark `last_observation_at + last_observation_id`.
+Stage 2 added explicit boundaries for validation, ingestion, data quality, feature materialization, dataset snapshots, and retention. SQLite schema v6 stores ingestion metadata, `quarantined_events`, `feature_windows`, `feature_materialization_state`, `collector_observations`, late/duplicate event records, `data_quality_runs`, and `dataset_snapshots`. The v6 materialization state includes the composite observation watermark `last_observation_at + last_observation_id`.
 
-Feature windows are 15-minute UTC tumbling windows partitioned by dataset kind and
-user+host profile. For real data, quality is based on collector observations rather than
-event counts or raw session duration. Incremental materialization reads observations by
-`(observed_at, observation_id)` and selects affected observations by coverage-interval
-overlap. Autoencoder training and offline detection read a verified registered Parquet
-dataset snapshot instead of arbitrary current SQLite event contents.
-See `DATA_PIPELINE.md` for the full flow and Mermaid diagram.
+Feature windows are 15-minute UTC tumbling windows partitioned by dataset kind and user+host profile. For real data, quality is based on collector observations rather than event counts or raw session duration. Incremental materialization reads observations by `(observed_at, observation_id)` and selects affected observations by coverage-interval overlap.
+
+## Stage 3 ML Pipeline
+
+SQLite schema v8 stores Stage 2 feature-store tables plus `training_runs`, `model_versions`, `model_evaluations`, `model_promotions`, `scoring_runs`, and `scored_windows`. Schema v8 makes `model_promotions.new_model_id` nullable so retirement audit history records `NULL` for the absent successor. Model bundles are immutable directories under the configured local model artifact root. Each bundle includes `manifest.json`, `split.json`, `preprocessor.json`, `metrics.json`, `model_card.md`, `checksums.sha256`, and exactly one family artifact: `autoencoder.pt` or `isolation_forest.skops`. `manifest.artifact_hashes` anchors the split, preprocessor, metrics, model card, and model artifact hashes; `checksums.sha256` must match the same hashes.
+
+Synthetic snapshots split chronologically at the first scenario window: prior normal windows become train/calibration, and all scenario windows stay in test. Real snapshots use chronological 70/15/15 splits over good windows only. The preprocessor is fitted on train rows only. Thresholds are calibrated only from calibration scores. Synthetic labels are used only for held-out evaluation and recommendation.
+
+Bundle creation uses internal temp-bundle verification before atomic rename and private pending registered verification after `model_versions` registration. After all candidates are registered and evaluated, one SQLite transaction marks the training run `success`, records `completed_at`, and fills `verified_at` for every candidate model. Public verification requires a registered verified source dataset snapshot, exact registry/manifest/training-run agreement, matching artifact path, model input dimension, a successful completed training run, and supported library-safe artifact loading.
+
+Offline scoring requires a verified registered model bundle and a verified registered dataset snapshot. The compatibility service checks dataset kind, profile key, feature schema, feature order, manifest hashes, artifact hashes, and threshold metadata before writing `scoring_runs` and `scored_windows`. A scoring run is inserted as `running` before model loading; success inserts rows atomically, and failure records a sanitized error without partial scored rows.
+
+The React ML Lab renders synthetic/real dataset controls, model family/config controls, training runs, model details, scoring-run details, drift details, candidate/recommended/champion lifecycle actions, verification state, and legacy Stage 2 artifact detection. Lifecycle actions require a browser confirmation before the API receives `confirm=true`. The UI shows pseudonymous profile labels and shortened hashes rather than raw users, hosts, local artifact paths, executable paths, network addresses, or payloads.

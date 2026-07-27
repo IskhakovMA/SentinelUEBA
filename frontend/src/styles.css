@@ -90,6 +90,7 @@ button:hover {
 .panel,
 .collectionPanel,
 .pipelinePanel,
+.mlPanel,
 .details,
 .log {
   border: 1px solid #2f3b46;
@@ -132,7 +133,8 @@ button:hover {
   margin-bottom: 12px;
 }
 
-.pipelinePanel {
+.pipelinePanel,
+.mlPanel {
   max-width: 1280px;
   margin: 0 auto 18px;
   padding: 16px;
@@ -142,18 +144,55 @@ button:hover {
   margin-bottom: 14px;
 }
 
+.mlControls {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.mlControls label {
+  color: #aeb8c2;
+  display: grid;
+  gap: 5px;
+  font-size: 13px;
+}
+
+.mlControls select,
+.mlControls input {
+  border: 1px solid #34414d;
+  background: #101820;
+  color: #f1f5f9;
+  border-radius: 7px;
+  min-height: 36px;
+  padding: 7px 9px;
+  width: 100%;
+}
+
+.mlControls .checkControl {
+  align-content: end;
+  grid-template-columns: 18px 1fr;
+  min-height: 58px;
+}
+
+.mlControls .checkControl input {
+  min-height: 18px;
+}
+
 .pipelineActions button:disabled {
   cursor: not-allowed;
   opacity: 0.55;
 }
 
-.pipelineGrid {
+.pipelineGrid,
+.mlGrid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 10px;
 }
 
-.pipelineGrid article {
+.pipelineGrid article,
+.mlGrid article {
   border: 1px solid #34414d;
   border-radius: 7px;
   padding: 10px;
@@ -162,7 +201,59 @@ button:hover {
   min-height: 78px;
 }
 
-.pipelineGrid strong {
+.pipelineGrid strong,
+.mlGrid strong {
+  overflow-wrap: anywhere;
+}
+
+.mlTables {
+  display: grid;
+  gap: 14px;
+  margin-top: 14px;
+}
+
+.mlTables h3 {
+  margin: 0 0 8px;
+  font-size: 15px;
+}
+
+.compactTable .row {
+  grid-template-columns:
+    minmax(130px, 1.2fr) repeat(5, minmax(80px, 1fr))
+    repeat(5, minmax(74px, 0.8fr));
+}
+
+.compactTable button {
+  justify-content: center;
+  min-height: 34px;
+  padding: 6px 8px;
+}
+
+.detailGrid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.detailGrid article {
+  border: 1px solid #34414d;
+  border-radius: 7px;
+  padding: 12px;
+}
+
+.detailGrid h3 {
+  margin: 0 0 8px;
+  font-size: 15px;
+}
+
+.detailList {
+  display: grid;
+  gap: 7px;
+  color: #cbd5df;
+}
+
+.detailList span {
   overflow-wrap: anywhere;
 }
 
@@ -309,7 +400,8 @@ button:hover {
   .grid,
   .collectorGrid,
   .scenarioGrid,
-  .pipelineGrid {
+  .pipelineGrid,
+  .mlGrid {
     grid-template-columns: 1fr;
   }
 }

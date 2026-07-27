@@ -1,6 +1,6 @@
 # SentinelUEBA
 
-SentinelUEBA — local-first Windows-focused UEBA портфолио-проект. Stage 2 сохраняет synthetic demo и opt-in Windows telemetry из предыдущих стадий, затем добавляет validation, data quality, materialized feature windows, immutable Parquet dataset snapshots, retention controls, FastAPI, CLI и React-интерфейс.
+SentinelUEBA — local-first Windows-focused UEBA портфолио-проект. Stage 3 сохраняет synthetic demo, opt-in Windows telemetry, validation-first ingestion, SQLite feature store, data quality, retention и immutable Parquet snapshots из предыдущих стадий, затем добавляет воспроизводимый локальный ML pipeline с model registry, evaluation, promotion, rollback, offline scoring, FastAPI, CLI и React ML Lab.
 
 [English version](README.md)
 
@@ -8,12 +8,17 @@ SentinelUEBA — local-first Windows-focused UEBA портфолио-проек�
 
 - Безопасная synthetic demo telemetry за 24-hour-equivalent период.
 - Opt-in Windows collectors для процессов, сети, системных метрик и optional Security Event Log authentication metadata.
-- SQLite с последовательными миграциями, индексами, защитой от дублей, collection sessions, collector observations и collector cursors.
-- Payload validation, quarantine и ingestion metadata.
+- SQLite с последовательными миграциями, индексами, защитой от дублей, collection sessions, collector observations, dataset snapshots и model registry v8.
+- Payload validation, quarantine и ingestion metadata до canonical normalization.
 - Persistent 15-минутные UTC feature windows для пары user + host.
 - Immutable Parquet dataset snapshots с manifest и SHA-256 verification.
-- CPU-friendly PyTorch autoencoder с preprocessing и model metadata.
-- Объяснения на основе per-feature reconstruction residual.
+- Leakage-safe train/calibration/test split из verified registered snapshots.
+- CPU-friendly PyTorch Autoencoder v2 и scikit-learn Isolation Forest baseline.
+- Calibration-only anomaly thresholding с higher-is-more-anomalous scores.
+- Immutable model bundles с manifest, model card, SHA-256 checksums и SQLite registry rows.
+- Lifecycle candidate, recommended, champion, retired, rejected и failed с явным promotion/rollback.
+- Offline snapshot scoring, scored-window audit rows, compatibility checks и drift reports.
+- Объяснения на основе per-feature reconstruction residual и context deviation.
 - Post-inference validation для всех пяти canonical synthetic demo-сценариев.
 - Уровни риска: low, medium, high, critical.
 - FastAPI endpoints и двуязычная EN/RU панель на React.
@@ -29,6 +34,7 @@ uv run sentinelueba features materialize --dataset synthetic
 uv run sentinelueba datasets create --kind synthetic
 uv run sentinelueba train --seed 42
 uv run sentinelueba detect
+uv run sentinelueba ml status
 uv run sentinelueba run-api
 pnpm --dir frontend install
 pnpm --dir frontend dev
@@ -63,12 +69,31 @@ uv run sentinelueba retention preview
 uv run sentinelueba quarantine summary
 ```
 
-Обучение и snapshot-backed detection теперь используют verified dataset snapshots, а не произвольное текущее содержимое SQLite.
+Обучение, public snapshot verification, matrix loading, detection, scoring, evaluation и drift reports используют verified registered dataset snapshots, а не произвольное текущее содержимое SQLite.
+
 Подробнее: [data pipeline](docs/DATA_PIPELINE.md), [data quality](docs/DATA_QUALITY.md), [dataset snapshots](docs/DATASET_SNAPSHOTS.md).
 
-## Ограничения Stage 2
+## ML Pipeline
 
-Не реализованы Windows Service, Linux collectors, ETW, kernel driver, cloud backend, SIEM, alerts, packet capture, keylogging, clipboard, browser history, traffic payload inspection, Isolation Forest и ручная калибровка threshold.
+```bash
+uv run sentinelueba ml train --dataset synthetic --seed 42 --autoencoder-epochs 20 --if-n-estimators 32
+uv run sentinelueba ml models list
+uv run sentinelueba ml models verify <model-id>
+uv run sentinelueba ml models recommend <model-id> --confirm
+uv run sentinelueba ml models promote <model-id> --confirm
+uv run sentinelueba ml score --dataset <dataset-id> --model <model-id> --batch-size 64
+uv run sentinelueba ml drift --model <model-id> --dataset <dataset-id>
+```
+
+Synthetic seed 42 обучает Autoencoder v2 и Isolation Forest candidates из verified snapshot. Scenario labels используются только для held-out evaluation и recommendation, но не как feature columns и не как training input. Real datasets считаются unlabeled: система показывает flagged rates и limitations, а не выдуманные precision, recall, F1, ROC-AUC или PR-AUC.
+
+Public model operations требуют finalized training runs и verified registered model rows. Во время training candidate bundles проходят private pending verification и становятся public только после одной SQLite transaction, которая переводит training run в `success` и заполняет `verified_at` для всех candidate models.
+
+Подробнее: [ML pipeline](docs/ML_PIPELINE.md), [model registry](docs/MODEL_REGISTRY.md), [model evaluation](docs/MODEL_EVALUATION.md), [model cards](docs/MODEL_CARDS.md).
+
+## Ограничения Stage 3
+
+Не реализованы Windows Service, Linux collectors, ETW, kernel driver, cloud backend, SIEM, alerts, packet capture, keylogging, clipboard, browser history, traffic payload inspection, live blocking, automated response, online learning, supervised security labels и production alerting.
 
 ## Разработка
 

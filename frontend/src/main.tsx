@@ -1,6 +1,17 @@
 import React, { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Activity, Archive, Database, Languages, Play, Radar, RefreshCw, Shield, Sparkles, Square } from 'lucide-react';
+import {
+  Activity,
+  Archive,
+  Database,
+  Languages,
+  Play,
+  Radar,
+  RefreshCw,
+  Shield,
+  Sparkles,
+  Square,
+} from 'lucide-react';
 import './styles.css';
 
 type Risk = 'low' | 'medium' | 'high' | 'critical';
@@ -23,6 +34,8 @@ type Status = {
     database_path: string;
     quarantine_count?: number;
     feature_window_count?: number;
+    model_count?: number;
+    scoring_run_count?: number;
   };
   model: { trained?: boolean; model_version?: string };
   collection?: CollectionStatus;
@@ -86,9 +99,101 @@ type DataPipelineStatus = {
 type ScenarioValidation = {
   scenario_name: string;
   detected: boolean;
-  match_count: number;
+  match_count?: number;
   best_anomaly_score: number;
-  max_risk_level: string;
+  max_risk_level?: string;
+};
+
+type MLModel = {
+  model_id: string;
+  family: string;
+  model_version: string;
+  lifecycle_status: string;
+  dataset_id: string;
+  dataset_kind: string;
+  threshold: number;
+  created_at: string;
+  verified_at?: string | null;
+};
+
+type MLTrainingRun = {
+  training_run_id: string;
+  dataset_id: string;
+  dataset_kind: string;
+  split_id: string;
+  profile_key: string;
+  status: string;
+  started_at: string;
+  completed_at?: string | null;
+  safe_error_message?: string | null;
+};
+
+type MLScoringRun = {
+  scoring_run_id: string;
+  model_id: string;
+  dataset_id: string;
+  split_range?: { kind?: string };
+  status: string;
+  window_count: number;
+  anomaly_count: number;
+  started_at: string;
+  safe_error?: string | null;
+};
+
+type MLStatus = {
+  schema_version: number;
+  models: MLModel[];
+  champions: MLModel[];
+  training_runs: MLTrainingRun[];
+  scoring_runs: MLScoringRun[];
+  legacy_unregistered: boolean;
+  legacy_artifact?: { description: string; recommendation: string };
+};
+
+type MLModelDetails = {
+  model: MLModel & {
+    profile_key: string;
+    manifest_sha256: string;
+    model_artifact_sha256: string;
+  };
+  evaluation?: {
+    label_status: string;
+    metrics: Record<string, unknown>;
+  } | null;
+  verification?: {
+    verified?: boolean;
+    manifest_sha256?: string;
+    model_artifact_sha256?: string;
+  };
+};
+
+type MLScoringRunDetails = MLScoringRun & {
+  windows?: Array<{
+    window_id: string;
+    window_start: string;
+    window_end: string;
+    anomaly_score: number;
+    risk_level: string;
+    is_anomaly: boolean;
+  }>;
+};
+
+type DriftReport = {
+  status: string;
+  reference_split?: { count?: number; kind?: string };
+  model_score_quantiles?: {
+    reference?: Record<string, number>;
+    target?: Record<string, number>;
+  };
+  reference_flagged_rate?: number;
+  target_flagged_rate?: number;
+  flagged_rate_difference?: number;
+  top_shifted_features?: Array<{
+    feature_name: string;
+    standardized_mean_shift: number;
+    psi: number;
+  }>;
+  limitations?: string[];
 };
 
 const copy = {
@@ -121,6 +226,19 @@ const copy = {
     latestSynthetic: 'Latest synthetic snapshot',
     latestReal: 'Latest real snapshot',
     realDisabled: 'Real snapshot requires 24 usable hours in one profile.',
+    mlLab: 'ML Lab',
+    trainCandidates: 'Train candidates',
+    verifyChampion: 'Verify champion',
+    scoreChampion: 'Score champion',
+    drift: 'Drift report',
+    champion: 'Champion',
+    recommended: 'Recommended',
+    latestRun: 'Latest training run',
+    latestScore: 'Latest scoring run',
+    registry: 'SQLite registry',
+    modelBundles: 'Model bundles',
+    scoringRuns: 'Scoring runs',
+    mlWarning: 'Offline model scoring only. An anomaly is not proof of malicious activity.',
   },
   ru: {
     title: 'SentinelUEBA',
@@ -151,6 +269,19 @@ const copy = {
     latestSynthetic: 'Последний synthetic snapshot',
     latestReal: 'Последний real snapshot',
     realDisabled: 'Real snapshot требует 24 полезных часа в одном профиле.',
+    mlLab: 'ML Lab',
+    trainCandidates: 'Обучить кандидатов',
+    verifyChampion: 'Проверить champion',
+    scoreChampion: 'Score champion',
+    drift: 'Drift report',
+    champion: 'Champion',
+    recommended: 'Recommended',
+    latestRun: 'Последний training run',
+    latestScore: 'Последний scoring run',
+    registry: 'SQLite registry',
+    modelBundles: 'Model bundles',
+    scoringRuns: 'Scoring runs',
+    mlWarning: 'Только offline scoring. Аномалия не является доказательством атаки.',
   },
 };
 
@@ -173,17 +304,34 @@ export function App() {
   const [capabilities, setCapabilities] = React.useState<CollectorCapability[]>([]);
   const [scenarioValidation, setScenarioValidation] = React.useState<ScenarioValidation[]>([]);
   const [dataQuality, setDataQuality] = React.useState<DataQuality | null>(null);
+  const [mlStatus, setMlStatus] = React.useState<MLStatus | null>(null);
+  const [mlDatasetKind, setMlDatasetKind] = React.useState<'synthetic' | 'real'>('synthetic');
+  const [selectedDatasetId, setSelectedDatasetId] = React.useState<string>('');
+  const [trainAutoencoder, setTrainAutoencoder] = React.useState<boolean>(true);
+  const [trainIsolationForest, setTrainIsolationForest] = React.useState<boolean>(true);
+  const [autoencoderEpochs, setAutoencoderEpochs] = React.useState<number>(20);
+  const [ifEstimators, setIfEstimators] = React.useState<number>(32);
+  const [scoreBatchSize, setScoreBatchSize] = React.useState<number>(64);
+  const [modelDetails, setModelDetails] = React.useState<MLModelDetails | null>(null);
+  const [scoringRunDetails, setScoringRunDetails] = React.useState<MLScoringRunDetails | null>(
+    null,
+  );
+  const [driftReport, setDriftReport] = React.useState<DriftReport | null>(null);
   const t = copy[locale];
 
   const refresh = React.useCallback(async () => {
     const statusResponse = await api<{ data: Status }>('/status');
     const anomalyResponse = await api<{ anomalies: Anomaly[] }>('/anomalies');
-    const capabilityResponse = await api<{ data: { collectors: CollectorCapability[] } }>('/collectors/capabilities');
+    const capabilityResponse = await api<{ data: { collectors: CollectorCapability[] } }>(
+      '/collectors/capabilities',
+    );
     const qualityResponse = await api<{ data: DataQuality }>('/data-quality');
+    const mlStatusResponse = await api<{ data: MLStatus }>('/ml/status');
     setStatus(statusResponse.data);
     setAnomalies(anomalyResponse.anomalies);
     setCapabilities(capabilityResponse.data.collectors);
     setDataQuality(qualityResponse.data);
+    setMlStatus(mlStatusResponse.data);
   }, []);
 
   React.useEffect(() => {
@@ -206,9 +354,47 @@ export function App() {
     }
   };
 
+  const confirmLifecycle = (action: string, model: MLModel, consequence: string) =>
+    window.confirm(
+      `${action} ${shortValue(model.model_id)}\n` +
+        `Current status: ${model.lifecycle_status}\n` +
+        consequence,
+    );
+
+  const loadModelDetails = (modelId: string) =>
+    run('model-details', async () => {
+      const response = await api<{ data: MLModelDetails }>(`/ml/models/${modelId}`);
+      setModelDetails(response.data);
+      return response;
+    });
+
+  const loadScoringRunDetails = (runId: string) =>
+    run('scoring-details', async () => {
+      const response = await api<{ data: MLScoringRunDetails }>(`/ml/scoring-runs/${runId}`);
+      setScoringRunDetails(response.data);
+      return response;
+    });
+
   const selectedAnomaly = anomalies[selected];
   const scores = anomalies.slice(0, 24).reverse();
   const maxScore = Math.max(...scores.map((item) => item.anomaly_score), 1);
+  const champion = mlStatus?.champions[0];
+  const recommended = mlStatus?.models.find((model) => model.lifecycle_status === 'recommended');
+  const latestTrainingRun = mlStatus?.training_runs[0];
+  const latestScoringRun = mlStatus?.scoring_runs[0];
+  const availableDatasets = dataQuality?.dataset_snapshots[mlDatasetKind] ?? [];
+  const effectiveDatasetId = selectedDatasetId || availableDatasets[0]?.dataset_id || '';
+  const selectedFamilies = [
+    trainAutoencoder ? 'autoencoder' : '',
+    trainIsolationForest ? 'isolation-forest' : '',
+  ].filter(Boolean);
+  const stage3ModelStatus = champion
+    ? `champion ${shortValue(champion.model_id)}`
+    : mlStatus?.legacy_unregistered
+      ? 'legacy'
+      : status?.model.trained
+        ? 'legacy'
+        : 'missing';
 
   return (
     <main>
@@ -289,7 +475,7 @@ export function App() {
         <article>
           <Shield size={18} />
           <span>{t.model}</span>
-          <strong>{status?.model.trained ? 'trained' : 'missing'}</strong>
+          <strong>{stage3ModelStatus}</strong>
         </article>
       </section>
 
@@ -344,6 +530,440 @@ export function App() {
           <article>
             <span>{t.latestReal}</span>
             <strong>{shortValue(dataQuality?.dataset_snapshots.real[0]?.dataset_id)}</strong>
+          </article>
+        </div>
+      </section>
+
+      <section className="mlPanel">
+        <div className="panelTitle">
+          <Sparkles size={18} />
+          <span>{t.mlLab}</span>
+        </div>
+        <div className="mlControls">
+          <label>
+            Dataset kind
+            <select
+              value={mlDatasetKind}
+              onChange={(event) => {
+                setMlDatasetKind(event.target.value as 'synthetic' | 'real');
+                setSelectedDatasetId('');
+              }}
+            >
+              <option value="synthetic">synthetic</option>
+              <option value="real">real</option>
+            </select>
+          </label>
+          <label>
+            Dataset
+            <select
+              value={effectiveDatasetId}
+              onChange={(event) => setSelectedDatasetId(event.target.value)}
+            >
+              {availableDatasets.length ? (
+                availableDatasets.map((dataset) => (
+                  <option key={dataset.dataset_id} value={dataset.dataset_id}>
+                    {shortValue(dataset.dataset_id)} / {shortValue(dataset.manifest_sha256)}
+                  </option>
+                ))
+              ) : (
+                <option value="">none</option>
+              )}
+            </select>
+          </label>
+          <label className="checkControl">
+            <input
+              type="checkbox"
+              checked={trainAutoencoder}
+              onChange={(event) => setTrainAutoencoder(event.target.checked)}
+            />
+            Autoencoder
+          </label>
+          <label className="checkControl">
+            <input
+              type="checkbox"
+              checked={trainIsolationForest}
+              onChange={(event) => setTrainIsolationForest(event.target.checked)}
+            />
+            Isolation Forest
+          </label>
+          <label>
+            AE epochs
+            <input
+              type="number"
+              min={1}
+              max={300}
+              value={autoencoderEpochs}
+              onChange={(event) => setAutoencoderEpochs(Number(event.target.value))}
+            />
+          </label>
+          <label>
+            IF estimators
+            <input
+              type="number"
+              min={10}
+              max={500}
+              value={ifEstimators}
+              onChange={(event) => setIfEstimators(Number(event.target.value))}
+            />
+          </label>
+          <label>
+            Batch
+            <input
+              type="number"
+              min={1}
+              max={4096}
+              value={scoreBatchSize}
+              onChange={(event) => setScoreBatchSize(Number(event.target.value))}
+            />
+          </label>
+        </div>
+        <div className="pipelineActions">
+          <button
+            disabled={!selectedFamilies.length}
+            onClick={() =>
+              run(
+                'ml-train',
+                () =>
+                  api('/ml/train', {
+                    method: 'POST',
+                    body: JSON.stringify({
+                      dataset_kind: mlDatasetKind,
+                      dataset_id: effectiveDatasetId || undefined,
+                      families: selectedFamilies,
+                      seed: 42,
+                      autoencoder: {
+                        epochs: autoencoderEpochs,
+                        batch_size: 16,
+                        learning_rate: 0.005,
+                        weight_decay: 0.0001,
+                        hidden_dim: 10,
+                        latent_dim: 4,
+                        plateau_patience: 12,
+                      },
+                      isolation_forest: {
+                        n_estimators: ifEstimators,
+                        max_samples: 'auto',
+                        max_features: 1,
+                        bootstrap: false,
+                        n_jobs: 1,
+                      },
+                    }),
+                  }),
+              )
+            }
+          >
+            <Sparkles size={17} /> {t.trainCandidates}
+          </button>
+          <button
+            disabled={!champion}
+            onClick={() =>
+              champion
+                ? run(
+                    'ml-verify',
+                    () => api(`/ml/models/${champion.model_id}/verify`, { method: 'POST' }),
+                  )
+                : undefined
+            }
+          >
+            <Shield size={17} /> {t.verifyChampion}
+          </button>
+          <button
+            disabled={!champion}
+            onClick={() =>
+              champion
+                ? run(
+                    'ml-score',
+                    () =>
+                      api('/ml/score', {
+                        method: 'POST',
+                        body: JSON.stringify({
+                          dataset_id: champion.dataset_id,
+                          model_id: champion.model_id,
+                          batch_size: scoreBatchSize,
+                        }),
+                      }),
+                  )
+                : undefined
+            }
+          >
+            <Play size={17} /> {t.scoreChampion}
+          </button>
+          <button
+            disabled={!champion}
+            onClick={() =>
+              champion
+                ? run(
+                    'ml-drift',
+                    async () => {
+                      const response = await api<{ data: DriftReport }>('/ml/drift', {
+                        method: 'POST',
+                        body: JSON.stringify({
+                          dataset_id: champion.dataset_id,
+                          model_id: champion.model_id,
+                        }),
+                      });
+                      setDriftReport(response.data);
+                      return response;
+                    },
+                  )
+                : undefined
+            }
+          >
+            <Activity size={17} /> {t.drift}
+          </button>
+        </div>
+        <div className="mlGrid">
+          <article>
+            <span>{t.registry}</span>
+            <strong>v{mlStatus?.schema_version ?? 0}</strong>
+          </article>
+          <article>
+            <span>{t.modelBundles}</span>
+            <strong>{status?.storage.model_count ?? mlStatus?.models.length ?? 0}</strong>
+          </article>
+          <article>
+            <span>{t.scoringRuns}</span>
+            <strong>{status?.storage.scoring_run_count ?? mlStatus?.scoring_runs.length ?? 0}</strong>
+          </article>
+          <article>
+            <span>{t.champion}</span>
+            <strong>{shortValue(champion?.model_id)}</strong>
+          </article>
+          <article>
+            <span>{t.recommended}</span>
+            <strong>{shortValue(recommended?.model_id)}</strong>
+          </article>
+          <article>
+            <span>{t.latestRun}</span>
+            <strong>
+              {latestTrainingRun
+                ? `${latestTrainingRun.status} ${shortValue(latestTrainingRun.training_run_id)}`
+                : 'none'}
+            </strong>
+          </article>
+          <article>
+            <span>{t.latestScore}</span>
+            <strong>{latestScoringRun ? `${latestScoringRun.anomaly_count}/${latestScoringRun.window_count}` : 'none'}</strong>
+          </article>
+          <article>
+            <span>Threshold</span>
+            <strong>{champion ? champion.threshold.toFixed(4) : 'none'}</strong>
+          </article>
+          <article>
+            <span>Legacy</span>
+            <strong>{mlStatus?.legacy_unregistered ? 'unregistered' : 'none'}</strong>
+          </article>
+        </div>
+        <p className="warning">{t.mlWarning}</p>
+        {mlStatus?.legacy_unregistered ? (
+          <p className="warning">{mlStatus.legacy_artifact?.recommendation}</p>
+        ) : null}
+        <div className="mlTables">
+          <div>
+            <h3>Models</h3>
+            <div className="table compactTable">
+              {(mlStatus?.models ?? []).map((model) => (
+                <div className="row" key={model.model_id}>
+                  <span>{shortValue(model.model_id)}</span>
+                  <span>{model.family}</span>
+                  <span>{model.lifecycle_status}</span>
+                  <span>{model.dataset_kind}</span>
+                  <span>{model.threshold.toFixed(4)}</span>
+                  <span>{model.verified_at ? 'verified' : 'pending'}</span>
+                  <button onClick={() => loadModelDetails(model.model_id)}>details</button>
+                  <button
+                    disabled={model.lifecycle_status !== 'candidate'}
+                    onClick={() => {
+                      if (
+                        confirmLifecycle(
+                          'Recommend',
+                          model,
+                          'The model becomes the preferred candidate, but not champion.',
+                        )
+                      ) {
+                        run('recommend', () =>
+                          api(`/ml/models/${model.model_id}/recommend`, {
+                            method: 'POST',
+                            body: JSON.stringify({
+                              confirm: true,
+                              reason: 'ML Lab recommendation',
+                            }),
+                          }),
+                        );
+                      }
+                    }}
+                  >
+                    {t.recommended}
+                  </button>
+                  <button
+                    disabled={!['candidate', 'recommended'].includes(model.lifecycle_status)}
+                    onClick={() => {
+                      if (
+                        confirmLifecycle(
+                          'Promote',
+                          model,
+                          'The current champion for this profile will be retired.',
+                        )
+                      ) {
+                        run('promote', () =>
+                          api(`/ml/models/${model.model_id}/promote`, {
+                            method: 'POST',
+                            body: JSON.stringify({ confirm: true, reason: 'ML Lab promotion' }),
+                          }),
+                        );
+                      }
+                    }}
+                  >
+                    {t.champion}
+                  </button>
+                  <button
+                    disabled={model.lifecycle_status !== 'champion'}
+                    onClick={() => {
+                      if (
+                        confirmLifecycle(
+                          'Retire',
+                          model,
+                          'The profile will have no champion until another model is promoted.',
+                        )
+                      ) {
+                        run('retire', () =>
+                          api(`/ml/models/${model.model_id}/retire`, {
+                            method: 'POST',
+                            body: JSON.stringify({ confirm: true, reason: 'ML Lab retirement' }),
+                          }),
+                        );
+                      }
+                    }}
+                  >
+                    retire
+                  </button>
+                  <button
+                    disabled={model.lifecycle_status !== 'retired'}
+                    onClick={() => {
+                      if (
+                        confirmLifecycle(
+                          'Rollback',
+                          model,
+                          'This retired model becomes champion and the current champion retires.',
+                        )
+                      ) {
+                        run('rollback', () =>
+                          api(`/ml/models/${model.model_id}/rollback`, {
+                            method: 'POST',
+                            body: JSON.stringify({ confirm: true, reason: 'ML Lab rollback' }),
+                          }),
+                        );
+                      }
+                    }}
+                  >
+                    rollback
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div>
+            <h3>Training runs</h3>
+            <div className="table compactTable">
+              {(mlStatus?.training_runs ?? []).map((run) => (
+                <div className="row" key={run.training_run_id}>
+                  <span>{shortValue(run.training_run_id)}</span>
+                  <span>{run.dataset_kind}</span>
+                  <span>{shortValue(run.profile_key)}</span>
+                  <span>{run.status}</span>
+                  <span>{shortValue(run.split_id)}</span>
+                  <span>{run.safe_error_message ? 'failed safely' : 'ok'}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div>
+            <h3>Scoring runs</h3>
+            <div className="table compactTable">
+              {(mlStatus?.scoring_runs ?? []).map((run) => (
+                <div className="row" key={run.scoring_run_id}>
+                  <span>{shortValue(run.scoring_run_id)}</span>
+                  <span>{shortValue(run.model_id)}</span>
+                  <span>{run.split_range?.kind ?? 'snapshot'}</span>
+                  <span>{run.status}</span>
+                  <span>{run.anomaly_count}/{run.window_count}</span>
+                  <span>{run.safe_error ? 'failed safely' : 'ok'}</span>
+                  <button onClick={() => loadScoringRunDetails(run.scoring_run_id)}>
+                    details
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+        <div className="detailGrid">
+          <article>
+            <h3>Model details</h3>
+            {modelDetails ? (
+              <div className="detailList">
+                <span>Profile {shortValue(modelDetails.model.profile_key)}</span>
+                <span>{modelDetails.model.family} / {modelDetails.model.model_version}</span>
+                <span>Lifecycle {modelDetails.model.lifecycle_status}</span>
+                <span>Verification {modelDetails.verification?.verified ? 'verified' : 'failed'}</span>
+                <span>Manifest {shortValue(modelDetails.model.manifest_sha256)}</span>
+                <span>Artifact {shortValue(modelDetails.model.model_artifact_sha256)}</span>
+                <span>Label {modelDetails.evaluation?.label_status ?? 'unknown'}</span>
+                <span>Split {metricText(modelDetails.evaluation?.metrics, 'train_count')} / {metricText(modelDetails.evaluation?.metrics, 'calibration_count')} / {metricText(modelDetails.evaluation?.metrics, 'test_count')}</span>
+                <span>Threshold {metricText(modelDetails.evaluation?.metrics, 'threshold')}</span>
+                <span>Calibration flagged {metricText(modelDetails.evaluation?.metrics, 'calibration_flagged_rate')}</span>
+                <span>Scenario recall {metricText(modelDetails.evaluation?.metrics, 'scenario_recall')}</span>
+                <span>FPR {metricText(modelDetails.evaluation?.metrics, 'false_positive_rate')}</span>
+                <span>Precision {metricText(modelDetails.evaluation?.metrics, 'precision')}</span>
+                <span>Recall {metricText(modelDetails.evaluation?.metrics, 'recall')}</span>
+                <span>F1 {metricText(modelDetails.evaluation?.metrics, 'f1')}</span>
+                <span>PR-AUC {metricText(modelDetails.evaluation?.metrics, 'pr_auc')}</span>
+                <span>{limitationsText(modelDetails.evaluation?.metrics)}</span>
+              </div>
+            ) : (
+              <p>Select a model.</p>
+            )}
+          </article>
+          <article>
+            <h3>Scoring details</h3>
+            {scoringRunDetails ? (
+              <div className="detailList">
+                <span>{scoringRunDetails.status}</span>
+                <span>Model {shortValue(scoringRunDetails.model_id)}</span>
+                <span>Dataset {shortValue(scoringRunDetails.dataset_id)}</span>
+                <span>Range {scoringRunDetails.split_range?.kind ?? 'snapshot'}</span>
+                <span>{scoringRunDetails.anomaly_count}/{scoringRunDetails.window_count}</span>
+                <span>{scoringRunDetails.safe_error ?? 'no safe error'}</span>
+                {(scoringRunDetails.windows ?? []).slice(0, 5).map((window) => (
+                  <span key={window.window_id}>
+                    {shortValue(window.window_id)} {window.risk_level} {window.anomaly_score.toFixed(4)}
+                  </span>
+                ))}
+              </div>
+            ) : (
+              <p>Select a scoring run.</p>
+            )}
+          </article>
+          <article>
+            <h3>Drift report</h3>
+            {driftReport ? (
+              <div className="detailList">
+                <span>Status {driftReport.status}</span>
+                <span>Reference {driftReport.reference_split?.count ?? 0}</span>
+                <span>Reference flagged {formatMaybe(driftReport.reference_flagged_rate)}</span>
+                <span>Target flagged {formatMaybe(driftReport.target_flagged_rate)}</span>
+                <span>Difference {formatMaybe(driftReport.flagged_rate_difference)}</span>
+                <span>Reference scores {quantileText(driftReport.model_score_quantiles?.reference)}</span>
+                <span>Target scores {quantileText(driftReport.model_score_quantiles?.target)}</span>
+                {(driftReport.top_shifted_features ?? []).slice(0, 5).map((feature) => (
+                  <span key={feature.feature_name}>
+                    {feature.feature_name}: shift {feature.standardized_mean_shift.toFixed(3)}, PSI {feature.psi.toFixed(3)}
+                  </span>
+                ))}
+                <span>{(driftReport.limitations ?? []).join('; ')}</span>
+              </div>
+            ) : (
+              <p>Run drift.</p>
+            )}
           </article>
         </div>
       </section>
@@ -407,7 +1027,7 @@ export function App() {
               <article key={scenario.scenario_name}>
                 <strong>{scenario.scenario_name}</strong>
                 <span>{scenario.detected ? 'detected' : 'missed'}</span>
-                <span>{scenario.max_risk_level}</span>
+                <span>{scenario.max_risk_level ?? 'offline'}</span>
                 <span>{scenario.best_anomaly_score.toFixed(4)}</span>
               </article>
             ))}
@@ -454,4 +1074,28 @@ function qualityText(quality?: Record<string, Record<string, number>>): string {
 function shortValue(value: unknown): string {
   if (typeof value !== 'string' || !value) return 'none';
   return value.length > 24 ? `${value.slice(0, 24)}...` : value;
+}
+
+function formatMaybe(value: unknown): string {
+  return typeof value === 'number' ? value.toFixed(4) : 'n/a';
+}
+
+function metricText(metrics: Record<string, unknown> | undefined, key: string): string {
+  const value = metrics?.[key];
+  if (typeof value === 'number') return value.toFixed(4);
+  if (typeof value === 'string') return value;
+  return 'n/a';
+}
+
+function quantileText(value?: Record<string, number>): string {
+  if (!value) return 'n/a';
+  return Object.entries(value)
+    .map(([key, numberValue]) => `${key}:${numberValue.toFixed(3)}`)
+    .join(' ');
+}
+
+function limitationsText(metrics: Record<string, unknown> | undefined): string {
+  const limitations = metrics?.limitations;
+  if (Array.isArray(limitations)) return limitations.join('; ');
+  return 'No model limitations recorded.';
 }

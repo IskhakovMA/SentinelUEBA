@@ -16,7 +16,7 @@ from sentinelueba.validation import (
     validate_event,
 )
 
-DB_SCHEMA_VERSION = 6
+DB_SCHEMA_VERSION = 8
 
 
 class SchemaIntegrityError(RuntimeError):
@@ -75,6 +75,12 @@ class SQLiteStorage:
                 version = 5
             if version < 6:
                 self._apply_v6(conn)
+                version = 6
+            if version < 7:
+                self._apply_v7(conn)
+                version = 7
+            if version < 8:
+                self._apply_v8(conn)
             self._assert_schema_integrity(conn)
 
     def _record_migration(self, conn: sqlite3.Connection, version: int) -> None:
@@ -354,6 +360,12 @@ class SQLiteStorage:
             "collector_observations",
             "late_event_records",
             "duplicate_event_records",
+            "training_runs",
+            "model_versions",
+            "model_evaluations",
+            "model_promotions",
+            "scoring_runs",
+            "scored_windows",
         }
         existing_tables = {
             row["name"]
@@ -397,6 +409,16 @@ class SQLiteStorage:
                 "returned_events",
                 "saved_events",
             },
+            "training_runs": {"training_run_id", "dataset_id", "split_id", "status"},
+            "model_versions": {
+                "model_id",
+                "training_run_id",
+                "family",
+                "lifecycle_status",
+                "manifest_sha256",
+            },
+            "scoring_runs": {"scoring_run_id", "model_id", "dataset_id", "status"},
+            "scored_windows": {"scoring_run_id", "window_id", "anomaly_score"},
         }
         for table, columns in required_columns.items():
             missing_columns = sorted(columns - self._columns(conn, table))
@@ -498,6 +520,166 @@ class SQLiteStorage:
             "ON collector_observations(observed_at, observation_id)"
         )
         self._record_migration(conn, 6)
+
+    def _apply_v7(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS training_runs (
+                training_run_id TEXT PRIMARY KEY,
+                dataset_id TEXT NOT NULL,
+                dataset_manifest_sha256 TEXT NOT NULL,
+                dataset_kind TEXT NOT NULL,
+                profile_key TEXT NOT NULL,
+                split_id TEXT NOT NULL,
+                split_manifest_sha256 TEXT NOT NULL,
+                effective_config_json TEXT NOT NULL,
+                config_sha256 TEXT NOT NULL,
+                seed INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                application_version TEXT NOT NULL,
+                source_commit TEXT,
+                error_class TEXT,
+                safe_error_message TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS model_versions (
+                model_id TEXT PRIMARY KEY,
+                training_run_id TEXT NOT NULL,
+                family TEXT NOT NULL,
+                model_version TEXT NOT NULL,
+                dataset_id TEXT NOT NULL,
+                dataset_manifest_sha256 TEXT NOT NULL,
+                dataset_kind TEXT NOT NULL,
+                profile_key TEXT NOT NULL,
+                feature_schema_version TEXT NOT NULL,
+                split_id TEXT NOT NULL,
+                artifact_path TEXT NOT NULL,
+                manifest_sha256 TEXT NOT NULL,
+                model_artifact_sha256 TEXT NOT NULL,
+                lifecycle_status TEXT NOT NULL,
+                threshold REAL NOT NULL,
+                created_at TEXT NOT NULL,
+                verified_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS model_evaluations (
+                evaluation_id TEXT PRIMARY KEY,
+                model_id TEXT NOT NULL,
+                dataset_id TEXT NOT NULL,
+                split_id TEXT NOT NULL,
+                label_status TEXT NOT NULL,
+                metrics_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS model_promotions (
+                promotion_id TEXT PRIMARY KEY,
+                profile_key TEXT NOT NULL,
+                dataset_kind TEXT NOT NULL,
+                previous_model_id TEXT,
+                new_model_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scoring_runs (
+                scoring_run_id TEXT PRIMARY KEY,
+                model_id TEXT NOT NULL,
+                dataset_id TEXT NOT NULL,
+                dataset_manifest_sha256 TEXT NOT NULL,
+                split_range_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                threshold REAL NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                window_count INTEGER NOT NULL,
+                anomaly_count INTEGER NOT NULL,
+                safe_error TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scored_windows (
+                scoring_run_id TEXT NOT NULL,
+                window_id TEXT NOT NULL,
+                window_start TEXT NOT NULL,
+                window_end TEXT NOT NULL,
+                anomaly_score REAL NOT NULL,
+                threshold REAL NOT NULL,
+                is_anomaly INTEGER NOT NULL,
+                risk_level TEXT NOT NULL,
+                explanation_kind TEXT NOT NULL,
+                explanation_json TEXT NOT NULL,
+                PRIMARY KEY(scoring_run_id, window_id)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_model_versions_profile "
+            "ON model_versions(dataset_kind, profile_key, lifecycle_status)"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_one_champion_per_profile "
+            "ON model_versions(dataset_kind, profile_key) "
+            "WHERE lifecycle_status = 'champion'"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_scored_windows_run_score "
+            "ON scored_windows(scoring_run_id, anomaly_score)"
+        )
+        self._record_migration(conn, 7)
+
+    def _apply_v8(self, conn: sqlite3.Connection) -> None:
+        columns = self._columns(conn, "model_promotions")
+        if "new_model_id" in columns:
+            conn.execute("ALTER TABLE model_promotions RENAME TO model_promotions_v7")
+            conn.execute(
+                """
+                CREATE TABLE model_promotions (
+                    promotion_id TEXT PRIMARY KEY,
+                    profile_key TEXT NOT NULL,
+                    dataset_kind TEXT NOT NULL,
+                    previous_model_id TEXT,
+                    new_model_id TEXT,
+                    action TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO model_promotions (
+                    promotion_id, profile_key, dataset_kind, previous_model_id,
+                    new_model_id, action, reason, created_at
+                )
+                SELECT promotion_id, profile_key, dataset_kind, previous_model_id,
+                       NULLIF(new_model_id, ''), action, reason, created_at
+                FROM model_promotions_v7
+                """
+            )
+            conn.execute("DROP TABLE model_promotions_v7")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_model_promotions_profile "
+            "ON model_promotions(dataset_kind, profile_key, created_at)"
+        )
+        self._record_migration(conn, 8)
 
     def insert_events(self, events: list[TelemetryEvent]) -> int:
         inserted, _ = self.insert_events_detailed(events)
@@ -1368,6 +1550,620 @@ class SQLiteStorage:
             for row in rows
         ]
 
+    def create_training_run(self, payload: dict[str, Any]) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO training_runs (
+                    training_run_id, dataset_id, dataset_manifest_sha256, dataset_kind,
+                    profile_key, split_id, split_manifest_sha256, effective_config_json,
+                    config_sha256, seed, status, started_at, completed_at,
+                    application_version, source_commit, error_class, safe_error_message
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    payload["training_run_id"],
+                    payload["dataset_id"],
+                    payload["dataset_manifest_sha256"],
+                    payload["dataset_kind"],
+                    payload["profile_key"],
+                    payload["split_id"],
+                    payload["split_manifest_sha256"],
+                    payload["effective_config_json"],
+                    payload["config_sha256"],
+                    payload["seed"],
+                    payload["status"],
+                    payload["started_at"],
+                    payload.get("completed_at"),
+                    payload["application_version"],
+                    payload.get("source_commit"),
+                    payload.get("error_class"),
+                    payload.get("safe_error_message"),
+                ),
+            )
+
+    def create_training_run_if_no_running(self, payload: dict[str, Any]) -> None:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            running = conn.execute(
+                """
+                SELECT training_run_id FROM training_runs
+                WHERE dataset_kind = ? AND profile_key = ? AND status = 'running'
+                LIMIT 1
+                """,
+                (payload["dataset_kind"], payload["profile_key"]),
+            ).fetchone()
+            if running is not None:
+                raise ValueError(
+                    "training is already running for this dataset kind and profile"
+                )
+            conn.execute(
+                """
+                INSERT INTO training_runs (
+                    training_run_id, dataset_id, dataset_manifest_sha256, dataset_kind,
+                    profile_key, split_id, split_manifest_sha256, effective_config_json,
+                    config_sha256, seed, status, started_at, completed_at,
+                    application_version, source_commit, error_class, safe_error_message
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    payload["training_run_id"],
+                    payload["dataset_id"],
+                    payload["dataset_manifest_sha256"],
+                    payload["dataset_kind"],
+                    payload["profile_key"],
+                    payload["split_id"],
+                    payload["split_manifest_sha256"],
+                    payload["effective_config_json"],
+                    payload["config_sha256"],
+                    payload["seed"],
+                    payload["status"],
+                    payload["started_at"],
+                    payload.get("completed_at"),
+                    payload["application_version"],
+                    payload.get("source_commit"),
+                    payload.get("error_class"),
+                    payload.get("safe_error_message"),
+                ),
+            )
+
+    def complete_training_run(
+        self,
+        training_run_id: str,
+        *,
+        status: str,
+        completed_at: str,
+        error_class: str | None = None,
+        safe_error_message: str | None = None,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE training_runs
+                SET status = ?, completed_at = ?, error_class = ?, safe_error_message = ?
+                WHERE training_run_id = ?
+                """,
+                (status, completed_at, error_class, safe_error_message, training_run_id),
+            )
+
+    def update_training_run_split(
+        self,
+        training_run_id: str,
+        *,
+        split_id: str,
+        split_manifest_sha256: str,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE training_runs
+                SET split_id = ?, split_manifest_sha256 = ?
+                WHERE training_run_id = ?
+                """,
+                (split_id, split_manifest_sha256, training_run_id),
+            )
+
+    def register_model_version(self, payload: dict[str, Any]) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO model_versions (
+                    model_id, training_run_id, family, model_version, dataset_id,
+                    dataset_manifest_sha256, dataset_kind, profile_key,
+                    feature_schema_version, split_id, artifact_path, manifest_sha256,
+                    model_artifact_sha256, lifecycle_status, threshold, created_at,
+                    verified_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    payload["model_id"],
+                    payload["training_run_id"],
+                    payload["family"],
+                    payload["model_version"],
+                    payload["dataset_id"],
+                    payload["dataset_manifest_sha256"],
+                    payload["dataset_kind"],
+                    payload["profile_key"],
+                    payload["feature_schema_version"],
+                    payload["split_id"],
+                    payload["artifact_path"],
+                    payload["manifest_sha256"],
+                    payload["model_artifact_sha256"],
+                    payload["lifecycle_status"],
+                    payload["threshold"],
+                    payload["created_at"],
+                    payload.get("verified_at"),
+                ),
+            )
+
+    def update_model_lifecycle(
+        self,
+        model_id: str,
+        status: str,
+        *,
+        verified_at: str | None = None,
+    ) -> None:
+        clauses = ["lifecycle_status = ?"]
+        params: list[object] = [status]
+        if verified_at is not None:
+            clauses.append("verified_at = ?")
+            params.append(verified_at)
+        params.append(model_id)
+        with self.connect() as conn:
+            conn.execute(
+                f"UPDATE model_versions SET {', '.join(clauses)} WHERE model_id = ?",
+                params,
+            )
+
+    def mark_model_verified(self, model_id: str, verified_at: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE model_versions SET verified_at = ? WHERE model_id = ?",
+                (verified_at, model_id),
+            )
+
+    def delete_models_for_training_run(self, training_run_id: str) -> None:
+        with self.connect() as conn:
+            model_ids = [
+                row["model_id"]
+                for row in conn.execute(
+                    "SELECT model_id FROM model_versions WHERE training_run_id = ?",
+                    (training_run_id,),
+                ).fetchall()
+            ]
+            if model_ids:
+                placeholders = ", ".join("?" for _ in model_ids)
+                conn.execute(
+                    f"DELETE FROM model_evaluations WHERE model_id IN ({placeholders})",
+                    model_ids,
+                )
+                conn.execute(
+                    f"DELETE FROM model_versions WHERE model_id IN ({placeholders})",
+                    model_ids,
+                )
+
+    def finalize_training_run_success(
+        self,
+        training_run_id: str,
+        *,
+        model_ids: list[str],
+        completed_at: str,
+        verified_at: str,
+    ) -> None:
+        if not model_ids:
+            raise ValueError("training run finalization requires at least one model")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run = conn.execute(
+                "SELECT * FROM training_runs WHERE training_run_id = ?",
+                (training_run_id,),
+            ).fetchone()
+            if run is None:
+                raise ValueError("training run is missing")
+            if run["status"] != "running":
+                raise ValueError("training run is not running")
+            placeholders = ", ".join("?" for _ in model_ids)
+            rows = conn.execute(
+                f"""
+                SELECT * FROM model_versions
+                WHERE training_run_id = ? AND model_id IN ({placeholders})
+                """,
+                [training_run_id, *model_ids],
+            ).fetchall()
+            if len(rows) != len(set(model_ids)):
+                raise ValueError("not all candidate model rows exist")
+            for row in rows:
+                if row["verified_at"] is not None:
+                    raise ValueError("candidate model is already finalized")
+                if row["dataset_id"] != run["dataset_id"]:
+                    raise ValueError("candidate dataset id does not match training run")
+                if row["dataset_manifest_sha256"] != run["dataset_manifest_sha256"]:
+                    raise ValueError("candidate dataset hash does not match training run")
+                if row["dataset_kind"] != run["dataset_kind"]:
+                    raise ValueError("candidate dataset kind does not match training run")
+                if row["profile_key"] != run["profile_key"]:
+                    raise ValueError("candidate profile does not match training run")
+                if row["split_id"] != run["split_id"]:
+                    raise ValueError("candidate split does not match training run")
+            conn.execute(
+                """
+                UPDATE training_runs
+                SET status = 'success', completed_at = ?, error_class = NULL,
+                    safe_error_message = NULL
+                WHERE training_run_id = ? AND status = 'running'
+                """,
+                (completed_at, training_run_id),
+            )
+            conn.execute(
+                f"""
+                UPDATE model_versions
+                SET verified_at = ?
+                WHERE training_run_id = ? AND model_id IN ({placeholders})
+                """,
+                [verified_at, training_run_id, *model_ids],
+            )
+
+    def record_model_evaluation(self, payload: dict[str, Any]) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO model_evaluations (
+                    evaluation_id, model_id, dataset_id, split_id, label_status,
+                    metrics_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    payload["evaluation_id"],
+                    payload["model_id"],
+                    payload["dataset_id"],
+                    payload["split_id"],
+                    payload["label_status"],
+                    json.dumps(payload["metrics"], sort_keys=True),
+                    payload["created_at"],
+                ),
+            )
+
+    def promote_model(
+        self,
+        *,
+        promotion_id: str,
+        model_id: str,
+        action: str,
+        reason: str,
+        created_at: str,
+    ) -> dict[str, Any]:
+        with self.connect() as conn:
+            model = conn.execute(
+                "SELECT * FROM model_versions WHERE model_id = ?",
+                (model_id,),
+            ).fetchone()
+            if model is None:
+                raise ValueError("model is not registered")
+            previous = conn.execute(
+                """
+                SELECT model_id FROM model_versions
+                WHERE dataset_kind = ? AND profile_key = ? AND lifecycle_status = 'champion'
+                """,
+                (model["dataset_kind"], model["profile_key"]),
+            ).fetchone()
+            previous_model_id = previous["model_id"] if previous is not None else None
+            if previous_model_id == model_id:
+                return {
+                    "previous_model_id": previous_model_id,
+                    "new_model_id": model_id,
+                    "action": "noop",
+                }
+            if previous_model_id and previous_model_id != model_id:
+                conn.execute(
+                    "UPDATE model_versions SET lifecycle_status = 'retired' WHERE model_id = ?",
+                    (previous_model_id,),
+                )
+            conn.execute(
+                "UPDATE model_versions SET lifecycle_status = 'champion' WHERE model_id = ?",
+                (model_id,),
+            )
+            conn.execute(
+                """
+                INSERT INTO model_promotions (
+                    promotion_id, profile_key, dataset_kind, previous_model_id,
+                    new_model_id, action, reason, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    promotion_id,
+                    model["profile_key"],
+                    model["dataset_kind"],
+                    previous_model_id,
+                    model_id,
+                    action,
+                    reason,
+                    created_at,
+                ),
+            )
+        return {"previous_model_id": previous_model_id, "new_model_id": model_id, "action": action}
+
+    def retire_model(
+        self,
+        *,
+        promotion_id: str,
+        model_id: str,
+        reason: str,
+        created_at: str,
+    ) -> dict[str, Any]:
+        with self.connect() as conn:
+            model = conn.execute(
+                "SELECT * FROM model_versions WHERE model_id = ?",
+                (model_id,),
+            ).fetchone()
+            if model is None:
+                raise ValueError("model is not registered")
+            conn.execute(
+                "UPDATE model_versions SET lifecycle_status = 'retired' WHERE model_id = ?",
+                (model_id,),
+            )
+            conn.execute(
+                """
+                INSERT INTO model_promotions (
+                    promotion_id, profile_key, dataset_kind, previous_model_id,
+                    new_model_id, action, reason, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    promotion_id,
+                    model["profile_key"],
+                    model["dataset_kind"],
+                    model_id,
+                    None,
+                    "retire",
+                    reason,
+                    created_at,
+                ),
+            )
+        return {"retired_model_id": model_id, "action": "retire"}
+
+    def list_model_promotions(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM model_promotions ORDER BY created_at DESC"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_model_version(self, model_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM model_versions WHERE model_id = ?",
+                (model_id,),
+            ).fetchone()
+        return self._model_version_row(row) if row is not None else None
+
+    def list_model_versions(
+        self,
+        *,
+        dataset_kind: str | None = None,
+        lifecycle_status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if dataset_kind is not None:
+            clauses.append("dataset_kind = ?")
+            params.append(dataset_kind)
+        if lifecycle_status is not None:
+            clauses.append("lifecycle_status = ?")
+            params.append(lifecycle_status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM model_versions {where} ORDER BY created_at DESC",
+                params,
+            ).fetchall()
+        return [self._model_version_row(row) for row in rows]
+
+    def champion_model(
+        self,
+        dataset_kind: str,
+        profile_key: str | None = None,
+    ) -> dict[str, Any] | None:
+        clauses = ["dataset_kind = ?", "lifecycle_status = 'champion'"]
+        params: list[object] = [dataset_kind]
+        if profile_key is not None:
+            clauses.append("profile_key = ?")
+            params.append(profile_key)
+        with self.connect() as conn:
+            row = conn.execute(
+                f"SELECT * FROM model_versions WHERE {' AND '.join(clauses)} "
+                "ORDER BY created_at DESC LIMIT 1",
+                params,
+            ).fetchone()
+        return self._model_version_row(row) if row is not None else None
+
+    def list_training_runs(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM training_runs ORDER BY started_at DESC").fetchall()
+        return [dict(row) for row in rows]
+
+    def get_training_run(self, training_run_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM training_runs WHERE training_run_id = ?",
+                (training_run_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def latest_model_evaluation(self, model_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM model_evaluations
+                WHERE model_id = ?
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (model_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        payload = dict(row)
+        payload["metrics"] = json.loads(payload.pop("metrics_json"))
+        return payload
+
+    def create_scoring_run(self, payload: dict[str, Any], rows: list[dict[str, Any]]) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO scoring_runs (
+                    scoring_run_id, model_id, dataset_id, dataset_manifest_sha256,
+                    split_range_json, status, threshold, started_at, completed_at,
+                    window_count, anomaly_count, safe_error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    payload["scoring_run_id"],
+                    payload["model_id"],
+                    payload["dataset_id"],
+                    payload["dataset_manifest_sha256"],
+                    json.dumps(payload["split_range"], sort_keys=True),
+                    payload["status"],
+                    payload["threshold"],
+                    payload["started_at"],
+                    payload.get("completed_at"),
+                    payload["window_count"],
+                    payload["anomaly_count"],
+                    payload.get("safe_error"),
+                ),
+            )
+            conn.executemany(
+                """
+                INSERT INTO scored_windows (
+                    scoring_run_id, window_id, window_start, window_end, anomaly_score,
+                    threshold, is_anomaly, risk_level, explanation_kind, explanation_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        payload["scoring_run_id"],
+                        row["window_id"],
+                        row["window_start"],
+                        row["window_end"],
+                        row["anomaly_score"],
+                        row["threshold"],
+                        int(row["is_anomaly"]),
+                        row["risk_level"],
+                        row["explanation_kind"],
+                        json.dumps(row["explanation"], sort_keys=True),
+                    )
+                    for row in rows
+                ],
+            )
+
+    def create_scoring_run_start(self, payload: dict[str, Any]) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO scoring_runs (
+                    scoring_run_id, model_id, dataset_id, dataset_manifest_sha256,
+                    split_range_json, status, threshold, started_at, completed_at,
+                    window_count, anomaly_count, safe_error
+                ) VALUES (?, ?, ?, ?, ?, 'running', ?, ?, NULL, 0, 0, NULL)
+                """,
+                (
+                    payload["scoring_run_id"],
+                    payload["model_id"],
+                    payload["dataset_id"],
+                    payload["dataset_manifest_sha256"],
+                    json.dumps(payload["split_range"], sort_keys=True),
+                    payload.get("threshold", 0.0),
+                    payload["started_at"],
+                ),
+            )
+
+    def complete_scoring_run_success(
+        self,
+        scoring_run_id: str,
+        *,
+        threshold: float,
+        completed_at: str,
+        rows: list[dict[str, Any]],
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            anomaly_count = sum(1 for row in rows if bool(row["is_anomaly"]))
+            conn.executemany(
+                """
+                INSERT INTO scored_windows (
+                    scoring_run_id, window_id, window_start, window_end, anomaly_score,
+                    threshold, is_anomaly, risk_level, explanation_kind, explanation_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        scoring_run_id,
+                        row["window_id"],
+                        row["window_start"],
+                        row["window_end"],
+                        row["anomaly_score"],
+                        row["threshold"],
+                        int(row["is_anomaly"]),
+                        row["risk_level"],
+                        row["explanation_kind"],
+                        json.dumps(row["explanation"], sort_keys=True),
+                    )
+                    for row in rows
+                ],
+            )
+            conn.execute(
+                """
+                UPDATE scoring_runs
+                SET status = 'success', threshold = ?, completed_at = ?,
+                    window_count = ?, anomaly_count = ?, safe_error = NULL
+                WHERE scoring_run_id = ?
+                """,
+                (threshold, completed_at, len(rows), anomaly_count, scoring_run_id),
+            )
+
+    def complete_scoring_run_failed(
+        self,
+        scoring_run_id: str,
+        *,
+        completed_at: str,
+        safe_error: str,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DELETE FROM scored_windows WHERE scoring_run_id = ?", (scoring_run_id,))
+            conn.execute(
+                """
+                UPDATE scoring_runs
+                SET status = 'failed', completed_at = ?, window_count = 0,
+                    anomaly_count = 0, safe_error = ?
+                WHERE scoring_run_id = ?
+                """,
+                (completed_at, safe_error, scoring_run_id),
+            )
+
+    def list_scoring_runs(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM scoring_runs ORDER BY started_at DESC").fetchall()
+        return [self._scoring_run_row(row) for row in rows]
+
+    def get_scoring_run(self, scoring_run_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            run = conn.execute(
+                "SELECT * FROM scoring_runs WHERE scoring_run_id = ?",
+                (scoring_run_id,),
+            ).fetchone()
+            if run is None:
+                return None
+            rows = conn.execute(
+                """
+                SELECT * FROM scored_windows
+                WHERE scoring_run_id = ?
+                ORDER BY anomaly_score DESC, window_start ASC
+                """,
+                (scoring_run_id,),
+            ).fetchall()
+        payload = self._scoring_run_row(run)
+        payload["windows"] = [self._scored_window_row(row) for row in rows]
+        return payload
+
     def replace_anomalies(self, anomalies: list[AnomalyRecord]) -> None:
         with self.connect() as conn:
             conn.execute("DELETE FROM anomalies")
@@ -1529,6 +2325,8 @@ class SQLiteStorage:
             dataset_snapshot_count = conn.execute(
                 "SELECT COUNT(*) FROM dataset_snapshots"
             ).fetchone()[0]
+            model_count = conn.execute("SELECT COUNT(*) FROM model_versions").fetchone()[0]
+            scoring_run_count = conn.execute("SELECT COUNT(*) FROM scoring_runs").fetchone()[0]
             schema = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
         return {
             "database_path": str(self.database_path),
@@ -1539,6 +2337,8 @@ class SQLiteStorage:
             "quarantine_count": quarantine_count,
             "feature_window_count": feature_window_count,
             "dataset_snapshot_count": dataset_snapshot_count,
+            "model_count": model_count,
+            "scoring_run_count": scoring_run_count,
         }
 
     def upsert_collector_state(
@@ -1786,4 +2586,55 @@ class SQLiteStorage:
             "source_event_hash": row["source_event_hash"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
+        }
+
+    def _model_version_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "model_id": row["model_id"],
+            "training_run_id": row["training_run_id"],
+            "family": row["family"],
+            "model_version": row["model_version"],
+            "dataset_id": row["dataset_id"],
+            "dataset_manifest_sha256": row["dataset_manifest_sha256"],
+            "dataset_kind": row["dataset_kind"],
+            "profile_key": row["profile_key"],
+            "feature_schema_version": row["feature_schema_version"],
+            "split_id": row["split_id"],
+            "artifact_path": row["artifact_path"],
+            "manifest_sha256": row["manifest_sha256"],
+            "model_artifact_sha256": row["model_artifact_sha256"],
+            "lifecycle_status": row["lifecycle_status"],
+            "threshold": row["threshold"],
+            "created_at": row["created_at"],
+            "verified_at": row["verified_at"],
+        }
+
+    def _scoring_run_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "scoring_run_id": row["scoring_run_id"],
+            "model_id": row["model_id"],
+            "dataset_id": row["dataset_id"],
+            "dataset_manifest_sha256": row["dataset_manifest_sha256"],
+            "split_range": json.loads(row["split_range_json"]),
+            "status": row["status"],
+            "threshold": row["threshold"],
+            "started_at": row["started_at"],
+            "completed_at": row["completed_at"],
+            "window_count": row["window_count"],
+            "anomaly_count": row["anomaly_count"],
+            "safe_error": row["safe_error"],
+        }
+
+    def _scored_window_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "scoring_run_id": row["scoring_run_id"],
+            "window_id": row["window_id"],
+            "window_start": row["window_start"],
+            "window_end": row["window_end"],
+            "anomaly_score": row["anomaly_score"],
+            "threshold": row["threshold"],
+            "is_anomaly": bool(row["is_anomaly"]),
+            "risk_level": row["risk_level"],
+            "explanation_kind": row["explanation_kind"],
+            "explanation": json.loads(row["explanation_json"]),
         }
