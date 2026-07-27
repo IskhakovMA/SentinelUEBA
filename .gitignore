@@ -14,6 +14,8 @@ data/
 artifacts/
 logs/
 reports/
+identity.secret
+**/identity.secret
 models/
 frontend/node_modules/
 frontend/dist/

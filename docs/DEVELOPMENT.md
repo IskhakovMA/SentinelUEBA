@@ -5,9 +5,8 @@ Use Python 3.12, `uv`, `pnpm`, and Node 22.
 Backend:
 
 ```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install --upgrade pip uv
-.venv/bin/uv pip install -e ".[dev]"
+uv sync --all-extras --dev
+uv run sentinelueba init
 ```
 
 Frontend:
@@ -17,3 +16,9 @@ pnpm --dir frontend install
 pnpm --dir frontend dev
 ```
 
+Windows collection smoke:
+
+```powershell
+uv run sentinelueba collect --duration 60 --interval 5
+uv run sentinelueba collector-status
+```

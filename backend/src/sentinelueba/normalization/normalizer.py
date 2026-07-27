@@ -5,10 +5,44 @@ from typing import Any
 from sentinelueba.domain.events import EventType, TelemetryEvent
 
 ALLOWED_PAYLOAD_KEYS: dict[EventType, set[str]] = {
-    EventType.PROCESS: {"process_name", "pid", "parent_process", "command_family"},
-    EventType.NETWORK: {"remote_address", "remote_port", "protocol", "connection_count"},
-    EventType.SYSTEM_METRICS: {"cpu_percent", "ram_percent"},
-    EventType.AUTHENTICATION: {"result", "method", "failure_reason"},
+    EventType.PROCESS: {
+        "action",
+        "process_name",
+        "pid",
+        "executable_path",
+        "parent_pid",
+        "parent_process",
+        "command_family",
+    },
+    EventType.NETWORK: {
+        "action",
+        "remote_address",
+        "remote_port",
+        "local_port",
+        "protocol",
+        "state",
+        "pid",
+        "process_name",
+        "connection_count",
+    },
+    EventType.SYSTEM_METRICS: {
+        "cpu_percent",
+        "ram_percent",
+        "disk_percent",
+        "network_bytes_sent_delta",
+        "network_bytes_recv_delta",
+        "boot_time",
+        "uptime_seconds",
+    },
+    EventType.AUTHENTICATION: {
+        "action",
+        "result",
+        "method",
+        "failure_reason",
+        "event_id",
+        "record_id",
+        "logon_type",
+    },
 }
 
 
@@ -21,4 +55,3 @@ def normalize_event(event: TelemetryEvent | dict[str, Any]) -> TelemetryEvent:
 
 def normalize_events(events: list[TelemetryEvent]) -> list[TelemetryEvent]:
     return [normalize_event(event) for event in events]
-

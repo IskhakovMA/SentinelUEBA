@@ -1,6 +1,6 @@
 import React, { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Activity, Database, Languages, Play, Radar, Shield, Sparkles } from 'lucide-react';
+import { Activity, Database, Languages, Play, Radar, Shield, Sparkles, Square } from 'lucide-react';
 import './styles.css';
 
 type Risk = 'low' | 'medium' | 'high' | 'critical';
@@ -19,9 +19,41 @@ type Anomaly = {
 type Status = {
   storage: { event_count: number; anomaly_count: number; database_path: string };
   model: { trained?: boolean; model_version?: string };
+  collection?: CollectionStatus;
 };
 
 type Locale = 'en' | 'ru';
+
+type CollectorCapability = {
+  collector_id: string;
+  status: string;
+  required_privilege: string;
+  errors: string[];
+};
+
+type CollectionStatus = {
+  running: boolean;
+  session_id: string | null;
+  collectors: Record<string, { status: string; errors: string[]; events_collected: number }>;
+  counters: Record<string, number>;
+  errors: string[];
+  progress: {
+    cumulative_collected_seconds: number;
+    longest_continuous_session_seconds: number;
+    current_session_seconds: number;
+    progress_to_24h: number;
+    strict_continuous_24h_validated: boolean;
+  };
+  event_summary?: { real?: Record<string, number>; synthetic?: Record<string, number> };
+};
+
+type ScenarioValidation = {
+  scenario_name: string;
+  detected: boolean;
+  match_count: number;
+  best_anomaly_score: number;
+  max_risk_level: string;
+};
 
 const copy = {
   en: {
@@ -36,6 +68,14 @@ const copy = {
     selected: 'Selected anomaly',
     noSelection: 'Run the demo pipeline and select an anomaly.',
     explanation: 'Explanation',
+    collection: 'Windows collection',
+    startCollection: 'Start',
+    stopCollection: 'Stop',
+    cumulative: 'Cumulative',
+    continuous: 'Longest session',
+    current: 'Current',
+    warning: 'Cumulative collection is not the same as strict continuous 24-hour validation.',
+    scenarios: 'Demo scenarios',
   },
   ru: {
     title: 'SentinelUEBA',
@@ -49,6 +89,14 @@ const copy = {
     selected: 'Выбранная аномалия',
     noSelection: 'Запустите demo pipeline и выберите аномалию.',
     explanation: 'Объяснение',
+    collection: 'Windows сбор',
+    startCollection: 'Старт',
+    stopCollection: 'Стоп',
+    cumulative: 'Накоплено',
+    continuous: 'Самый длинный сеанс',
+    current: 'Текущий',
+    warning: 'Накопительный сбор не равен строгой непрерывной 24-часовой проверке.',
+    scenarios: 'Demo-сценарии',
   },
 };
 
@@ -68,13 +116,17 @@ export function App() {
   const [selected, setSelected] = React.useState<number>(0);
   const [busy, setBusy] = React.useState<string>('');
   const [message, setMessage] = React.useState<string>('Ready');
+  const [capabilities, setCapabilities] = React.useState<CollectorCapability[]>([]);
+  const [scenarioValidation, setScenarioValidation] = React.useState<ScenarioValidation[]>([]);
   const t = copy[locale];
 
   const refresh = React.useCallback(async () => {
     const statusResponse = await api<{ data: Status }>('/status');
     const anomalyResponse = await api<{ anomalies: Anomaly[] }>('/anomalies');
+    const capabilityResponse = await api<{ data: { collectors: CollectorCapability[] } }>('/collectors/capabilities');
     setStatus(statusResponse.data);
     setAnomalies(anomalyResponse.anomalies);
+    setCapabilities(capabilityResponse.data.collectors);
   }, []);
 
   React.useEffect(() => {
@@ -85,6 +137,9 @@ export function App() {
     setBusy(label);
     try {
       const result = await action();
+      if (isApiData(result) && Array.isArray(result.data.scenario_validation)) {
+        setScenarioValidation(result.data.scenario_validation as ScenarioValidation[]);
+      }
       setMessage(JSON.stringify(result, null, 2));
       await refresh();
     } catch (error) {
@@ -122,6 +177,45 @@ export function App() {
           <Play size={17} /> {t.detect}
         </button>
         <span className="busy">{busy || 'idle'}</span>
+      </section>
+
+      <section className="collectionPanel">
+        <div className="panelTitle">
+          <Shield size={18} />
+          <span>{t.collection}</span>
+        </div>
+        <div className="collectionActions">
+          <button onClick={() => run('collect', () => api('/collection/start', { method: 'POST', body: JSON.stringify({ interval_seconds: 5 }) }))}>
+            <Play size={17} /> {t.startCollection}
+          </button>
+          <button onClick={() => run('stop', () => api('/collection/stop', { method: 'POST' }))}>
+            <Square size={17} /> {t.stopCollection}
+          </button>
+          <strong>{status?.collection?.running ? 'running' : 'stopped'}</strong>
+        </div>
+        <div className="progressLine">
+          <span>{t.cumulative}: {formatDuration(status?.collection?.progress.cumulative_collected_seconds ?? 0)}</span>
+          <span>{t.continuous}: {formatDuration(status?.collection?.progress.longest_continuous_session_seconds ?? 0)}</span>
+          <span>{t.current}: {formatDuration(status?.collection?.progress.current_session_seconds ?? 0)}</span>
+          <span>{Math.round((status?.collection?.progress.progress_to_24h ?? 0) * 100)}%</span>
+        </div>
+        <p className="warning">{t.warning}</p>
+        <div className="collectorGrid">
+          {capabilities.map((collector) => (
+            <article key={collector.collector_id}>
+              <strong>{collector.collector_id}</strong>
+              <span>{collector.status}</span>
+              <span>{collector.required_privilege}</span>
+              <small>{collector.errors.join(', ')}</small>
+            </article>
+          ))}
+        </div>
+        <div className="eventCounts">
+          {['process', 'network', 'system_metrics', 'authentication'].map((eventType) => (
+            <span key={eventType}>{eventType}: {status?.collection?.event_summary?.real?.[eventType] ?? 0}</span>
+          ))}
+        </div>
+        {status?.collection?.errors?.length ? <p className="warning">{status.collection.errors.slice(-3).join(' | ')}</p> : null}
       </section>
 
       <section className="metrics">
@@ -193,6 +287,23 @@ export function App() {
         )}
       </section>
 
+      {scenarioValidation.length ? (
+        <section className="details">
+          <h2>{t.scenarios}</h2>
+          <div className="scenarioGrid">
+            {scenarioValidation.map((scenario) => (
+              <article key={scenario.scenario_name}>
+                <strong>{scenario.scenario_name}</strong>
+                <span>{scenario.detected ? 'detected' : 'missed'}</span>
+                <span>{scenario.max_risk_level}</span>
+                <span>{scenario.best_anomaly_score.toFixed(4)}</span>
+              </article>
+            ))}
+          </div>
+        </section>
+      ) : null}
+
+
       <pre className="log">{message}</pre>
     </main>
   );
@@ -203,3 +314,14 @@ createRoot(document.getElementById('root')!).render(
     <App />
   </StrictMode>,
 );
+
+function formatDuration(seconds: number): string {
+  const safeSeconds = Math.max(0, Math.floor(seconds));
+  const hours = Math.floor(safeSeconds / 3600);
+  const minutes = Math.floor((safeSeconds % 3600) / 60);
+  return `${hours}h ${minutes}m`;
+}
+
+function isApiData(value: unknown): value is { data: { scenario_validation?: unknown } } {
+  return typeof value === 'object' && value !== null && 'data' in value;
+}

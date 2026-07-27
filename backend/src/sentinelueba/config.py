@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     database_path: Path = Field(default=Path("data/sentinelueba.sqlite3"))
     model_dir: Path = Field(default=Path("artifacts/model"))
     log_level: str = Field(default="INFO")
+    identity_mode: str = Field(default="pseudonymous")
 
     def ensure_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -22,4 +23,3 @@ class Settings(BaseSettings):
 
 def get_settings() -> Settings:
     return Settings()
-
