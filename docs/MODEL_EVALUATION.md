@@ -11,7 +11,7 @@ Synthetic evaluation reports:
 - score percentiles;
 - inference duration and windows per second.
 
-The recommendation rule is deterministic: prefer higher scenario recall, then lower false positive rate, then higher PR-AUC, then faster inference. Synthetic auto-promotion is allowed only when the recommended model detects all scenario windows and keeps false positive rate at or below the configured gate.
+The recommendation rule is deterministic: prefer higher scenario recall, then lower false positive rate, then higher PR-AUC, then faster inference. A false positive rate of `0.0` is treated as a real best value, not as a missing metric. Compare recommendations are emitted only for compatible synthetic candidates from the same dataset kind, profile, dataset id, split id, feature schema, and feature order. Real compare reports are descriptive only and do not recommend a model.
 
 Real evaluation reports:
 

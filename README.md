@@ -8,7 +8,7 @@ SentinelUEBA is a local-first Windows-focused UEBA portfolio project. Stage 3 ke
 
 - Safe synthetic 24-hour-equivalent demo telemetry.
 - Opt-in Windows collectors for process, network, system metrics, and optional Security Event Log authentication metadata.
-- SQLite storage with sequential migrations, indexes, duplicate protection, collection sessions, collector observations, dataset snapshots, and model registry v7.
+- SQLite storage with sequential migrations, indexes, duplicate protection, collection sessions, collector observations, dataset snapshots, and model registry v8.
 - Payload validation, quarantine, and ingestion metadata before canonical normalization.
 - Persistent 15-minute UTC feature windows for user + host behavior.
 - Immutable Parquet dataset snapshots with manifests and SHA-256 verification.
@@ -86,6 +86,8 @@ uv run sentinelueba ml drift --model <model-id> --dataset <dataset-id>
 ```
 
 Synthetic seed 42 trains Autoencoder v2 and Isolation Forest candidates from a verified snapshot. Scenario labels are used only for held-out evaluation and recommendation, never as feature columns or training input. Real datasets are unlabeled: the system reports flagged rates and limitations instead of fake precision, recall, F1, ROC-AUC, or PR-AUC.
+
+Model public operations require finalized training runs and verified registered model rows. During training, candidate bundles are checked with a private pending verifier and become public only when one SQLite transaction marks the training run successful and fills `verified_at` for every candidate model.
 
 See [ML pipeline](docs/ML_PIPELINE.md), [model registry](docs/MODEL_REGISTRY.md), [model evaluation](docs/MODEL_EVALUATION.md), and [model cards](docs/MODEL_CARDS.md).
 

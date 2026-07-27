@@ -175,13 +175,13 @@ def test_invalid_payload_for_each_event_type_is_quarantined(
     assert store.quarantine_summary()["count"] == 1
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4, 5, 6])
-def test_historical_schema_migrations_to_v7(tmp_path: Path, version: int) -> None:
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 5, 6, 7])
+def test_historical_schema_migrations_to_v8(tmp_path: Path, version: int) -> None:
     db = tmp_path / f"v{version}.sqlite3"
     create_historical_database(db, version)
     store = SQLiteStorage(db)
     store.initialize()
-    assert store.status()["schema_version"] == 7
+    assert store.status()["schema_version"] == 8
     assert store.status()["event_count"] == 1
     columns = {
         row[1] for row in sqlite3.connect(db).execute("PRAGMA table_info(telemetry_events)")
@@ -197,17 +197,22 @@ def test_historical_schema_migrations_to_v7(tmp_path: Path, version: int) -> Non
     assert "last_observation_id" in state_columns
     assert "model_versions" in table_names(db)
     assert "scoring_runs" in table_names(db)
+    if version == 7:
+        row = sqlite3.connect(db).execute(
+            "SELECT previous_model_id, new_model_id, action FROM model_promotions"
+        ).fetchone()
+        assert row == ("retired-v7", None, "retire")
 
 
-def test_fresh_schema_initializes_to_v7(tmp_path: Path) -> None:
+def test_fresh_schema_initializes_to_v8(tmp_path: Path) -> None:
     store = SQLiteStorage(tmp_path / "fresh.sqlite3")
     store.initialize()
-    assert store.status()["schema_version"] == 7
+    assert store.status()["schema_version"] == 8
     assert "collector_observations" in table_names(store.database_path)
     assert "model_versions" in table_names(store.database_path)
 
 
-def test_repeated_initialize_v7_runs_no_migrations_or_event_updates(
+def test_repeated_initialize_v8_runs_no_migrations_or_event_updates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -222,7 +227,7 @@ def test_repeated_initialize_v7_runs_no_migrations_or_event_updates(
 
     def fail_migration(method_name: str):
         def fail(conn: sqlite3.Connection) -> None:
-            pytest.fail(f"{method_name} should not run for schema v7")
+            pytest.fail(f"{method_name} should not run for schema v8")
 
         return fail
 
@@ -234,6 +239,7 @@ def test_repeated_initialize_v7_runs_no_migrations_or_event_updates(
         "_apply_v5",
         "_apply_v6",
         "_apply_v7",
+        "_apply_v8",
     ]:
         monkeypatch.setattr(store, name, fail_migration(name))
     store.initialize()
@@ -245,8 +251,8 @@ def test_repeated_initialize_v7_runs_no_migrations_or_event_updates(
     assert after == before
 
 
-def test_v7_missing_required_table_raises_schema_integrity_error(tmp_path: Path) -> None:
-    store = SQLiteStorage(tmp_path / "corrupt-v7.sqlite3")
+def test_v8_missing_required_table_raises_schema_integrity_error(tmp_path: Path) -> None:
+    store = SQLiteStorage(tmp_path / "corrupt-v8.sqlite3")
     store.initialize()
     with sqlite3.connect(store.database_path) as conn:
         conn.execute("DROP TABLE model_versions")
@@ -1292,6 +1298,126 @@ def create_historical_database(db: Path, version: int) -> None:
         conn.execute(
             "CREATE INDEX idx_observations_watermark "
             "ON collector_observations(observed_at, observation_id)"
+        )
+    if version >= 7:
+        conn.execute(
+            """
+            CREATE TABLE training_runs (
+                training_run_id TEXT PRIMARY KEY,
+                dataset_id TEXT NOT NULL,
+                dataset_manifest_sha256 TEXT NOT NULL,
+                dataset_kind TEXT NOT NULL,
+                profile_key TEXT NOT NULL,
+                split_id TEXT NOT NULL,
+                split_manifest_sha256 TEXT NOT NULL,
+                effective_config_json TEXT NOT NULL,
+                config_sha256 TEXT NOT NULL,
+                seed INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                application_version TEXT NOT NULL,
+                source_commit TEXT,
+                error_class TEXT,
+                safe_error_message TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE model_versions (
+                model_id TEXT PRIMARY KEY,
+                training_run_id TEXT NOT NULL,
+                family TEXT NOT NULL,
+                model_version TEXT NOT NULL,
+                dataset_id TEXT NOT NULL,
+                dataset_manifest_sha256 TEXT NOT NULL,
+                dataset_kind TEXT NOT NULL,
+                profile_key TEXT NOT NULL,
+                feature_schema_version TEXT NOT NULL,
+                split_id TEXT NOT NULL,
+                artifact_path TEXT NOT NULL,
+                manifest_sha256 TEXT NOT NULL,
+                model_artifact_sha256 TEXT NOT NULL,
+                lifecycle_status TEXT NOT NULL,
+                threshold REAL NOT NULL,
+                created_at TEXT NOT NULL,
+                verified_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE model_evaluations (
+                evaluation_id TEXT PRIMARY KEY,
+                model_id TEXT NOT NULL,
+                dataset_id TEXT NOT NULL,
+                split_id TEXT NOT NULL,
+                label_status TEXT NOT NULL,
+                metrics_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE model_promotions (
+                promotion_id TEXT PRIMARY KEY,
+                profile_key TEXT NOT NULL,
+                dataset_kind TEXT NOT NULL,
+                previous_model_id TEXT,
+                new_model_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO model_promotions (
+                promotion_id, profile_key, dataset_kind, previous_model_id,
+                new_model_id, action, reason, created_at
+            ) VALUES (
+                'promotion-v7', 'profile-v7', 'synthetic', 'retired-v7',
+                '', 'retire', 'legacy retirement', '2026-01-01T00:00:00+00:00'
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE scoring_runs (
+                scoring_run_id TEXT PRIMARY KEY,
+                model_id TEXT NOT NULL,
+                dataset_id TEXT NOT NULL,
+                dataset_manifest_sha256 TEXT NOT NULL,
+                split_range_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                threshold REAL NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                window_count INTEGER NOT NULL,
+                anomaly_count INTEGER NOT NULL,
+                safe_error TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE scored_windows (
+                scoring_run_id TEXT NOT NULL,
+                window_id TEXT NOT NULL,
+                window_start TEXT NOT NULL,
+                window_end TEXT NOT NULL,
+                anomaly_score REAL NOT NULL,
+                threshold REAL NOT NULL,
+                is_anomaly INTEGER NOT NULL,
+                risk_level TEXT NOT NULL,
+                explanation_kind TEXT NOT NULL,
+                explanation_json TEXT NOT NULL,
+                PRIMARY KEY(scoring_run_id, window_id)
+            )
+            """
         )
     insert_historical_event(conn, version)
     conn.commit()

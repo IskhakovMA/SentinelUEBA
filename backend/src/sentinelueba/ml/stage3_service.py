@@ -151,10 +151,18 @@ class ModelBundleVerifier:
         }
 
     def verify(self, model_id: str) -> dict[str, Any]:
+        return self._verify_registered(model_id, allow_pending=False)
+
+    def _verify_registered_pending(self, model_id: str) -> dict[str, Any]:
+        return self._verify_registered(model_id, allow_pending=True)
+
+    def _verify_registered(self, model_id: str, *, allow_pending: bool) -> dict[str, Any]:
         bundle_dir = self.bundle_dir(model_id)
         registry = self.storage.get_model_version(model_id)
         if registry is None:
             raise ModelBundleVerificationError("model bundle is not registered")
+        if not allow_pending and registry["verified_at"] is None:
+            raise ModelBundleVerificationError("model registration is not finalized")
         if Path(str(registry["artifact_path"])).resolve() != bundle_dir:
             raise ModelBundleVerificationError("SQLite artifact path mismatch")
         if not bundle_dir.exists():
@@ -166,8 +174,16 @@ class ModelBundleVerifier:
         self._verify_registry_contract(registry, manifest, artifact_name, bundle_dir)
         compatibility = self.compatibility.verify_source(model_id)
         source_snapshot = compatibility["source_snapshot"]
-        if self.storage.get_training_run(str(registry["training_run_id"])) is None:
+        training_run = self.storage.get_training_run(str(registry["training_run_id"]))
+        if training_run is None:
             raise ModelBundleVerificationError("training run is missing")
+        if not allow_pending and (
+            training_run["status"] != "success" or training_run["completed_at"] is None
+        ):
+            raise ModelBundleVerificationError("model registration is not finalized")
+        if allow_pending and training_run["status"] not in {"running", "success"}:
+            raise ModelBundleVerificationError("model registration is not finalized")
+        self._verify_training_run_contract(registry, training_run, manifest)
         self._verify_dataset_contract(
             manifest,
             split,
@@ -186,6 +202,25 @@ class ModelBundleVerifier:
             "dataset_id": registry["dataset_id"],
             "threshold": registry["threshold"],
         }
+
+    def _verify_training_run_contract(
+        self,
+        registry: dict[str, Any],
+        training_run: dict[str, Any],
+        manifest: dict[str, Any],
+    ) -> None:
+        comparisons = {
+            "dataset_id": registry["dataset_id"],
+            "dataset_manifest_sha256": registry["dataset_manifest_sha256"],
+            "dataset_kind": registry["dataset_kind"],
+            "profile_key": registry["profile_key"],
+            "split_id": registry["split_id"],
+        }
+        for key, expected in comparisons.items():
+            if training_run[key] != expected:
+                raise ModelBundleVerificationError(f"training run {key} mismatch")
+        if training_run["split_manifest_sha256"] != manifest["split_manifest_sha256"]:
+            raise ModelBundleVerificationError("training run split SHA-256 mismatch")
 
     def _assert_safe_bundle_path(self, model_id: str, path: Path) -> None:
         if not MODEL_ID_PATTERN.fullmatch(model_id):
@@ -531,6 +566,7 @@ class Stage3MLService:
             }
         )
         candidates: list[dict[str, Any]] = []
+        candidate_model_ids: list[str] = []
         created_bundle_dirs: list[Path] = []
         try:
             split = create_split_plan(
@@ -645,8 +681,7 @@ class Stage3MLService:
                         "verified_at": None,
                     }
                 )
-                verification = self.verifier.verify(model_id)
-                self.storage.mark_model_verified(model_id, datetime.now(UTC).isoformat())
+                verification = self.verifier._verify_registered_pending(model_id)
                 self.storage.record_model_evaluation(
                     {
                         "evaluation_id": f"eval-{uuid4().hex[:12]}",
@@ -671,36 +706,23 @@ class Stage3MLService:
                         "inference_duration_seconds": inference_duration,
                     }
                 )
-            recommended = self._recommend(candidates, manifest["dataset_kind"])
-            if recommended is not None:
-                self.storage.update_model_lifecycle(
-                    str(recommended["model_id"]),
-                    LifecycleStatus.RECOMMENDED.value,
-                    verified_at=datetime.now(UTC).isoformat(),
-                )
-                if manifest["dataset_kind"] == "synthetic" and auto_promote_synthetic:
-                    metrics = recommended["metrics"]
-                    if (
-                        metrics.get("scenario_recall") == 1.0
-                        and metrics.get("false_positive_rate", 1) <= 0.15
-                    ):
-                        self.promote(
-                            str(recommended["model_id"]),
-                            confirm=True,
-                            reason="synthetic auto-promotion gate passed",
-                        )
-            self.storage.complete_training_run(
+                candidate_model_ids.append(model_id)
+            finalized_at = datetime.now(UTC).isoformat()
+            self.storage.finalize_training_run_success(
                 training_run_id,
-                status="success",
-                completed_at=datetime.now(UTC).isoformat(),
+                model_ids=candidate_model_ids,
+                completed_at=finalized_at,
+                verified_at=finalized_at,
             )
-            return {
+            for candidate in candidates:
+                candidate["verification"] = self.verifier.verify(str(candidate["model_id"]))
+            result_payload: dict[str, Any] = {
                 "training_run_id": training_run_id,
                 "dataset_id": dataset_id,
                 "dataset_manifest_sha256": dataset_manifest_sha256,
                 "split": split.to_manifest(),
                 "candidates": candidates,
-                "recommended_model_id": recommended["model_id"] if recommended else None,
+                "recommended_model_id": None,
             }
         except Exception as exc:
             self.storage.delete_models_for_training_run(training_run_id)
@@ -715,6 +737,28 @@ class Stage3MLService:
                 safe_error_message=_safe_error(exc),
             )
             raise
+        try:
+            recommended = self._recommend(candidates, manifest["dataset_kind"])
+            if recommended is not None:
+                self.storage.update_model_lifecycle(
+                    str(recommended["model_id"]),
+                    LifecycleStatus.RECOMMENDED.value,
+                )
+                result_payload["recommended_model_id"] = recommended["model_id"]
+                if manifest["dataset_kind"] == "synthetic" and auto_promote_synthetic:
+                    metrics = recommended["metrics"]
+                    if (
+                        metrics.get("scenario_recall") == 1.0
+                        and metrics.get("false_positive_rate", 1) <= 0.15
+                    ):
+                        self.promote(
+                            str(recommended["model_id"]),
+                            confirm=True,
+                            reason="synthetic auto-promotion gate passed",
+                        )
+        except Exception as exc:  # noqa: BLE001
+            result_payload["lifecycle_warning"] = _safe_error(exc)
+        return result_payload
 
     def _validate_training_eligibility(
         self,
@@ -1022,6 +1066,8 @@ class Stage3MLService:
 
     def compare(self, model_ids: list[str]) -> dict[str, Any]:
         reports: list[dict[str, Any]] = []
+        compatibility_keys: list[tuple[Any, ...]] = []
+        pairwise_failures: list[dict[str, Any]] = []
         for model_id in model_ids:
             model = self.storage.get_model_version(model_id)
             if model is None:
@@ -1035,14 +1081,28 @@ class Stage3MLService:
                 continue
             verification_status = "ok"
             compatibility_status: dict[str, Any]
+            feature_order: list[str] | None = None
             try:
                 compatibility_status = self.compatibility.verify_source(model_id)
-                self.verify_model(model_id)
+                verification = self.verify_model(model_id)
+                bundle_manifest = _read_json(self.verifier.bundle_dir(model_id) / "manifest.json")
+                feature_order = cast(list[str], bundle_manifest.get("feature_names"))
             except Exception as exc:  # noqa: BLE001
                 verification_status = "failed"
                 compatibility_status = {"status": "failed", "reason": _safe_error(exc)}
+                verification = {"verified": False}
             evaluation = self.storage.latest_model_evaluation(model_id) or {}
             metrics = evaluation.get("metrics", {}) if evaluation else {}
+            compatibility_keys.append(
+                (
+                    model["dataset_kind"],
+                    model["profile_key"],
+                    model["feature_schema_version"],
+                    tuple(feature_order or []),
+                    model["dataset_id"],
+                    model["split_id"],
+                )
+            )
             reports.append(
                 {
                     "model_id": model_id,
@@ -1055,6 +1115,7 @@ class Stage3MLService:
                     "lifecycle_status": model["lifecycle_status"],
                     "verification_status": verification_status,
                     "compatibility": {"status": compatibility_status.get("status", "ok")},
+                    "verified": bool(verification.get("verified")),
                     "label_status": metrics.get("label_status"),
                     "scenario_recall": metrics.get("scenario_recall"),
                     "false_positive_rate": metrics.get("false_positive_rate"),
@@ -1066,20 +1127,53 @@ class Stage3MLService:
                     "inference_duration_seconds": metrics.get("inference_duration_seconds"),
                 }
             )
-        synthetic = [item for item in reports if item.get("dataset_kind") == "synthetic"]
+        for left_index, left_key in enumerate(compatibility_keys):
+            for right_index, right_key in enumerate(
+                compatibility_keys[left_index + 1 :],
+                start=left_index + 1,
+            ):
+                if left_key != right_key:
+                    pairwise_failures.append(
+                        {
+                            "left_model_id": reports[left_index]["model_id"],
+                            "right_model_id": reports[right_index]["model_id"],
+                            "status": "failed",
+                            "reason": (
+                                "models use different dataset, split, profile, schema, "
+                                "or feature order"
+                            ),
+                        }
+                    )
+        synthetic = [
+            item
+            for item in reports
+            if item.get("dataset_kind") == "synthetic" and item.get("verification_status") == "ok"
+        ]
+        can_recommend = (
+            bool(synthetic)
+            and len(synthetic) == len(reports)
+            and not pairwise_failures
+        )
         ordering = [
             item["model_id"]
             for item in sorted(
                 synthetic,
                 key=lambda item: (
-                    float(item.get("scenario_recall") or 0.0),
-                    -float(item.get("false_positive_rate") or 1.0),
-                    float(item.get("pr_auc") or 0.0),
+                    _metric_value(item.get("scenario_recall"), default=0.0),
+                    -_metric_value(item.get("false_positive_rate"), default=1.0),
+                    _metric_value(item.get("pr_auc"), default=0.0),
+                    -_metric_value(item.get("inference_duration_seconds"), default=float("inf")),
                 ),
                 reverse=True,
             )
-        ]
-        return {"models": reports, "recommendation_order": ordering}
+        ] if can_recommend else []
+        return {
+            "models": reports,
+            "pairwise_compatibility": (
+                pairwise_failures if pairwise_failures else [{"status": "ok"}]
+            ),
+            "recommendation_order": ordering,
+        }
 
     def drift(self, *, model_id: str, dataset_id: str) -> dict[str, Any]:
         compatibility = self.compatibility.verify_target(model_id, dataset_id)
@@ -1550,6 +1644,12 @@ def _stability_summary(
 
 def _flagged_rate(scores: list[float], threshold: float) -> float:
     return sum(1 for score in scores if float(score) >= threshold) / len(scores) if scores else 0.0
+
+
+def _metric_value(value: object, *, default: float) -> float:
+    if value is None:
+        return default
+    return float(cast(float, value))
 
 
 def _percentiles(scores: list[float]) -> dict[str, float]:

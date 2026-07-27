@@ -220,13 +220,41 @@ button:hover {
 .compactTable .row {
   grid-template-columns:
     minmax(130px, 1.2fr) repeat(5, minmax(80px, 1fr))
-    repeat(4, minmax(74px, 0.8fr));
+    repeat(5, minmax(74px, 0.8fr));
 }
 
 .compactTable button {
   justify-content: center;
   min-height: 34px;
   padding: 6px 8px;
+}
+
+.detailGrid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.detailGrid article {
+  border: 1px solid #34414d;
+  border-radius: 7px;
+  padding: 12px;
+}
+
+.detailGrid h3 {
+  margin: 0 0 8px;
+  font-size: 15px;
+}
+
+.detailList {
+  display: grid;
+  gap: 7px;
+  color: #cbd5df;
+}
+
+.detailList span {
+  overflow-wrap: anywhere;
 }
 
 .collectorGrid {

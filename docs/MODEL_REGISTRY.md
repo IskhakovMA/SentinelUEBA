@@ -1,6 +1,6 @@
 # Model Registry
 
-SQLite schema v7 stores model lifecycle and scoring audit metadata.
+SQLite schema v8 stores model lifecycle and scoring audit metadata.
 
 Core tables:
 
@@ -19,9 +19,9 @@ Lifecycle states are `candidate`, `recommended`, `champion`, `retired`, `rejecte
 - `retired -> champion` only through rollback.
 - `failed/rejected` models cannot be promoted.
 
-Promotion, retirement, and rollback require explicit confirmation in the CLI/API wrappers and verify the bundle, source snapshot, registry/manifest contract, evaluation row, and compatibility before changing lifecycle state. Rollback writes `model_promotions.action = "rollback"` and retires the previous champion. Retirement history records the retired model as `previous_model_id` and an empty `new_model_id`; it is not represented as a self-transition.
+Promotion, recommendation, retirement, and rollback require explicit confirmation in the CLI/API wrappers and verify the bundle, source snapshot, registry/manifest/training-run contract, evaluation row, and compatibility before changing lifecycle state. Rollback writes `model_promotions.action = "rollback"` and retires the previous champion. Retirement history records the retired model as `previous_model_id` and `new_model_id = NULL`; it is not represented as a self-transition.
 
-The compatibility service is used by verify/load/promote/rollback/score/detect/drift/compare. It proves that the model is registered, the source snapshot is registered and verified, optional target snapshots are registered and verified, dataset kind/profile/schema/order match, and model/registry/source hashes agree.
+The compatibility service is used by public verify/load/promote/recommend/retire/rollback/score/detect/drift/compare. It proves that the model is registered and finalized, the source snapshot is registered and verified, optional target snapshots are registered and verified, dataset kind/profile/schema/order match, model/registry/source hashes agree, and the linked training run is successful with `completed_at` populated. During training, pending registered candidates are checked only by a private verifier until the finalization transaction fills `verified_at`.
 
 Model ids are constrained to safe generated ids such as:
 

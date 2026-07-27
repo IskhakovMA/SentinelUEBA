@@ -13,9 +13,10 @@ flowchart LR
   F --> G["held-out evaluation"]
   G --> H["temp model bundle + internal verify"]
   H --> I["atomic rename + SQLite model_versions registry"]
-  I --> J["public verify + verified_at"]
-  J --> K["candidate / recommended / champion lifecycle"]
-  K --> L["batch offline scoring + drift reports"]
+  I --> J["private pending registered verify"]
+  J --> K["atomic success finalize + verified_at"]
+  K --> L["public verify/load/lifecycle"]
+  L --> M["batch offline scoring + drift reports"]
 ```
 
 Synthetic snapshots split at the first canonical scenario window. Earlier normal windows are divided into train and calibration, and all scenario windows remain in test. Scenario labels are used only for held-out metrics and recommendation. They are never feature columns, training targets, preprocessor inputs, or calibration inputs.
@@ -40,6 +41,6 @@ sentinelueba ml score --dataset <dataset-id> --model <model-id> --batch-size 64
 sentinelueba ml drift --model <model-id> --dataset <dataset-id>
 ```
 
-Model bundle creation is all-or-nothing. The service writes a temporary directory, anchors split, preprocessor, metrics, model card, and model artifact hashes in `manifest.artifact_hashes`, writes `checksums.sha256`, performs internal verification without requiring a registry row, atomically renames to the final bundle path, registers `model_versions` with `verified_at = NULL`, performs public verification against SQLite and the source dataset snapshot, and only then sets `verified_at` and records evaluation. Failures remove temp/final directories, remove registry/evaluation rows for the failed training run, and mark the training run failed with a sanitized error.
+Model bundle creation is all-or-nothing until finalization. The service writes a temporary directory, anchors split, preprocessor, metrics, model card, and model artifact hashes in `manifest.artifact_hashes`, writes `checksums.sha256`, performs internal verification without requiring a registry row, atomically renames to the final bundle path, registers `model_versions` with `verified_at = NULL`, and uses a private pending registered verifier while the training run is still `running`. After all candidates are registered and evaluated, one SQLite transaction marks the training run `success`, sets `completed_at`, and fills `verified_at` for every candidate model. Only finalized models can pass public verify/load/promote/recommend/retire/rollback/score/detect/drift/compare. Failures before finalization remove temp/final directories, remove registry/evaluation rows for the failed training run, and mark the training run failed with a sanitized error. Lifecycle recommendation or auto-promotion failures after finalization return a lifecycle warning without deleting verified candidates.
 
 Offline scoring creates a `scoring_runs` row as `running` before compatibility/model loading. Scores are computed in bounded batches, `scored_windows` are inserted atomically on success, and failed runs store a sanitized error without partial scored rows.

@@ -16,7 +16,7 @@ from sentinelueba.validation import (
     validate_event,
 )
 
-DB_SCHEMA_VERSION = 7
+DB_SCHEMA_VERSION = 8
 
 
 class SchemaIntegrityError(RuntimeError):
@@ -78,6 +78,9 @@ class SQLiteStorage:
                 version = 6
             if version < 7:
                 self._apply_v7(conn)
+                version = 7
+            if version < 8:
+                self._apply_v8(conn)
             self._assert_schema_integrity(conn)
 
     def _record_migration(self, conn: sqlite3.Connection, version: int) -> None:
@@ -641,6 +644,42 @@ class SQLiteStorage:
             "ON scored_windows(scoring_run_id, anomaly_score)"
         )
         self._record_migration(conn, 7)
+
+    def _apply_v8(self, conn: sqlite3.Connection) -> None:
+        columns = self._columns(conn, "model_promotions")
+        if "new_model_id" in columns:
+            conn.execute("ALTER TABLE model_promotions RENAME TO model_promotions_v7")
+            conn.execute(
+                """
+                CREATE TABLE model_promotions (
+                    promotion_id TEXT PRIMARY KEY,
+                    profile_key TEXT NOT NULL,
+                    dataset_kind TEXT NOT NULL,
+                    previous_model_id TEXT,
+                    new_model_id TEXT,
+                    action TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO model_promotions (
+                    promotion_id, profile_key, dataset_kind, previous_model_id,
+                    new_model_id, action, reason, created_at
+                )
+                SELECT promotion_id, profile_key, dataset_kind, previous_model_id,
+                       NULLIF(new_model_id, ''), action, reason, created_at
+                FROM model_promotions_v7
+                """
+            )
+            conn.execute("DROP TABLE model_promotions_v7")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_model_promotions_profile "
+            "ON model_promotions(dataset_kind, profile_key, created_at)"
+        )
+        self._record_migration(conn, 8)
 
     def insert_events(self, events: list[TelemetryEvent]) -> int:
         inserted, _ = self.insert_events_detailed(events)
@@ -1703,6 +1742,67 @@ class SQLiteStorage:
                     model_ids,
                 )
 
+    def finalize_training_run_success(
+        self,
+        training_run_id: str,
+        *,
+        model_ids: list[str],
+        completed_at: str,
+        verified_at: str,
+    ) -> None:
+        if not model_ids:
+            raise ValueError("training run finalization requires at least one model")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run = conn.execute(
+                "SELECT * FROM training_runs WHERE training_run_id = ?",
+                (training_run_id,),
+            ).fetchone()
+            if run is None:
+                raise ValueError("training run is missing")
+            if run["status"] != "running":
+                raise ValueError("training run is not running")
+            placeholders = ", ".join("?" for _ in model_ids)
+            rows = conn.execute(
+                f"""
+                SELECT * FROM model_versions
+                WHERE training_run_id = ? AND model_id IN ({placeholders})
+                """,
+                [training_run_id, *model_ids],
+            ).fetchall()
+            if len(rows) != len(set(model_ids)):
+                raise ValueError("not all candidate model rows exist")
+            for row in rows:
+                if row["verified_at"] is not None:
+                    raise ValueError("candidate model is already finalized")
+                if row["dataset_id"] != run["dataset_id"]:
+                    raise ValueError("candidate dataset id does not match training run")
+                if row["dataset_manifest_sha256"] != run["dataset_manifest_sha256"]:
+                    raise ValueError("candidate dataset hash does not match training run")
+                if row["dataset_kind"] != run["dataset_kind"]:
+                    raise ValueError("candidate dataset kind does not match training run")
+                if row["profile_key"] != run["profile_key"]:
+                    raise ValueError("candidate profile does not match training run")
+                if row["split_id"] != run["split_id"]:
+                    raise ValueError("candidate split does not match training run")
+            conn.execute(
+                """
+                UPDATE training_runs
+                SET status = 'success', completed_at = ?, error_class = NULL,
+                    safe_error_message = NULL
+                WHERE training_run_id = ? AND status = 'running'
+                """,
+                (completed_at, training_run_id),
+            )
+            conn.execute(
+                f"""
+                UPDATE model_versions
+                SET verified_at = ?
+                WHERE training_run_id = ? AND model_id IN ({placeholders})
+                """,
+                [verified_at, training_run_id, *model_ids],
+            )
+
     def record_model_evaluation(self, payload: dict[str, Any]) -> None:
         with self.connect() as conn:
             conn.execute(
@@ -1813,13 +1913,20 @@ class SQLiteStorage:
                     model["profile_key"],
                     model["dataset_kind"],
                     model_id,
-                    "",
+                    None,
                     "retire",
                     reason,
                     created_at,
                 ),
             )
         return {"retired_model_id": model_id, "action": "retire"}
+
+    def list_model_promotions(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM model_promotions ORDER BY created_at DESC"
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def get_model_version(self, model_id: str) -> dict[str, Any] | None:
         with self.connect() as conn:

@@ -291,6 +291,81 @@ def test_model_bundle_failure_cleanup_has_no_orphans(
     assert not [path for path in models_root.glob("*") if path.is_dir()]
 
 
+def test_pending_registered_model_is_private_only_until_atomic_finalize(
+    tmp_path: Path,
+) -> None:
+    pipe = prepared_synthetic_pipe(tmp_path)
+    result = pipe.ml().train(
+        dataset_kind="synthetic",
+        families=["isolation-forest"],
+        isolation_forest_config=small_if_config(),
+        auto_promote_synthetic=False,
+    )
+    model_id = str(result["candidates"][0]["model_id"])
+    dataset_id = str(result["dataset_id"])
+    training_run_id = str(result["training_run_id"])
+    with pipe.storage.connect() as conn:
+        conn.execute(
+            "UPDATE model_versions SET verified_at = NULL WHERE model_id = ?",
+            (model_id,),
+        )
+        conn.execute(
+            """
+            UPDATE training_runs
+            SET status = 'running', completed_at = NULL
+            WHERE training_run_id = ?
+            """,
+            (training_run_id,),
+        )
+
+    service = pipe.ml()
+    assert service.verifier._verify_registered_pending(model_id)["verified"] is True
+    with pytest.raises(ModelBundleVerificationError, match="not finalized"):
+        pipe.ml_verify_model(model_id)
+    with pytest.raises(ModelBundleVerificationError, match="not finalized"):
+        service.verifier.load(model_id)
+    with pytest.raises(ValueError, match="not finalized"):
+        pipe.ml_promote_model(model_id, confirm=True)
+    with pytest.raises(ValueError, match="not finalized"):
+        service.score(dataset_id=dataset_id, model_id=model_id)
+    with pytest.raises(ValueError, match="not finalized"):
+        service.drift(model_id=model_id, dataset_id=dataset_id)
+
+    finalized_at = datetime.now(UTC).isoformat()
+    pipe.storage.finalize_training_run_success(
+        training_run_id,
+        model_ids=[model_id],
+        completed_at=finalized_at,
+        verified_at=finalized_at,
+    )
+    assert pipe.ml_verify_model(model_id)["verified"] is True
+    assert pipe.ml_promote_model(model_id, confirm=True)["new_model_id"] == model_id
+    assert service.score(dataset_id=dataset_id, model_id=model_id)["window_count"] == 96
+    assert service.drift(model_id=model_id, dataset_id=dataset_id)["status"] == "ok"
+
+
+def test_failed_training_run_model_is_not_publicly_usable(tmp_path: Path) -> None:
+    pipe = prepared_synthetic_pipe(tmp_path)
+    result = pipe.ml().train(
+        dataset_kind="synthetic",
+        families=["isolation-forest"],
+        isolation_forest_config=small_if_config(),
+        auto_promote_synthetic=False,
+    )
+    model_id = str(result["candidates"][0]["model_id"])
+    with pipe.storage.connect() as conn:
+        conn.execute(
+            """
+            UPDATE training_runs
+            SET status = 'failed', completed_at = NULL
+            WHERE training_run_id = ?
+            """,
+            (result["training_run_id"],),
+        )
+    with pytest.raises(ModelBundleVerificationError, match="not finalized"):
+        pipe.ml_verify_model(model_id)
+
+
 def test_concurrent_same_profile_training_is_rejected_by_db_lock(tmp_path: Path) -> None:
     pipe = prepared_synthetic_pipe(tmp_path)
     dataset_id = str(pipe.create_dataset("synthetic")["dataset_id"])
@@ -344,8 +419,14 @@ def test_stage3_lifecycle_promote_rollback_and_immutable_scoring(tmp_path: Path)
     assert rollback["new_model_id"] == champion_id
     assert pipe.storage.champion_model("synthetic")["model_id"] == champion_id  # type: ignore[index]
     with pipe.storage.connect() as conn:
-        promotions = conn.execute("SELECT action FROM model_promotions").fetchall()
+        promotions = conn.execute(
+            "SELECT previous_model_id, new_model_id, action FROM model_promotions"
+        ).fetchall()
     assert "rollback" in {row["action"] for row in promotions}
+    retire_rows = [row for row in promotions if row["action"] == "retire"]
+    assert retire_rows
+    assert retire_rows[0]["previous_model_id"] == champion_id
+    assert retire_rows[0]["new_model_id"] is None
 
 
 def test_lifecycle_forbidden_transitions_are_rejected(tmp_path: Path) -> None:
@@ -620,6 +701,88 @@ def test_legacy_unregistered_status_and_compare_report(tmp_path: Path) -> None:
     assert all("verification_status" in item for item in report["models"])
 
 
+def test_compare_ranks_zero_fpr_and_inference_tiebreaker(tmp_path: Path) -> None:
+    pipe = prepared_synthetic_pipe(tmp_path)
+    trained = pipe.ml().train(
+        dataset_kind="synthetic",
+        families=["autoencoder", "isolation-forest"],
+        autoencoder_config=asdict(AutoencoderV2Config(epochs=6, batch_size=8)),
+        isolation_forest_config=small_if_config(),
+        auto_promote_synthetic=False,
+    )
+    first, second = [str(item["model_id"]) for item in trained["candidates"]]
+    set_latest_metrics(
+        pipe,
+        first,
+        {
+            "label_status": "labeled",
+            "scenario_recall": 1.0,
+            "false_positive_rate": 0.0,
+            "pr_auc": 0.5,
+            "inference_duration_seconds": 0.2,
+        },
+    )
+    set_latest_metrics(
+        pipe,
+        second,
+        {
+            "label_status": "labeled",
+            "scenario_recall": 1.0,
+            "false_positive_rate": 0.15,
+            "pr_auc": 1.0,
+            "inference_duration_seconds": 0.01,
+        },
+    )
+    assert pipe.ml_compare_models([first, second])["recommendation_order"] == [first, second]
+
+    set_latest_metrics(
+        pipe,
+        second,
+        {
+            "label_status": "labeled",
+            "scenario_recall": 1.0,
+            "false_positive_rate": 0.0,
+            "pr_auc": 0.5,
+            "inference_duration_seconds": 0.01,
+        },
+    )
+    assert pipe.ml_compare_models([first, second])["recommendation_order"] == [second, first]
+
+
+def test_compare_skips_recommendation_for_incompatible_and_real_models(tmp_path: Path) -> None:
+    pipe = prepared_synthetic_pipe(tmp_path)
+    trained = pipe.ml().train(
+        dataset_kind="synthetic",
+        families=["autoencoder", "isolation-forest"],
+        autoencoder_config=asdict(AutoencoderV2Config(epochs=6, batch_size=8)),
+        isolation_forest_config=small_if_config(),
+        auto_promote_synthetic=False,
+    )
+    first, second = [str(item["model_id"]) for item in trained["candidates"]]
+    with pipe.storage.connect() as conn:
+        conn.execute(
+            "UPDATE model_versions SET split_id = 'different-split' WHERE model_id = ?",
+            (second,),
+        )
+    incompatible = pipe.ml_compare_models([first, second])
+    assert incompatible["recommendation_order"] == []
+    assert incompatible["pairwise_compatibility"][0]["status"] == "failed"
+
+    real_pipe = DemoPipeline(settings(tmp_path / "real"))
+    real_pipe.initialize()
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    real_pipe.storage.insert_events(real_events(start, windows=96, synthetic=False))
+    add_observations(real_pipe, start, windows=96)
+    real_pipe.materialize_features("real")
+    real_result = real_pipe.ml().train(
+        dataset_kind="real",
+        families=["isolation-forest"],
+        isolation_forest_config=small_if_config(),
+    )
+    real_id = str(real_result["candidates"][0]["model_id"])
+    assert real_pipe.ml_compare_models([real_id])["recommendation_order"] == []
+
+
 def test_psi_handles_constant_and_rejects_non_finite() -> None:
     import numpy as np
 
@@ -629,6 +792,27 @@ def test_psi_handles_constant_and_rejects_non_finite() -> None:
     assert shifted < float("inf")
     with pytest.raises(ValueError, match="NaN|Infinity"):
         _psi(np.asarray([1.0, float("nan")]), np.asarray([1.0, 2.0]))
+
+
+def set_latest_metrics(
+    pipe: DemoPipeline,
+    model_id: str,
+    metrics: dict[str, object],
+) -> None:
+    with pipe.storage.connect() as conn:
+        row = conn.execute(
+            """
+            SELECT evaluation_id FROM model_evaluations
+            WHERE model_id = ?
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (model_id,),
+        ).fetchone()
+        assert row is not None
+        conn.execute(
+            "UPDATE model_evaluations SET metrics_json = ? WHERE evaluation_id = ?",
+            (json.dumps(metrics, sort_keys=True), row["evaluation_id"]),
+        )
 
 
 def add_observations(pipe: DemoPipeline, start: datetime, *, windows: int) -> None:

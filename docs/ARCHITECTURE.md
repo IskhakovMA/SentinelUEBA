@@ -18,10 +18,11 @@ flowchart LR
   J --> K["Leakage-safe split"]
   K --> L["Train Autoencoder v2 / Isolation Forest"]
   L --> M["Calibration-only threshold"]
-  M --> N["Immutable model bundle + SQLite registry"]
-  N --> O["Promotion / rollback lifecycle"]
-  O --> P["Controlled offline scoring"]
-  P --> H["FastAPI / CLI / React ML Lab"]
+  M --> N["Pending bundle verification"]
+  N --> O["Atomic training finalize + verified_at"]
+  O --> P["Promotion / rollback lifecycle"]
+  P --> R["Controlled offline scoring"]
+  R --> H["FastAPI / CLI / React ML Lab"]
   I["Collector state, cursors, observations, heartbeats"] --> F
   I --> H
 ```
@@ -38,12 +39,12 @@ Feature windows are 15-minute UTC tumbling windows partitioned by dataset kind a
 
 ## Stage 3 ML Pipeline
 
-SQLite schema v7 adds `training_runs`, `model_versions`, `model_evaluations`, `model_promotions`, `scoring_runs`, and `scored_windows`. Model bundles are immutable directories under the configured local model artifact root. Each bundle includes `manifest.json`, `split.json`, `preprocessor.json`, `metrics.json`, `model_card.md`, `checksums.sha256`, and exactly one family artifact: `autoencoder.pt` or `isolation_forest.skops`. `manifest.artifact_hashes` anchors the split, preprocessor, metrics, model card, and model artifact hashes; `checksums.sha256` must match the same hashes.
+SQLite schema v8 stores Stage 2 feature-store tables plus `training_runs`, `model_versions`, `model_evaluations`, `model_promotions`, `scoring_runs`, and `scored_windows`. Schema v8 makes `model_promotions.new_model_id` nullable so retirement audit history records `NULL` for the absent successor. Model bundles are immutable directories under the configured local model artifact root. Each bundle includes `manifest.json`, `split.json`, `preprocessor.json`, `metrics.json`, `model_card.md`, `checksums.sha256`, and exactly one family artifact: `autoencoder.pt` or `isolation_forest.skops`. `manifest.artifact_hashes` anchors the split, preprocessor, metrics, model card, and model artifact hashes; `checksums.sha256` must match the same hashes.
 
 Synthetic snapshots split chronologically at the first scenario window: prior normal windows become train/calibration, and all scenario windows stay in test. Real snapshots use chronological 70/15/15 splits over good windows only. The preprocessor is fitted on train rows only. Thresholds are calibrated only from calibration scores. Synthetic labels are used only for held-out evaluation and recommendation.
 
-Bundle creation uses internal temp-bundle verification before atomic rename and public registry-backed verification after `model_versions` registration. Public verification requires a registered verified source dataset snapshot, exact registry/manifest agreement, matching artifact path, model input dimension, linked training run, and supported library-safe artifact loading.
+Bundle creation uses internal temp-bundle verification before atomic rename and private pending registered verification after `model_versions` registration. After all candidates are registered and evaluated, one SQLite transaction marks the training run `success`, records `completed_at`, and fills `verified_at` for every candidate model. Public verification requires a registered verified source dataset snapshot, exact registry/manifest/training-run agreement, matching artifact path, model input dimension, a successful completed training run, and supported library-safe artifact loading.
 
 Offline scoring requires a verified registered model bundle and a verified registered dataset snapshot. The compatibility service checks dataset kind, profile key, feature schema, feature order, manifest hashes, artifact hashes, and threshold metadata before writing `scoring_runs` and `scored_windows`. A scoring run is inserted as `running` before model loading; success inserts rows atomically, and failure records a sanitized error without partial scored rows.
 
-The React ML Lab renders synthetic/real dataset controls, model family/config controls, training runs, candidate/recommended/champion lifecycle actions, scoring runs, drift output, verification state, and legacy Stage 2 artifact detection. It shows pseudonymous profile labels and shortened hashes rather than raw users, hosts, local artifact paths, executable paths, network addresses, or payloads.
+The React ML Lab renders synthetic/real dataset controls, model family/config controls, training runs, model details, scoring-run details, drift details, candidate/recommended/champion lifecycle actions, verification state, and legacy Stage 2 artifact detection. Lifecycle actions require a browser confirmation before the API receives `confirm=true`. The UI shows pseudonymous profile labels and shortened hashes rather than raw users, hosts, local artifact paths, executable paths, network addresses, or payloads.

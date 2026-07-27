@@ -23,7 +23,7 @@ Synthetic local demo pipeline, PyTorch autoencoder, FastAPI, React, tests, CI, a
 
 - Leakage-safe ML split and calibration-only thresholds.
 - Autoencoder v2 and Isolation Forest candidate training.
-- SQLite model registry v7 and immutable model bundles.
+- SQLite model registry v8 and immutable model bundles.
 - Model evaluation, model cards, promotion, rollback, scoring runs, and drift reports.
 - ML CLI/API and React ML Lab.
 
