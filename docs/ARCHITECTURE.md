@@ -59,7 +59,7 @@ The React ML Lab renders synthetic/real dataset controls, model family/config co
 
 ## Stage 4 Detection Engine
 
-SQLite schema v9 stores Stage 4 tables: `detection_policies`, `detection_runs`, `detection_evaluations`, `findings`, `finding_occurrences`, `finding_state_history`, `detection_suppressions`, `detection_watermarks`, and `detection_worker_leases`. Fresh databases and v1-v8 databases migrate sequentially to v9; a database that claims v9 but lacks required tables fails schema integrity checks.
+SQLite schema v10 stores Stage 4 tables: `detection_policies`, `detection_policy_activations`, `detection_runs`, `detection_evaluations`, `findings`, `finding_occurrences`, `finding_state_history`, `detection_suppressions`, `detection_watermarks`, and `detection_worker_leases`. Fresh databases and historical databases migrate sequentially to v10; a database that claims v10 but lacks required tables or columns fails schema integrity checks.
 
 Detection is validation- and feature-window-backed. `DetectionInput` contains only the window id, dataset kind, pseudonymous profile key, window bounds, feature schema version, ordered `FEATURE_NAMES`, numeric feature values, data quality, and feature input hash. It never includes raw telemetry payloads, raw user or host values, executable paths, remote addresses, authentication identities, or synthetic scenario labels.
 
@@ -77,11 +77,11 @@ flowchart LR
   H --> K["verified champion model signal"]
   J --> L["hybrid-fusion-v1"]
   K --> L
-  L --> M["evaluation, finding, occurrence, suppression audit"]
+  L --> M["atomic evaluation, finding, occurrence, suppression audit"]
 ```
 
 The built-in policy is `hybrid-policy-v1`, mode `hybrid`. Its rules are `rare-process-v1`, `new-remote-spike-v1`, `unusual-hour-activity-v1`, `resource-pressure-v1`, and `authentication-failure-burst-v1`. The fusion method is deterministic and explainable; corroboration increases the score, weak single signals do not become critical, and the output is a triage finding rather than proof of compromise.
 
-Model signals are loaded only through the public Stage 3 verifier and SQLite registry. A user cannot provide an artifact path. Direct persisted feature-window scoring is used only for Stage 4 detection, not for training, calibration, evaluation, promotion, or drift.
+Model signals are loaded only through the public Stage 3 verifier and SQLite registry. A user cannot provide an artifact path. Direct persisted feature-window scoring is used only for Stage 4 detection, not for training, calibration, evaluation, promotion, or drift. Scoring is exact by dataset/profile/model namespace; no-profile requests fan out into per-profile child runs instead of mixing profiles in one run.
 
-The local worker is a controlled foreground/API worker lease, not an installed Windows Service or autostart mechanism. Watermarks are keyed by dataset kind, profile, policy hash, and model identity so policy or champion changes trigger fresh evaluations without silently rescoring history.
+The local worker is a controlled foreground/API worker lease, not an installed Windows Service or autostart mechanism. Watermarks are keyed by dataset kind, profile, policy hash, and model identity so policy or champion changes trigger fresh evaluations without silently rescoring history. Pending detection windows are selected by SQL anti-join; watermarks are only an audit/optimization aid and not a replacement for idempotency.

@@ -8,7 +8,7 @@ SentinelUEBA is a local-first Windows-focused UEBA portfolio project. Stage 4 ke
 
 - Safe synthetic 24-hour-equivalent demo telemetry.
 - Opt-in Windows collectors for process, network, system metrics, and optional Security Event Log authentication metadata.
-- SQLite storage with sequential migrations, indexes, duplicate protection, collection sessions, collector observations, dataset snapshots, model registry v8, and detection schema v9.
+- SQLite storage with sequential migrations, indexes, duplicate protection, collection sessions, collector observations, dataset snapshots, model registry v8, and detection schema v10.
 - Payload validation, quarantine, and ingestion metadata before canonical normalization.
 - Persistent 15-minute UTC feature windows for user + host behavior.
 - Immutable Parquet dataset snapshots with manifests and SHA-256 verification.
@@ -21,7 +21,7 @@ SentinelUEBA is a local-first Windows-focused UEBA portfolio project. Stage 4 ke
 - Per-feature reconstruction residual and context-deviation explanations.
 - Post-inference validation for all five canonical synthetic demo scenarios.
 - Stage 4 hybrid detection policy `hybrid-policy-v1` over feature windows and verified champion models.
-- Immutable findings, occurrences, lifecycle history, exact TTL suppressions, idempotent evaluations, and worker watermarks.
+- Immutable findings, occurrences, lifecycle history, exact TTL suppressions, idempotent SQL anti-join evaluations, exact profile/model isolation, and worker watermarks.
 - Risk levels: low, medium, high, critical.
 - FastAPI endpoints and a bilingual EN/RU React dashboard.
 
@@ -102,13 +102,13 @@ uv run sentinelueba detection status
 uv run sentinelueba detection policies list
 uv run sentinelueba detection rules list
 uv run sentinelueba detection run-once --dataset synthetic
-uv run sentinelueba detection backfill --dataset synthetic --start <iso> --end <iso> --confirm
+uv run sentinelueba detection backfill --dataset synthetic --policy-id <policy-id> --start <iso> --end <iso> --confirm
 uv run sentinelueba detection findings list
 uv run sentinelueba detection suppressions create --scope signal_for_profile --profile <profile-key> --signal-id <signal-id> --ttl-minutes 60 --reason "maintenance"
 uv run sentinelueba detection worker run-foreground --dataset synthetic --max-windows 256
 ```
 
-Stage 4 detection inputs contain only window id, dataset kind, pseudonymous profile key, window bounds, feature schema version, ordered feature values, quality, and feature input hash. Raw payloads, raw users, hosts, executable paths, remote addresses, and synthetic scenario labels do not enter the rule engine.
+Stage 4 detection inputs contain only window id, dataset kind, pseudonymous profile key, window bounds, feature schema version, ordered feature values, quality, and feature input hash. Raw payloads, raw users, hosts, executable paths, remote addresses, and synthetic scenario labels do not enter the rule engine. No-profile runs create exact per-profile child runs; verified model signals are scored only for the model's dataset/profile namespace.
 
 See [detection engine](docs/DETECTION_ENGINE.md), [rules](docs/DETECTION_RULES.md), [policies](docs/DETECTION_POLICIES.md), [finding lifecycle](docs/FINDING_LIFECYCLE.md), and [continuous detection](docs/CONTINUOUS_DETECTION.md).
 

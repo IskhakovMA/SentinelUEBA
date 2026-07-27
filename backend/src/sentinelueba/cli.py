@@ -536,10 +536,19 @@ def detection_policies_show(
 def detection_policies_activate(
     policy_id: str,
     version: str | None = typer.Option(None, "--version"),
+    confirm: bool = typer.Option(False, "--confirm"),
+    reason: str = typer.Option("manual policy activation", "--reason"),
 ) -> None:
     """Activate a registered immutable detection policy."""
     try:
-        _print(_pipeline().detection_activate_policy(policy_id, version))
+        _print(
+            _pipeline().detection_activate_policy(
+                policy_id,
+                version,
+                confirm=confirm,
+                reason=reason,
+            )
+        )
     except ValueError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=2) from exc
@@ -591,12 +600,14 @@ def detection_run_once(
 def detection_backfill(
     dataset: str = typer.Option("synthetic", "--dataset"),
     policy_id: str | None = typer.Option(None, "--policy-id"),
+    policy_version: str | None = typer.Option(None, "--policy-version"),
     model_id: str | None = typer.Option(None, "--model-id"),
     start: str | None = typer.Option(None, "--start"),
     end: str | None = typer.Option(None, "--end"),
     dataset_id: str | None = typer.Option(None, "--dataset-id"),
     confirm: bool = typer.Option(False, "--confirm"),
     advance_watermark: bool = typer.Option(False, "--advance-watermark"),
+    confirm_advance_watermark: bool = typer.Option(False, "--confirm-advance-watermark"),
 ) -> None:
     """Backfill Stage 4 detection over an explicit range or registered dataset."""
     try:
@@ -604,12 +615,14 @@ def detection_backfill(
             _pipeline().detection_backfill(
                 dataset_kind=dataset,
                 policy_id=policy_id,
+                policy_version=policy_version,
                 model_id=model_id,
                 start=_parse_datetime(start),
                 end=_parse_datetime(end),
                 registered_dataset_id=dataset_id,
                 confirm=confirm,
                 advance_watermark=advance_watermark,
+                confirm_advance_watermark=confirm_advance_watermark,
             )
         )
     except ValueError as exc:
@@ -740,10 +753,13 @@ def detection_suppressions_create(
 
 
 @detection_suppressions_app.command("revoke")
-def detection_suppressions_revoke(suppression_id: str) -> None:
+def detection_suppressions_revoke(
+    suppression_id: str,
+    confirm: bool = typer.Option(False, "--confirm"),
+) -> None:
     """Revoke an active suppression."""
     try:
-        _print(_pipeline().detection_revoke_suppression(suppression_id))
+        _print(_pipeline().detection_revoke_suppression(suppression_id, confirm=confirm))
     except ValueError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=2) from exc
@@ -770,15 +786,16 @@ def detection_worker_start(
 
 
 @detection_worker_app.command("stop")
-def detection_worker_stop() -> None:
+def detection_worker_stop(confirm: bool = typer.Option(False, "--confirm")) -> None:
     """Request local detection worker stop."""
-    _print(_pipeline().detection_worker_stop())
+    _print(_pipeline().detection_worker_stop(confirm=confirm))
 
 
 @detection_worker_app.command("run-foreground")
 def detection_worker_run_foreground(
     dataset: str = typer.Option("synthetic", "--dataset"),
     max_windows: int | None = typer.Option(256, "--max-windows", min=1),
+    interval_seconds: int = typer.Option(60, "--interval-seconds", min=5),
 ) -> None:
     """Run one bounded local worker cycle in the foreground."""
     try:
@@ -786,6 +803,7 @@ def detection_worker_run_foreground(
             _pipeline().detection_worker_run_foreground(
                 dataset_kind=dataset,
                 max_windows=max_windows,
+                interval_seconds=interval_seconds,
             )
         )
     except ValueError as exc:

@@ -28,11 +28,19 @@ quality, and feature input hash. It excludes raw events, payloads, user names, h
 executable paths, remote addresses, authentication identities, command lines, and
 synthetic scenario labels.
 
-SQLite schema v9 adds detection policies, runs, evaluations, findings, occurrences,
-lifecycle history, suppressions, watermarks, and worker leases. Idempotency is keyed by
-window id, feature input hash, policy hash, and model identity sentinel.
+SQLite schema v10 extends the Stage 4 detection schema with persisted feature profile
+keys/input hashes, stricter run audit counters/statuses, policy activation audit, worker
+lease namespaces, suppression audit fields, and `finding-fingerprint-v2` correlation.
+Idempotency is enforced by SQL anti-join on window id, feature input hash, policy hash,
+and model identity sentinel.
 
 Model signals are loaded only through the public Stage 3 verifier and SQLite registry.
 User-supplied artifact paths are not accepted. Direct persisted feature-window scoring is
 allowed only for detection, not for training, calibration, evaluation, promotion, or
 drift.
+
+Detection never scores across profiles. A run without an explicit profile creates exact
+per-profile child runs. A run with an explicit model uses the model registry profile, and
+a mismatched explicit profile/model combination is blocked before scoring. Finding writes
+are atomic with evaluation and occurrence writes; safe suppressions require exact scoped
+fields and revocation confirmation.

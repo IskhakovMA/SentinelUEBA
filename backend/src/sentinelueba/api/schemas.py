@@ -113,16 +113,20 @@ class DetectionRunRequest(BaseModel):
 class DetectionBackfillRequest(BaseModel):
     dataset_kind: str = Field(default="synthetic", pattern="^(synthetic|real)$")
     policy_id: str | None = None
+    policy_version: str | None = None
     model_id: str | None = None
     start: str | None = None
     end: str | None = None
     dataset_id: str | None = None
     confirm: bool = False
     advance_watermark: bool = False
+    confirm_advance_watermark: bool = False
 
 
 class DetectionPolicyActivateRequest(BaseModel):
     policy_version: str | None = None
+    confirm: bool = False
+    reason: str = "manual policy activation"
 
 
 class FindingTransitionRequest(BaseModel):
@@ -148,6 +152,11 @@ class DetectionWorkerStartRequest(BaseModel):
 class DetectionWorkerRunRequest(BaseModel):
     dataset_kind: str = Field(default="synthetic", pattern="^(synthetic|real)$")
     max_windows: int | None = Field(default=256, ge=1, le=10_000)
+    interval_seconds: int = Field(default=60, ge=5, le=3600)
+
+
+class ConfirmRequest(BaseModel):
+    confirm: bool = False
 
 
 class ApiResponse(BaseModel):

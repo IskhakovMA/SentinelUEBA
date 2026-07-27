@@ -442,9 +442,17 @@ class DemoPipeline:
         self,
         policy_id: str,
         policy_version: str | None = None,
+        *,
+        confirm: bool = False,
+        reason: str = "manual policy activation",
     ) -> dict[str, object]:
         self.storage.initialize()
-        return self.detection().activate_policy(policy_id, policy_version)
+        return self.detection().activate_policy(
+            policy_id,
+            policy_version,
+            confirm=confirm,
+            reason=reason,
+        )
 
     def detection_rules(self) -> list[dict[str, object]]:
         self.storage.initialize()
@@ -485,23 +493,27 @@ class DemoPipeline:
         *,
         dataset_kind: str = "synthetic",
         policy_id: str | None = None,
+        policy_version: str | None = None,
         model_id: str | None = None,
         start: datetime | None = None,
         end: datetime | None = None,
         registered_dataset_id: str | None = None,
         confirm: bool = False,
         advance_watermark: bool = False,
+        confirm_advance_watermark: bool = False,
     ) -> dict[str, object]:
         self.storage.initialize()
         return self.detection().backfill(
             dataset_kind=dataset_kind,
             policy_id=policy_id,
+            policy_version=policy_version,
             model_id=model_id,
             start=start,
             end=end,
             registered_dataset_id=registered_dataset_id,
             confirm=confirm,
             advance_watermark=advance_watermark,
+            confirm_advance_watermark=confirm_advance_watermark,
         )
 
     def detection_runs(self) -> list[dict[str, object]]:
@@ -567,9 +579,14 @@ class DemoPipeline:
             signal_id=signal_id,
         )
 
-    def detection_revoke_suppression(self, suppression_id: str) -> dict[str, object]:
+    def detection_revoke_suppression(
+        self,
+        suppression_id: str,
+        *,
+        confirm: bool = False,
+    ) -> dict[str, object]:
         self.storage.initialize()
-        return self.detection().revoke_suppression(suppression_id)
+        return self.detection().revoke_suppression(suppression_id, confirm=confirm)
 
     def detection_worker_status(self) -> dict[str, object]:
         self.storage.initialize()
@@ -587,20 +604,22 @@ class DemoPipeline:
             interval_seconds=interval_seconds,
         )
 
-    def detection_worker_stop(self) -> dict[str, object]:
+    def detection_worker_stop(self, *, confirm: bool = False) -> dict[str, object]:
         self.storage.initialize()
-        return self.detection().worker_stop()
+        return self.detection().worker_stop(confirm=confirm)
 
     def detection_worker_run_foreground(
         self,
         *,
         dataset_kind: str = "synthetic",
         max_windows: int | None = 256,
+        interval_seconds: int = 60,
     ) -> dict[str, object]:
         self.storage.initialize()
         return self.detection().worker_run_foreground(
             dataset_kind=dataset_kind,
             max_windows=max_windows,
+            interval_seconds=interval_seconds,
         )
 
     def _create_dataset_locked(self, dataset_kind: str) -> dict[str, object]:

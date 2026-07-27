@@ -199,14 +199,21 @@ type DriftReport = {
 };
 
 type DetectionRun = {
-  detection_run_id: string;
+  detection_run_id?: string | null;
+  child_run_ids?: string[];
   status: string;
   mode: string;
   model_id?: string | null;
+  examined_count?: number;
   evaluated_count: number;
   skipped_count: number;
   finding_count: number;
+  finding_occurrences?: number;
+  new_findings?: number;
+  updated_findings?: number;
   no_op_count: number;
+  blocked_reason?: string | null;
+  safe_error?: string | null;
   started_at?: string;
   completed_at?: string | null;
 };
@@ -226,7 +233,14 @@ type DetectionStatus = {
   finding_counts: Record<string, number>;
   evaluation_count: number;
   watermarks: Array<{ last_window_start?: string | null; last_window_id?: string | null }>;
-  worker?: { status?: string; heartbeat_at?: string; stop_requested?: number } | null;
+  worker?: {
+    status?: string;
+    heartbeat_at?: string;
+    stop_requested?: number;
+    worker_key?: string | null;
+    lease_expired?: boolean;
+    expires_at?: string | null;
+  } | null;
 };
 
 type DetectionFinding = {
@@ -1089,8 +1103,16 @@ export function App() {
             <strong>{detectionStatus?.active_policy.policy_id ?? 'none'}</strong>
           </article>
           <article>
+            <span>Schema</span>
+            <strong>v{detectionStatus?.schema_version ?? 'n/a'}</strong>
+          </article>
+          <article>
             <span>{t.fusion}</span>
             <strong>{detectionStatus?.active_policy.fusion_method ?? 'none'}</strong>
+          </article>
+          <article>
+            <span>Policy hash</span>
+            <strong>{shortValue(detectionStatus?.active_policy.policy_hash)}</strong>
           </article>
           <article>
             <span>Mode / threshold</span>
@@ -1102,7 +1124,14 @@ export function App() {
           </article>
           <article>
             <span>{t.worker}</span>
-            <strong>{detectionStatus?.worker?.status ?? 'stopped'}</strong>
+            <strong>
+              {detectionStatus?.worker?.status ?? 'stopped'}
+              {detectionStatus?.worker?.lease_expired ? ' / expired' : ''}
+            </strong>
+          </article>
+          <article>
+            <span>Worker key</span>
+            <strong>{shortValue(detectionStatus?.worker?.worker_key)}</strong>
           </article>
           <article>
             <span>{t.evaluations}</span>
@@ -1121,8 +1150,28 @@ export function App() {
             </strong>
           </article>
           <article>
+            <span>Run audit</span>
+            <strong>
+              {latestDetectionRun
+                ? `${latestDetectionRun.examined_count ?? 0} examined / ${latestDetectionRun.skipped_count} skipped`
+                : 'none'}
+            </strong>
+          </article>
+          <article>
+            <span>Occurrences</span>
+            <strong>
+              {latestDetectionRun
+                ? `${latestDetectionRun.finding_occurrences ?? 0} occ / ${latestDetectionRun.new_findings ?? 0} new`
+                : 'none'}
+            </strong>
+          </article>
+          <article>
             <span>{t.watermark}</span>
             <strong>{shortValue(latestWatermark?.last_window_start)}</strong>
+          </article>
+          <article>
+            <span>Watermark id</span>
+            <strong>{shortValue(latestWatermark?.last_window_id)}</strong>
           </article>
         </div>
         <p className="warning">{t.findingWarning}</p>

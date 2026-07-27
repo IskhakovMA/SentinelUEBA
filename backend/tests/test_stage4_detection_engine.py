@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -13,7 +14,7 @@ from sentinelueba.api.main import app
 from sentinelueba.cli import app as cli_app
 from sentinelueba.config import Settings
 from sentinelueba.detection.contracts import DetectionInput
-from sentinelueba.detection.policies import DEFAULT_POLICY_ID
+from sentinelueba.detection.policies import DEFAULT_POLICY_ID, RULES_ONLY_POLICY_ID
 from sentinelueba.detection.service import DetectionEngineError, model_strength
 from sentinelueba.features.windows import FEATURE_NAMES
 from sentinelueba.ml.stage3_models import AutoencoderV2Config
@@ -37,20 +38,36 @@ def prepared_pipe(tmp_path: Path) -> DemoPipeline:
     return pipe
 
 
-def scenario_evaluations(pipe: DemoPipeline, detection_run_id: str) -> dict[str, dict[str, object]]:
-    run = pipe.detection_run(detection_run_id)
-    assert run is not None
-    evaluations = {item["window_start"]: item for item in run["evaluations"]}
+def scenario_evaluations(
+    pipe: DemoPipeline,
+    result: dict[str, object],
+) -> dict[str, dict[str, object]]:
+    run_ids = [run_id(result)]
+    if result.get("child_run_ids"):
+        run_ids = [str(item) for item in result["child_run_ids"]]  # type: ignore[index]
+    evaluations: dict[str, dict[str, object]] = {}
+    for detection_run_id in run_ids:
+        run = pipe.detection_run(detection_run_id)
+        assert run is not None
+        evaluations.update({item["window_start"]: item for item in run["evaluations"]})
     manifest = pipe.generate_demo_data(seed=42)["scenario_manifest"]
     return {item["name"]: evaluations[item["window_start"]] for item in manifest}
 
+def run_id(result: dict[str, object]) -> str:
+    if result.get("detection_run_id") is not None:
+        return str(result["detection_run_id"])
+    children = result.get("child_run_ids")
+    assert isinstance(children, list)
+    assert len(children) == 1
+    return str(children[0])
 
-def test_stage4_schema_v9_fresh_repeat_and_corrupt_claimed_v9(tmp_path: Path) -> None:
+
+def test_stage4_schema_v10_fresh_repeat_and_corrupt_claimed_v10(tmp_path: Path) -> None:
     storage = SQLiteStorage(tmp_path / "fresh.sqlite3")
     storage.initialize()
     storage.initialize()
 
-    assert storage.status()["schema_version"] == DB_SCHEMA_VERSION == 9
+    assert storage.status()["schema_version"] == DB_SCHEMA_VERSION == 10
     with storage.connect() as conn:
         tables = {
             row["name"]
@@ -66,12 +83,13 @@ def test_stage4_schema_v9_fresh_repeat_and_corrupt_claimed_v9(tmp_path: Path) ->
         "detection_suppressions",
         "detection_watermarks",
         "detection_worker_leases",
+        "detection_policy_activations",
     }.issubset(tables)
 
     corrupt = tmp_path / "corrupt.sqlite3"
     with sqlite3.connect(corrupt) as conn:
         conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT)")
-        conn.execute("INSERT INTO schema_version(version, applied_at) VALUES (9, 'now')")
+        conn.execute("INSERT INTO schema_version(version, applied_at) VALUES (10, 'now')")
     with pytest.raises(SchemaIntegrityError):
         SQLiteStorage(corrupt).initialize()
 
@@ -113,10 +131,13 @@ def test_stage4_hybrid_detects_all_synthetic_scenarios_without_labels(tmp_path: 
     assert pipe.storage.champion_model("synthetic")["model_id"] == model_id  # type: ignore[index]
 
     result = pipe.detection_run_once(dataset_kind="synthetic")
-    scenarios = scenario_evaluations(pipe, str(result["detection_run_id"]))
+    scenarios = scenario_evaluations(pipe, result)
 
-    assert result["model_id"] == model_id
+    child = pipe.detection_run(run_id(result))
+    assert child is not None
+    assert child["model_id"] == model_id
     assert result["evaluated_count"] == 96
+    assert result["child_run_ids"] == [run_id(result)]
     assert set(scenarios) == {
         "rare_process",
         "outbound_connection_spike",
@@ -141,7 +162,8 @@ def test_stage4_idempotency_makes_second_same_run_noop(tmp_path: Path) -> None:
 
     assert first["evaluated_count"] == 96
     assert second["evaluated_count"] == 0
-    assert second["no_op_count"] == 96
+    assert second["examined_count"] == 0
+    assert second["child_run_ids"] == [run_id(second)]
     assert pipe.detection_status()["active_policy"]["policy_id"] == DEFAULT_POLICY_ID
 
 
@@ -161,12 +183,98 @@ def test_stage4_signal_suppression_preserves_audit_without_finding(tmp_path: Pat
         signal_id="rare-process-v1",
     )
     result = pipe.detection_run_once(dataset_kind="synthetic", rules_only=True)
-    scenarios = scenario_evaluations(pipe, str(result["detection_run_id"]))
+    scenarios = scenario_evaluations(pipe, result)
 
     assert suppression["active"] == 1
     assert scenarios["rare_process"]["status"] == "suppressed"
     assert scenarios["rare_process"]["finding_id"] is None
     assert pipe.detection_suppressions()[0]["reason"] == "test suppression"
+
+
+def test_stage4_v10_exact_profile_policy_and_worker_contracts(tmp_path: Path) -> None:
+    pipe = prepared_pipe(tmp_path)
+    profile = pipe.storage.list_detection_profiles(dataset_kind="synthetic")[0]
+
+    policy = pipe.detection_policy(RULES_ONLY_POLICY_ID)
+    with pytest.raises(DetectionEngineError, match="confirm=true"):
+        pipe.detection_activate_policy(RULES_ONLY_POLICY_ID)
+    activated = pipe.detection_activate_policy(
+        RULES_ONLY_POLICY_ID,
+        confirm=True,
+        reason="activate rules-only regression policy",
+    )
+    assert activated["policy_hash"] == policy["policy_hash"]
+
+    result = pipe.detection_run_once(dataset_kind="synthetic", profile=profile)
+    assert result["detection_run_id"] is not None
+    assert result["child_run_ids"] == []
+    assert result["model_id"] is None
+    assert result["policy_id"] == RULES_ONLY_POLICY_ID
+    assert result["evaluated_count"] == 96
+
+    with pipe.storage.connect() as conn:
+        run = conn.execute(
+            "SELECT * FROM detection_runs WHERE detection_run_id = ?",
+            (result["detection_run_id"],),
+        ).fetchone()
+        evaluations = conn.execute(
+            "SELECT DISTINCT profile_key, model_id, policy_hash FROM detection_evaluations"
+        ).fetchall()
+        activations = conn.execute("SELECT COUNT(*) FROM detection_policy_activations").fetchone()
+    assert run["profile_key"] == profile
+    assert run["policy_mode"] == "rules_only"
+    assert run["examined_windows"] == 96
+    assert {(row["profile_key"], row["model_id"], row["policy_hash"]) for row in evaluations} == {
+        (profile, "__rules_only__", policy["policy_hash"])
+    }
+    assert activations[0] == 1
+
+    start = "2026-01-06T00:00:00+00:00"
+    end = "2026-01-07T00:00:00+00:00"
+    with pytest.raises(DetectionEngineError, match="explicit registered policy id"):
+        pipe.detection_backfill(
+            dataset_kind="synthetic",
+            start=datetime.fromisoformat(start),
+            end=datetime.fromisoformat(end),
+            confirm=True,
+        )
+    with pytest.raises(DetectionEngineError, match="confirm_advance_watermark=true"):
+        pipe.detection_backfill(
+            dataset_kind="synthetic",
+            policy_id=RULES_ONLY_POLICY_ID,
+            start=datetime.fromisoformat(start),
+            end=datetime.fromisoformat(end),
+            confirm=True,
+            advance_watermark=True,
+        )
+
+    with pytest.raises(DetectionEngineError, match="known Stage 4 signal"):
+        pipe.detection_create_suppression(
+            scope="signal_for_profile",
+            reason="bad signal",
+            ttl_minutes=5,
+            profile_key=profile,
+            signal_id="unknown-rule",
+        )
+    suppression = pipe.detection_create_suppression(
+        scope="signal_for_profile",
+        reason="exact suppress",
+        ttl_minutes=5,
+        profile_key=profile,
+        signal_id="rare-process-v1",
+    )
+    with pytest.raises(DetectionEngineError, match="confirm=true"):
+        pipe.detection_revoke_suppression(str(suppression["suppression_id"]))
+    revoked = pipe.detection_revoke_suppression(
+        str(suppression["suppression_id"]),
+        confirm=True,
+    )
+    assert revoked["revoked"] is True
+
+    worker = pipe.detection_worker_run_foreground(dataset_kind="synthetic", max_windows=1)
+    assert worker["worker"]["worker_key"] == "stage4|synthetic|*"
+    assert not str(worker["worker"].get("owner_id", "")).startswith("demo-host")
+    assert worker["runs"]
 
 
 def test_stage4_model_strength_handles_threshold_edges() -> None:

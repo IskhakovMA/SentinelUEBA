@@ -6,6 +6,7 @@ from sentinelueba.detection.contracts import (
     DetectionPolicy,
     DetectionSignal,
     RiskLevel,
+    RiskThresholdConfig,
 )
 
 
@@ -69,13 +70,13 @@ def fuse_signals(
     )
 
 
-def risk_for_score(score: int, thresholds: dict[str, int]) -> RiskLevel:
-    if score >= thresholds["critical"]:
+def risk_for_score(score: int, thresholds: RiskThresholdConfig) -> RiskLevel:
+    if score >= thresholds.critical:
         return "critical"
-    if score >= thresholds["high"]:
+    if score >= thresholds.high:
         return "high"
-    if score >= thresholds["medium"]:
+    if score >= thresholds.medium:
         return "medium"
-    if score >= thresholds["low"]:
+    if score >= thresholds.low:
         return "low"
     return "none"

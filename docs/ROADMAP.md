@@ -32,7 +32,7 @@ Synthetic local demo pipeline, PyTorch autoencoder, FastAPI, React, tests, CI, a
 - Immutable `hybrid-policy-v1` detection policy with deterministic policy hash.
 - Built-in safe feature-window rules and verified champion model signals.
 - Deterministic `hybrid-fusion-v1` scoring, risk levels, findings, occurrences, lifecycle history, and exact TTL suppressions.
-- SQLite schema v9 detection tables, idempotent evaluations, composite worker watermarks, and local worker lease.
+- SQLite schema v10 detection tables, SQL anti-join idempotent evaluations, composite worker watermarks, and local worker lease.
 - Detection CLI/API and React Detection Center.
 
 ## Recommended Stage 5

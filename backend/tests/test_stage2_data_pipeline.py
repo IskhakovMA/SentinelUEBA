@@ -24,7 +24,7 @@ from sentinelueba.domain.events import EventType, TelemetryEvent, deterministic_
 from sentinelueba.features.materialization import FeatureMaterializer
 from sentinelueba.features.windows import align_window_start
 from sentinelueba.services.pipeline import DemoPipeline
-from sentinelueba.storage.sqlite import SchemaIntegrityError, SQLiteStorage
+from sentinelueba.storage.sqlite import DB_SCHEMA_VERSION, SchemaIntegrityError, SQLiteStorage
 from sentinelueba.validation import validate_event
 
 
@@ -181,7 +181,7 @@ def test_historical_schema_migrations_to_current(tmp_path: Path, version: int) -
     create_historical_database(db, version)
     store = SQLiteStorage(db)
     store.initialize()
-    assert store.status()["schema_version"] == 9
+    assert store.status()["schema_version"] == DB_SCHEMA_VERSION
     assert store.status()["event_count"] == 1
     columns = {
         row[1] for row in sqlite3.connect(db).execute("PRAGMA table_info(telemetry_events)")
@@ -207,7 +207,7 @@ def test_historical_schema_migrations_to_current(tmp_path: Path, version: int) -
 def test_fresh_schema_initializes_to_current(tmp_path: Path) -> None:
     store = SQLiteStorage(tmp_path / "fresh.sqlite3")
     store.initialize()
-    assert store.status()["schema_version"] == 9
+    assert store.status()["schema_version"] == DB_SCHEMA_VERSION
     assert "collector_observations" in table_names(store.database_path)
     assert "model_versions" in table_names(store.database_path)
 
@@ -241,6 +241,7 @@ def test_repeated_initialize_current_runs_no_migrations_or_event_updates(
         "_apply_v7",
         "_apply_v8",
         "_apply_v9",
+        "_apply_v10",
     ]:
         monkeypatch.setattr(store, name, fail_migration(name))
     store.initialize()

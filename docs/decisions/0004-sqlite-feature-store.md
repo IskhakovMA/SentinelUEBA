@@ -30,7 +30,7 @@ Stage 3 adds:
 - `scoring_runs`
 - `scored_windows`
 
-Stage 4 schema v9 adds:
+The first Stage 4 detection migration adds:
 
 - `detection_policies`
 - `detection_runs`
@@ -42,8 +42,13 @@ Stage 4 schema v9 adds:
 - `detection_watermarks`
 - `detection_worker_leases`
 
+Stage 4 schema v10 adds persisted feature-window `profile_key` and `feature_input_hash`
+columns, `detection_policy_activations`, expanded run counters/status fields, worker
+lease namespace columns, suppression audit fields on evaluations, and
+`related_previous_finding_id` for `finding-fingerprint-v2` correlation.
+
 ## Consequences
 
 SQLite keeps Windows setup simple and CI portable. It is not a streaming framework; late event handling is implemented by deterministic invalidation and rebuild of affected window ranges. Real coverage is derived from collector observations so a quiet but successfully polled host can still produce usable windows without inventing change events. Incremental materialization reads observations with the composite `observed_at + observation_id` watermark and selects affected observations by coverage-interval overlap.
 
-The model registry can enforce one champion per dataset kind/profile, preserve model lifecycle transitions, and keep offline scoring auditable without introducing a second database. Schema v8 keeps `model_promotions.new_model_id` nullable so retirement history records a real `NULL` successor. Schema v9 adds detection policy, evaluation, finding, suppression, watermark, and worker lease audit rows. Fresh databases and historical v1-v8 databases migrate to v9. Databases already at schema v9 are verified for required structure; missing tables or columns are treated as integrity failures instead of triggering old migrations again.
+The model registry can enforce one champion per dataset kind/profile, preserve model lifecycle transitions, and keep offline scoring auditable without introducing a second database. Schema v8 keeps `model_promotions.new_model_id` nullable so retirement history records a real `NULL` successor. The first Stage 4 detection migration adds detection policy, evaluation, finding, suppression, watermark, and worker lease audit rows. Schema v10 tightens Stage 4 isolation and auditability without adding another database. Fresh and historical databases migrate to v10. Databases already at schema v10 are verified for required structure; missing tables or columns are treated as integrity failures instead of triggering old migrations again.

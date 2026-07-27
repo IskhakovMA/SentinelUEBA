@@ -12,6 +12,7 @@ from sentinelueba.api.schemas import (
     AnomalyListResponse,
     ApiResponse,
     CollectionStartRequest,
+    ConfirmRequest,
     DatasetKindRequest,
     DetectionBackfillRequest,
     DetectionPolicyActivateRequest,
@@ -306,6 +307,8 @@ async def detection_policy_activate(
                 pipeline().detection_activate_policy,
                 policy_id,
                 request.policy_version,
+                confirm=request.confirm,
+                reason=request.reason,
             )
         )
     except ValueError as exc:
@@ -348,12 +351,14 @@ async def detection_backfill(request: DetectionBackfillRequest) -> ApiResponse:
                 pipeline().detection_backfill,
                 dataset_kind=request.dataset_kind,
                 policy_id=request.policy_id,
+                policy_version=request.policy_version,
                 model_id=request.model_id,
                 start=parse_api_datetime(request.start),
                 end=parse_api_datetime(request.end),
                 registered_dataset_id=request.dataset_id,
                 confirm=request.confirm,
                 advance_watermark=request.advance_watermark,
+                confirm_advance_watermark=request.confirm_advance_watermark,
             )
         )
     except ValueError as exc:
@@ -467,10 +472,17 @@ async def detection_suppression_create(request: SuppressionCreateRequest) -> Api
 
 
 @app.post("/detection/suppressions/{suppression_id}/revoke", response_model=ApiResponse)
-async def detection_suppression_revoke(suppression_id: str) -> ApiResponse:
+async def detection_suppression_revoke(
+    suppression_id: str,
+    request: ConfirmRequest | None = None,
+) -> ApiResponse:
     try:
         return ApiResponse(
-            data=await run_blocking(pipeline().detection_revoke_suppression, suppression_id)
+            data=await run_blocking(
+                pipeline().detection_revoke_suppression,
+                suppression_id,
+                confirm=request.confirm if request is not None else False,
+            )
         )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -493,8 +505,13 @@ async def detection_worker_start(request: DetectionWorkerStartRequest) -> ApiRes
 
 
 @app.post("/detection/worker/stop", response_model=ApiResponse)
-async def detection_worker_stop() -> ApiResponse:
-    return ApiResponse(data=await run_blocking(pipeline().detection_worker_stop))
+async def detection_worker_stop(request: ConfirmRequest | None = None) -> ApiResponse:
+    return ApiResponse(
+        data=await run_blocking(
+            pipeline().detection_worker_stop,
+            confirm=request.confirm if request is not None else False,
+        )
+    )
 
 
 @app.post("/detection/worker/run-foreground", response_model=ApiResponse)
@@ -505,6 +522,7 @@ async def detection_worker_run_foreground(request: DetectionWorkerRunRequest) ->
                 pipeline().detection_worker_run_foreground,
                 dataset_kind=request.dataset_kind,
                 max_windows=request.max_windows,
+                interval_seconds=request.interval_seconds,
             )
         )
     except ValueError as exc:

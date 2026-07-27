@@ -9,11 +9,12 @@ Commands:
 uv run sentinelueba detection worker status
 uv run sentinelueba detection worker start --dataset synthetic --interval-seconds 60
 uv run sentinelueba detection worker run-foreground --dataset synthetic --max-windows 256
-uv run sentinelueba detection worker stop
+uv run sentinelueba detection worker stop --confirm
 ```
 
-The worker lease stores owner, heartbeat, stop request, status, config, and sanitized
-errors. Foreground cycles call the same idempotent run-once engine used by the CLI and API.
-Watermarks are keyed by dataset kind, profile, policy hash, and model identity so changed
-policy or champion identity causes fresh evaluations instead of silently skipping changed
-inputs.
+The worker lease stores an opaque owner id, namespace key, heartbeat, expiry, stop
+request, status, config, policy hash, and sanitized errors. It does not store raw host
+names. Foreground cycles call the same SQL anti-join idempotent run-once engine used by
+the CLI and API. Watermarks are keyed by dataset kind, profile, policy hash, and model
+identity so changed policy or champion identity causes fresh evaluations instead of
+silently skipping changed inputs.
