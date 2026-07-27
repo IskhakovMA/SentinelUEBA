@@ -19,9 +19,11 @@ Windows authentication collection stores Security Event Log metadata only for su
 
 ## Stage 2 Data Handling
 
-Payload validation runs after normalization. Rejected events are quarantined with a safe
-normalized representation and rejection reason. Dataset snapshots contain materialized
-feature windows and ML metadata only; raw event payloads are not included by default.
+Payload validation checks original payload keys before canonical normalization. Rejected
+events are quarantined with a safe representation and rejection reason; unknown or
+forbidden payload values are omitted from quarantine records. Dataset snapshots contain
+materialized feature windows and ML metadata only; raw event payloads are not included by
+default.
 
 Retention defaults to 30 days for raw real events and quarantined events. Dataset snapshots
 and model artifacts are not deleted automatically.

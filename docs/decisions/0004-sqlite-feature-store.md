@@ -12,7 +12,7 @@ and dataset snapshot metadata without adding infrastructure.
 
 ## Decision
 
-Use SQLite v5 tables for the feature store:
+Use SQLite v6 tables for the feature store:
 
 - `feature_windows`
 - `feature_materialization_state`
@@ -29,6 +29,9 @@ SQLite keeps Windows setup simple and CI portable. It is not a streaming framewo
 event handling is implemented by deterministic invalidation and rebuild of affected
 window ranges. Real coverage is derived from collector observations so a quiet but
 successfully polled host can still produce usable windows without inventing change
-events. Databases already at schema v5 are verified for required structure; missing
-tables or columns are treated as integrity failures instead of triggering old migrations
-again.
+events. Incremental materialization reads observations with the composite
+`observed_at + observation_id` watermark and selects affected observations by
+coverage-interval overlap. Fresh databases and historical v1/v2/v3/v4/v5 databases
+migrate to v6. Databases already at schema v6 are verified for required structure;
+missing tables or columns are treated as integrity failures instead of triggering old
+migrations again.

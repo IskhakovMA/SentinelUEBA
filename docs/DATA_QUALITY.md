@@ -27,9 +27,10 @@ requires 24 cumulative hours of usable real coverage in one user+host profile. T
 the same as strict continuous 24-hour collection. The API and CLI report both cumulative
 collection and strict continuous validation.
 
-Rejected events are written to `quarantined_events` with a safe normalized event
+Rejected events are written to `quarantined_events` after the original-key validation
+step, before canonical normalization. Quarantine rows include a safe event
 representation, reason, collector/source, receipt timestamp, schema version, and error
-class. The quarantine does not store fields removed by the normalizer.
+class. Unknown or forbidden payload fields are omitted from the safe representation.
 
 The quality summary reports `received_events = accepted_events + duplicate_events +
 quarantined_events`, plus accepted, duplicate, quarantined, late-within-policy,
