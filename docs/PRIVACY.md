@@ -35,3 +35,16 @@ metrics, model cards, hashes, and model artifacts. They do not include raw event
 raw usernames, hostnames, paths, network addresses, browser history, clipboard contents,
 keystrokes, or packet payloads. Real evaluation is labeled as unlabeled and does not claim
 attack accuracy.
+
+## Stage 4 Detection Handling
+
+Stage 4 `DetectionInput` is a privacy-safe contract. It includes only a window id,
+dataset kind, pseudonymous profile key, window bounds, feature schema version, ordered
+feature values, quality, and feature input hash. The rule engine and finding evidence do
+not receive raw telemetry payloads, raw usernames, hostnames, executable paths, remote
+addresses, authentication identities, command lines, or synthetic scenario labels.
+
+Findings, occurrences, suppressions, lifecycle reasons, run errors, and API responses use
+sanitized summaries and allowlisted feature names. Free-text reasons are normalized and
+limited to 500 characters. A finding is an analyst triage record, not proof of malicious
+activity.

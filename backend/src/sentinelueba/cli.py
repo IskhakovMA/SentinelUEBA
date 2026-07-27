@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime
 
 import typer
 import uvicorn
@@ -19,14 +20,28 @@ ml_app = typer.Typer(help="Stage 3 ML pipeline commands.")
 ml_runs_app = typer.Typer(help="ML training run commands.")
 ml_models_app = typer.Typer(help="ML model registry commands.")
 ml_scoring_app = typer.Typer(help="Offline scoring run commands.")
+detection_app = typer.Typer(help="Stage 4 detection engine commands.")
+detection_policies_app = typer.Typer(help="Detection policy commands.")
+detection_rules_app = typer.Typer(help="Detection rule commands.")
+detection_runs_app = typer.Typer(help="Detection run commands.")
+detection_findings_app = typer.Typer(help="Finding lifecycle commands.")
+detection_suppressions_app = typer.Typer(help="Detection suppression commands.")
+detection_worker_app = typer.Typer(help="Controlled local detection worker commands.")
 app.add_typer(features_app, name="features")
 app.add_typer(datasets_app, name="datasets")
 app.add_typer(retention_app, name="retention")
 app.add_typer(quarantine_app, name="quarantine")
 app.add_typer(ml_app, name="ml")
+app.add_typer(detection_app, name="detection")
 ml_app.add_typer(ml_runs_app, name="runs")
 ml_app.add_typer(ml_models_app, name="models")
 ml_app.add_typer(ml_scoring_app, name="scoring-runs")
+detection_app.add_typer(detection_policies_app, name="policies")
+detection_app.add_typer(detection_rules_app, name="rules")
+detection_app.add_typer(detection_runs_app, name="runs")
+detection_app.add_typer(detection_findings_app, name="findings")
+detection_app.add_typer(detection_suppressions_app, name="suppressions")
+detection_app.add_typer(detection_worker_app, name="worker")
 
 
 def _pipeline() -> DemoPipeline:
@@ -52,6 +67,15 @@ def _parse_if_max_samples(value: str) -> str | int | float:
     except ValueError as exc:
         raise typer.BadParameter("must be auto, a positive int, or a float in (0, 1]") from exc
     raise typer.BadParameter("must be auto, a positive int, or a float in (0, 1]")
+
+
+def _parse_datetime(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise typer.BadParameter("must be an ISO-8601 datetime") from exc
 
 
 @app.command()
@@ -478,6 +502,292 @@ def ml_drift(
     """Compare a model training snapshot to another registered snapshot."""
     try:
         _print(_pipeline().ml_drift(model_id=model_id, dataset_id=dataset_id))
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+
+
+@detection_app.command("status")
+def detection_status() -> None:
+    """Show Stage 4 detection policy, worker, watermark, and finding state."""
+    _print(_pipeline().detection_status())
+
+
+@detection_policies_app.command("list")
+def detection_policies_list() -> None:
+    """List immutable detection policies."""
+    _print({"policies": _pipeline().detection_policies()})
+
+
+@detection_policies_app.command("show")
+def detection_policies_show(
+    policy_id: str,
+    version: str | None = typer.Option(None, "--version"),
+) -> None:
+    """Show one immutable detection policy."""
+    try:
+        _print(_pipeline().detection_policy(policy_id, version))
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+
+
+@detection_policies_app.command("activate")
+def detection_policies_activate(
+    policy_id: str,
+    version: str | None = typer.Option(None, "--version"),
+) -> None:
+    """Activate a registered immutable detection policy."""
+    try:
+        _print(_pipeline().detection_activate_policy(policy_id, version))
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+
+
+@detection_rules_app.command("list")
+def detection_rules_list() -> None:
+    """List built-in safe detection rules."""
+    _print({"rules": _pipeline().detection_rules()})
+
+
+@detection_app.command("run-once")
+def detection_run_once(
+    dataset: str = typer.Option("synthetic", "--dataset"),
+    profile: str | None = typer.Option(None, "--profile"),
+    policy_id: str | None = typer.Option(None, "--policy-id"),
+    policy_version: str | None = typer.Option(None, "--policy-version"),
+    model_id: str | None = typer.Option(None, "--model-id"),
+    start: str | None = typer.Option(None, "--start"),
+    end: str | None = typer.Option(None, "--end"),
+    batch_size: int = typer.Option(256, "--batch-size", min=1, max=4096),
+    max_windows: int | None = typer.Option(None, "--max-windows", min=1),
+    rules_only: bool = typer.Option(False, "--rules-only"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    """Run Stage 4 detection once over materialized feature windows."""
+    try:
+        _print(
+            _pipeline().detection_run_once(
+                dataset_kind=dataset,
+                profile=profile,
+                policy_id=policy_id,
+                policy_version=policy_version,
+                model_id=model_id,
+                start=_parse_datetime(start),
+                end=_parse_datetime(end),
+                batch_size=batch_size,
+                max_windows=max_windows,
+                rules_only=rules_only,
+                dry_run=dry_run,
+            )
+        )
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+
+
+@detection_app.command("backfill")
+def detection_backfill(
+    dataset: str = typer.Option("synthetic", "--dataset"),
+    policy_id: str | None = typer.Option(None, "--policy-id"),
+    model_id: str | None = typer.Option(None, "--model-id"),
+    start: str | None = typer.Option(None, "--start"),
+    end: str | None = typer.Option(None, "--end"),
+    dataset_id: str | None = typer.Option(None, "--dataset-id"),
+    confirm: bool = typer.Option(False, "--confirm"),
+    advance_watermark: bool = typer.Option(False, "--advance-watermark"),
+) -> None:
+    """Backfill Stage 4 detection over an explicit range or registered dataset."""
+    try:
+        _print(
+            _pipeline().detection_backfill(
+                dataset_kind=dataset,
+                policy_id=policy_id,
+                model_id=model_id,
+                start=_parse_datetime(start),
+                end=_parse_datetime(end),
+                registered_dataset_id=dataset_id,
+                confirm=confirm,
+                advance_watermark=advance_watermark,
+            )
+        )
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+
+
+@detection_runs_app.command("list")
+def detection_runs_list() -> None:
+    """List Stage 4 detection runs."""
+    _print({"detection_runs": _pipeline().detection_runs()})
+
+
+@detection_runs_app.command("show")
+def detection_runs_show(detection_run_id: str) -> None:
+    """Show one Stage 4 detection run."""
+    run = _pipeline().detection_run(detection_run_id)
+    if run is None:
+        typer.echo("detection run not found", err=True)
+        raise typer.Exit(code=2)
+    _print(run)
+
+
+@detection_findings_app.command("list")
+def detection_findings_list(
+    status: str | None = typer.Option(None, "--status"),
+    dataset: str | None = typer.Option(None, "--dataset"),
+) -> None:
+    """List privacy-safe Stage 4 findings."""
+    _print({"findings": _pipeline().detection_findings(status=status, dataset_kind=dataset)})
+
+
+@detection_findings_app.command("show")
+def detection_findings_show(finding_id: str) -> None:
+    """Show finding details, occurrences, and lifecycle history."""
+    finding = _pipeline().detection_finding(finding_id)
+    if finding is None:
+        typer.echo("finding not found", err=True)
+        raise typer.Exit(code=2)
+    _print(finding)
+
+
+def _transition_finding(finding_id: str, to_status: str, reason: str, confirm: bool) -> None:
+    try:
+        _print(
+            _pipeline().detection_transition_finding(
+                finding_id,
+                to_status=to_status,
+                reason=reason,
+                confirm=confirm,
+            )
+        )
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+
+
+@detection_findings_app.command("acknowledge")
+def detection_findings_acknowledge(
+    finding_id: str,
+    reason: str = typer.Option("manual acknowledge", "--reason"),
+) -> None:
+    """Acknowledge an open finding."""
+    _transition_finding(finding_id, "acknowledged", reason, False)
+
+
+@detection_findings_app.command("investigate")
+def detection_findings_investigate(
+    finding_id: str,
+    reason: str = typer.Option("manual investigation", "--reason"),
+) -> None:
+    """Move a finding into investigating."""
+    _transition_finding(finding_id, "investigating", reason, False)
+
+
+@detection_findings_app.command("resolve")
+def detection_findings_resolve(
+    finding_id: str,
+    reason: str = typer.Option("manual resolution", "--reason"),
+    confirm: bool = typer.Option(False, "--confirm"),
+) -> None:
+    """Resolve a finding with explicit confirmation."""
+    _transition_finding(finding_id, "resolved", reason, confirm)
+
+
+@detection_findings_app.command("false-positive")
+def detection_findings_false_positive(
+    finding_id: str,
+    reason: str = typer.Option("manual false positive", "--reason"),
+    confirm: bool = typer.Option(False, "--confirm"),
+) -> None:
+    """Mark a finding false positive with explicit confirmation."""
+    _transition_finding(finding_id, "false_positive", reason, confirm)
+
+
+@detection_suppressions_app.command("list")
+def detection_suppressions_list() -> None:
+    """List exact, TTL-bound detection suppressions."""
+    _print({"suppressions": _pipeline().detection_suppressions()})
+
+
+@detection_suppressions_app.command("create")
+def detection_suppressions_create(
+    scope: str = typer.Option(..., "--scope"),
+    reason: str = typer.Option(..., "--reason"),
+    ttl_minutes: int = typer.Option(..., "--ttl-minutes", min=1),
+    dataset: str | None = typer.Option(None, "--dataset"),
+    profile: str | None = typer.Option(None, "--profile"),
+    fingerprint: str | None = typer.Option(None, "--fingerprint"),
+    signal_id: str | None = typer.Option(None, "--signal-id"),
+) -> None:
+    """Create an exact suppression; regex and arbitrary code are not supported."""
+    try:
+        _print(
+            _pipeline().detection_create_suppression(
+                scope=scope,
+                reason=reason,
+                ttl_minutes=ttl_minutes,
+                dataset_kind=dataset,
+                profile_key=profile,
+                finding_fingerprint=fingerprint,
+                signal_id=signal_id,
+            )
+        )
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+
+
+@detection_suppressions_app.command("revoke")
+def detection_suppressions_revoke(suppression_id: str) -> None:
+    """Revoke an active suppression."""
+    try:
+        _print(_pipeline().detection_revoke_suppression(suppression_id))
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+
+
+@detection_worker_app.command("status")
+def detection_worker_status() -> None:
+    """Show local detection worker lease state."""
+    _print(_pipeline().detection_worker_status())
+
+
+@detection_worker_app.command("start")
+def detection_worker_start(
+    dataset: str = typer.Option("synthetic", "--dataset"),
+    interval_seconds: int = typer.Option(60, "--interval-seconds", min=5),
+) -> None:
+    """Start the local worker lease without installing an OS service."""
+    _print(
+        _pipeline().detection_worker_start(
+            dataset_kind=dataset,
+            interval_seconds=interval_seconds,
+        )
+    )
+
+
+@detection_worker_app.command("stop")
+def detection_worker_stop() -> None:
+    """Request local detection worker stop."""
+    _print(_pipeline().detection_worker_stop())
+
+
+@detection_worker_app.command("run-foreground")
+def detection_worker_run_foreground(
+    dataset: str = typer.Option("synthetic", "--dataset"),
+    max_windows: int | None = typer.Option(256, "--max-windows", min=1),
+) -> None:
+    """Run one bounded local worker cycle in the foreground."""
+    try:
+        _print(
+            _pipeline().detection_worker_run_foreground(
+                dataset_kind=dataset,
+                max_windows=max_windows,
+            )
+        )
     except ValueError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=2) from exc

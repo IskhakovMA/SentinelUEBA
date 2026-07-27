@@ -176,12 +176,12 @@ def test_invalid_payload_for_each_event_type_is_quarantined(
 
 
 @pytest.mark.parametrize("version", [1, 2, 3, 4, 5, 6, 7])
-def test_historical_schema_migrations_to_v8(tmp_path: Path, version: int) -> None:
+def test_historical_schema_migrations_to_current(tmp_path: Path, version: int) -> None:
     db = tmp_path / f"v{version}.sqlite3"
     create_historical_database(db, version)
     store = SQLiteStorage(db)
     store.initialize()
-    assert store.status()["schema_version"] == 8
+    assert store.status()["schema_version"] == 9
     assert store.status()["event_count"] == 1
     columns = {
         row[1] for row in sqlite3.connect(db).execute("PRAGMA table_info(telemetry_events)")
@@ -204,15 +204,15 @@ def test_historical_schema_migrations_to_v8(tmp_path: Path, version: int) -> Non
         assert row == ("retired-v7", None, "retire")
 
 
-def test_fresh_schema_initializes_to_v8(tmp_path: Path) -> None:
+def test_fresh_schema_initializes_to_current(tmp_path: Path) -> None:
     store = SQLiteStorage(tmp_path / "fresh.sqlite3")
     store.initialize()
-    assert store.status()["schema_version"] == 8
+    assert store.status()["schema_version"] == 9
     assert "collector_observations" in table_names(store.database_path)
     assert "model_versions" in table_names(store.database_path)
 
 
-def test_repeated_initialize_v8_runs_no_migrations_or_event_updates(
+def test_repeated_initialize_current_runs_no_migrations_or_event_updates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -227,7 +227,7 @@ def test_repeated_initialize_v8_runs_no_migrations_or_event_updates(
 
     def fail_migration(method_name: str):
         def fail(conn: sqlite3.Connection) -> None:
-            pytest.fail(f"{method_name} should not run for schema v8")
+            pytest.fail(f"{method_name} should not run for current schema")
 
         return fail
 
@@ -240,6 +240,7 @@ def test_repeated_initialize_v8_runs_no_migrations_or_event_updates(
         "_apply_v6",
         "_apply_v7",
         "_apply_v8",
+        "_apply_v9",
     ]:
         monkeypatch.setattr(store, name, fail_migration(name))
     store.initialize()
@@ -251,8 +252,8 @@ def test_repeated_initialize_v8_runs_no_migrations_or_event_updates(
     assert after == before
 
 
-def test_v8_missing_required_table_raises_schema_integrity_error(tmp_path: Path) -> None:
-    store = SQLiteStorage(tmp_path / "corrupt-v8.sqlite3")
+def test_current_missing_required_table_raises_schema_integrity_error(tmp_path: Path) -> None:
+    store = SQLiteStorage(tmp_path / "corrupt-current.sqlite3")
     store.initialize()
     with sqlite3.connect(store.database_path) as conn:
         conn.execute("DROP TABLE model_versions")

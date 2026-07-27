@@ -91,6 +91,7 @@ button:hover {
 .collectionPanel,
 .pipelinePanel,
 .mlPanel,
+.detectionPanel,
 .details,
 .log {
   border: 1px solid #2f3b46;
@@ -134,7 +135,8 @@ button:hover {
 }
 
 .pipelinePanel,
-.mlPanel {
+.mlPanel,
+.detectionPanel {
   max-width: 1280px;
   margin: 0 auto 18px;
   padding: 16px;
@@ -185,14 +187,16 @@ button:hover {
 }
 
 .pipelineGrid,
-.mlGrid {
+.mlGrid,
+.detectionGrid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 10px;
 }
 
 .pipelineGrid article,
-.mlGrid article {
+.mlGrid article,
+.detectionGrid article {
   border: 1px solid #34414d;
   border-radius: 7px;
   padding: 10px;
@@ -202,8 +206,15 @@ button:hover {
 }
 
 .pipelineGrid strong,
-.mlGrid strong {
+.mlGrid strong,
+.detectionGrid strong {
   overflow-wrap: anywhere;
+}
+
+.findingTable .row {
+  grid-template-columns:
+    minmax(130px, 1.2fr) 88px 112px 72px minmax(140px, 1fr) 72px
+    repeat(3, minmax(86px, 0.8fr));
 }
 
 .mlTables {
@@ -401,7 +412,12 @@ button:hover {
   .collectorGrid,
   .scenarioGrid,
   .pipelineGrid,
-  .mlGrid {
+  .mlGrid,
+  .detectionGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .findingTable .row {
     grid-template-columns: 1fr;
   }
 }

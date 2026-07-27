@@ -38,5 +38,20 @@ uv run sentinelueba ml models compare <model-id> <other-model-id>
 uv run sentinelueba ml score --dataset <dataset-id> --model <model-id> --batch-size 64
 ```
 
+Stage 4 detection smoke:
+
+```bash
+uv run sentinelueba detection status
+uv run sentinelueba detection policies list
+uv run sentinelueba detection rules list
+uv run sentinelueba detection run-once --dataset synthetic
+uv run sentinelueba detection runs list
+uv run sentinelueba detection findings list
+uv run sentinelueba detection worker run-foreground --dataset synthetic --max-windows 256
+```
+
+The worker commands manage a local SQLite lease only. They do not install an OS service,
+autostart task, or background daemon.
+
 Generated SQLite databases, Parquet snapshots, manifests, checksums, model bundles, logs,
 and local identity secrets must remain outside Git.

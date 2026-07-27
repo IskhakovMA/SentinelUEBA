@@ -16,7 +16,7 @@ from sentinelueba.validation import (
     validate_event,
 )
 
-DB_SCHEMA_VERSION = 8
+DB_SCHEMA_VERSION = 9
 
 
 class SchemaIntegrityError(RuntimeError):
@@ -81,6 +81,9 @@ class SQLiteStorage:
                 version = 7
             if version < 8:
                 self._apply_v8(conn)
+                version = 8
+            if version < 9:
+                self._apply_v9(conn)
             self._assert_schema_integrity(conn)
 
     def _record_migration(self, conn: sqlite3.Connection, version: int) -> None:
@@ -366,6 +369,15 @@ class SQLiteStorage:
             "model_promotions",
             "scoring_runs",
             "scored_windows",
+            "detection_policies",
+            "detection_runs",
+            "detection_evaluations",
+            "findings",
+            "finding_occurrences",
+            "finding_state_history",
+            "detection_suppressions",
+            "detection_watermarks",
+            "detection_worker_leases",
         }
         existing_tables = {
             row["name"]
@@ -419,6 +431,22 @@ class SQLiteStorage:
             },
             "scoring_runs": {"scoring_run_id", "model_id", "dataset_id", "status"},
             "scored_windows": {"scoring_run_id", "window_id", "anomaly_score"},
+            "detection_policies": {"policy_id", "policy_version", "policy_hash", "active"},
+            "detection_runs": {"detection_run_id", "policy_hash", "status", "mode"},
+            "detection_evaluations": {
+                "evaluation_id",
+                "window_id",
+                "feature_input_hash",
+                "policy_hash",
+                "model_id",
+                "decision_json",
+            },
+            "findings": {"finding_id", "fingerprint", "status", "risk_level"},
+            "finding_occurrences": {"occurrence_id", "finding_id", "evaluation_id", "window_id"},
+            "finding_state_history": {"history_id", "finding_id", "from_status", "to_status"},
+            "detection_suppressions": {"suppression_id", "scope", "active"},
+            "detection_watermarks": {"watermark_key", "last_window_start", "last_window_id"},
+            "detection_worker_leases": {"worker_id", "owner_id", "status", "heartbeat_at"},
         }
         for table, columns in required_columns.items():
             missing_columns = sorted(columns - self._columns(conn, table))
@@ -680,6 +708,214 @@ class SQLiteStorage:
             "ON model_promotions(dataset_kind, profile_key, created_at)"
         )
         self._record_migration(conn, 8)
+
+    def _apply_v9(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS detection_policies (
+                policy_id TEXT NOT NULL,
+                policy_version TEXT NOT NULL,
+                policy_hash TEXT PRIMARY KEY,
+                mode TEXT NOT NULL,
+                policy_json TEXT NOT NULL,
+                active INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                source_commit TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_detection_policy_identity
+            ON detection_policies(policy_id, policy_version)
+            """
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_detection_policy
+            ON detection_policies(active)
+            WHERE active = 1
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS detection_runs (
+                detection_run_id TEXT PRIMARY KEY,
+                dataset_kind TEXT NOT NULL,
+                profile_key TEXT,
+                policy_id TEXT NOT NULL,
+                policy_version TEXT NOT NULL,
+                policy_hash TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                model_id TEXT,
+                model_version TEXT,
+                model_hash TEXT,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                window_count INTEGER NOT NULL,
+                evaluated_count INTEGER NOT NULL,
+                skipped_count INTEGER NOT NULL,
+                finding_count INTEGER NOT NULL,
+                no_op_count INTEGER NOT NULL,
+                dry_run INTEGER NOT NULL,
+                safe_error TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS detection_evaluations (
+                evaluation_id TEXT PRIMARY KEY,
+                detection_run_id TEXT NOT NULL,
+                window_id TEXT NOT NULL,
+                dataset_kind TEXT NOT NULL,
+                profile_key TEXT NOT NULL,
+                window_start TEXT NOT NULL,
+                window_end TEXT NOT NULL,
+                feature_schema_version TEXT NOT NULL,
+                feature_input_hash TEXT NOT NULL,
+                policy_id TEXT NOT NULL,
+                policy_version TEXT NOT NULL,
+                policy_hash TEXT NOT NULL,
+                model_id TEXT,
+                model_version TEXT,
+                model_hash TEXT,
+                mode TEXT NOT NULL,
+                status TEXT NOT NULL,
+                detection_score REAL NOT NULL,
+                risk_level TEXT NOT NULL,
+                matched_signal_ids_json TEXT NOT NULL,
+                decision_json TEXT NOT NULL,
+                finding_id TEXT,
+                created_at TEXT NOT NULL,
+                skipped_reason TEXT,
+                UNIQUE(window_id, feature_input_hash, policy_hash, model_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS findings (
+                finding_id TEXT PRIMARY KEY,
+                fingerprint TEXT NOT NULL,
+                dataset_kind TEXT NOT NULL,
+                profile_key TEXT NOT NULL,
+                policy_id TEXT NOT NULL,
+                policy_version TEXT NOT NULL,
+                policy_hash TEXT NOT NULL,
+                model_id TEXT,
+                model_version TEXT,
+                model_hash TEXT,
+                status TEXT NOT NULL,
+                risk_level TEXT NOT NULL,
+                detection_score REAL NOT NULL,
+                primary_signal_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                occurrence_count INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS finding_occurrences (
+                occurrence_id TEXT PRIMARY KEY,
+                finding_id TEXT NOT NULL,
+                evaluation_id TEXT NOT NULL,
+                window_id TEXT NOT NULL,
+                window_start TEXT NOT NULL,
+                window_end TEXT NOT NULL,
+                detection_score REAL NOT NULL,
+                risk_level TEXT NOT NULL,
+                signals_json TEXT NOT NULL,
+                evidence_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(finding_id, evaluation_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS finding_state_history (
+                history_id TEXT PRIMARY KEY,
+                finding_id TEXT NOT NULL,
+                from_status TEXT,
+                to_status TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS detection_suppressions (
+                suppression_id TEXT PRIMARY KEY,
+                scope TEXT NOT NULL,
+                dataset_kind TEXT,
+                profile_key TEXT,
+                finding_fingerprint TEXT,
+                signal_id TEXT,
+                reason TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                active INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                revoked_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS detection_watermarks (
+                watermark_key TEXT PRIMARY KEY,
+                dataset_kind TEXT NOT NULL,
+                profile_key TEXT,
+                policy_hash TEXT NOT NULL,
+                model_id TEXT,
+                last_window_start TEXT,
+                last_window_id TEXT,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS detection_worker_leases (
+                worker_id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                heartbeat_at TEXT NOT NULL,
+                stop_requested INTEGER NOT NULL,
+                config_json TEXT NOT NULL,
+                safe_error TEXT
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_detection_runs_started "
+            "ON detection_runs(started_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_detection_evaluations_window "
+            "ON detection_evaluations(dataset_kind, profile_key, window_start, window_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_findings_status "
+            "ON findings(status, last_seen_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_findings_fingerprint "
+            "ON findings(fingerprint, status, last_seen_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_suppressions_scope "
+            "ON detection_suppressions(scope, active, expires_at)"
+        )
+        self._record_migration(conn, 9)
 
     def insert_events(self, events: list[TelemetryEvent]) -> int:
         inserted, _ = self.insert_events_detailed(events)
@@ -1315,6 +1551,11 @@ class SQLiteStorage:
         *,
         dataset_kind: str | None = None,
         quality_status: set[str] | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        after_window_start: str | None = None,
+        after_window_id: str | None = None,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         clauses: list[str] = []
         params: list[object] = []
@@ -1325,10 +1566,28 @@ class SQLiteStorage:
             placeholders = ", ".join("?" for _ in quality_status)
             clauses.append(f"quality_status IN ({placeholders})")
             params.extend(sorted(quality_status))
+        if start is not None:
+            clauses.append("window_start >= ?")
+            params.append(start.isoformat())
+        if end is not None:
+            clauses.append("window_start < ?")
+            params.append(end.isoformat())
+        if after_window_start is not None:
+            if after_window_id is None:
+                clauses.append("window_start > ?")
+                params.append(after_window_start)
+            else:
+                clauses.append("(window_start > ? OR (window_start = ? AND window_id > ?))")
+                params.extend([after_window_start, after_window_start, after_window_id])
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        limit_sql = ""
+        if limit is not None:
+            limit_sql = " LIMIT ?"
+            params.append(limit)
         with self.connect() as conn:
             rows = conn.execute(
-                f"SELECT * FROM feature_windows {where} ORDER BY window_start ASC, window_id ASC",
+                f"SELECT * FROM feature_windows {where} "
+                f"ORDER BY window_start ASC, window_id ASC{limit_sql}",
                 params,
             ).fetchall()
         return [self._feature_window_row(row) for row in rows]
@@ -2327,6 +2586,10 @@ class SQLiteStorage:
             ).fetchone()[0]
             model_count = conn.execute("SELECT COUNT(*) FROM model_versions").fetchone()[0]
             scoring_run_count = conn.execute("SELECT COUNT(*) FROM scoring_runs").fetchone()[0]
+            detection_run_count = conn.execute(
+                "SELECT COUNT(*) FROM detection_runs"
+            ).fetchone()[0]
+            finding_count = conn.execute("SELECT COUNT(*) FROM findings").fetchone()[0]
             schema = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
         return {
             "database_path": str(self.database_path),
@@ -2339,6 +2602,8 @@ class SQLiteStorage:
             "dataset_snapshot_count": dataset_snapshot_count,
             "model_count": model_count,
             "scoring_run_count": scoring_run_count,
+            "detection_run_count": detection_run_count,
+            "finding_count": finding_count,
         }
 
     def upsert_collector_state(

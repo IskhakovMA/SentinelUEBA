@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client';
 import {
   Activity,
   Archive,
+  Bell,
   Database,
   Languages,
   Play,
@@ -40,6 +41,7 @@ type Status = {
   model: { trained?: boolean; model_version?: string };
   collection?: CollectionStatus;
   data_pipeline?: DataPipelineStatus;
+  detection?: DetectionStatus;
 };
 
 type Locale = 'en' | 'ru';
@@ -196,6 +198,53 @@ type DriftReport = {
   limitations?: string[];
 };
 
+type DetectionRun = {
+  detection_run_id: string;
+  status: string;
+  mode: string;
+  model_id?: string | null;
+  evaluated_count: number;
+  skipped_count: number;
+  finding_count: number;
+  no_op_count: number;
+  started_at?: string;
+  completed_at?: string | null;
+};
+
+type DetectionStatus = {
+  schema_version: number;
+  active_policy: {
+    policy_id: string;
+    policy_version: string;
+    policy_hash: string;
+    mode: string;
+    finding_threshold: number;
+    fusion_method: string;
+    rules: Array<{ rule_id: string; enabled: boolean }>;
+  };
+  latest_run?: DetectionRun | null;
+  finding_counts: Record<string, number>;
+  evaluation_count: number;
+  watermarks: Array<{ last_window_start?: string | null; last_window_id?: string | null }>;
+  worker?: { status?: string; heartbeat_at?: string; stop_requested?: number } | null;
+};
+
+type DetectionFinding = {
+  finding_id: string;
+  fingerprint: string;
+  dataset_kind: string;
+  profile_key: string;
+  status: string;
+  risk_level: Risk | 'none';
+  detection_score: number;
+  primary_signal_id: string;
+  title: string;
+  summary: string;
+  first_seen_at: string;
+  last_seen_at: string;
+  occurrence_count: number;
+};
+
 const copy = {
   en: {
     title: 'SentinelUEBA',
@@ -239,6 +288,15 @@ const copy = {
     modelBundles: 'Model bundles',
     scoringRuns: 'Scoring runs',
     mlWarning: 'Offline model scoring only. An anomaly is not proof of malicious activity.',
+    detectionCenter: 'Detection Center',
+    runDetection: 'Run detection',
+    workerCycle: 'Worker cycle',
+    findings: 'Findings',
+    activePolicy: 'Active policy',
+    fusion: 'Fusion',
+    worker: 'Worker',
+    evaluations: 'Evaluations',
+    findingWarning: 'Findings are triage records, not proof of malicious activity.',
   },
   ru: {
     title: 'SentinelUEBA',
@@ -282,6 +340,15 @@ const copy = {
     modelBundles: 'Model bundles',
     scoringRuns: 'Scoring runs',
     mlWarning: 'Только offline scoring. Аномалия не является доказательством атаки.',
+    detectionCenter: 'Центр обнаружения',
+    runDetection: 'Запустить detection',
+    workerCycle: 'Цикл worker',
+    findings: 'Findings',
+    activePolicy: 'Активная policy',
+    fusion: 'Fusion',
+    worker: 'Worker',
+    evaluations: 'Оценки',
+    findingWarning: 'Findings являются triage-записями, а не доказательством атаки.',
   },
 };
 
@@ -317,6 +384,8 @@ export function App() {
     null,
   );
   const [driftReport, setDriftReport] = React.useState<DriftReport | null>(null);
+  const [detectionStatus, setDetectionStatus] = React.useState<DetectionStatus | null>(null);
+  const [detectionFindings, setDetectionFindings] = React.useState<DetectionFinding[]>([]);
   const t = copy[locale];
 
   const refresh = React.useCallback(async () => {
@@ -327,11 +396,17 @@ export function App() {
     );
     const qualityResponse = await api<{ data: DataQuality }>('/data-quality');
     const mlStatusResponse = await api<{ data: MLStatus }>('/ml/status');
+    const detectionStatusResponse = await api<{ data: DetectionStatus }>('/detection/status');
+    const detectionFindingsResponse = await api<{ data: { findings: DetectionFinding[] } }>(
+      '/detection/findings',
+    );
     setStatus(statusResponse.data);
     setAnomalies(anomalyResponse.anomalies);
     setCapabilities(capabilityResponse.data.collectors);
     setDataQuality(qualityResponse.data);
     setMlStatus(mlStatusResponse.data);
+    setDetectionStatus(detectionStatusResponse.data);
+    setDetectionFindings(detectionFindingsResponse.data.findings);
   }, []);
 
   React.useEffect(() => {
@@ -382,6 +457,8 @@ export function App() {
   const recommended = mlStatus?.models.find((model) => model.lifecycle_status === 'recommended');
   const latestTrainingRun = mlStatus?.training_runs[0];
   const latestScoringRun = mlStatus?.scoring_runs[0];
+  const latestDetectionRun = detectionStatus?.latest_run;
+  const latestWatermark = detectionStatus?.watermarks[0];
   const availableDatasets = dataQuality?.dataset_snapshots[mlDatasetKind] ?? [];
   const effectiveDatasetId = selectedDatasetId || availableDatasets[0]?.dataset_id || '';
   const selectedFamilies = [
@@ -965,6 +1042,151 @@ export function App() {
               <p>Run drift.</p>
             )}
           </article>
+        </div>
+      </section>
+
+      <section className="detectionPanel">
+        <div className="panelTitle">
+          <Bell size={18} />
+          <span>{t.detectionCenter}</span>
+        </div>
+        <div className="pipelineActions">
+          <button
+            onClick={() =>
+              run(
+                'detection',
+                () =>
+                  api('/detection/run-once', {
+                    method: 'POST',
+                    body: JSON.stringify({ dataset_kind: 'synthetic' }),
+                  }),
+              )
+            }
+          >
+            <Play size={17} /> {t.runDetection}
+          </button>
+          <button
+            onClick={() =>
+              run(
+                'detection-worker',
+                () =>
+                  api('/detection/worker/run-foreground', {
+                    method: 'POST',
+                    body: JSON.stringify({ dataset_kind: 'synthetic', max_windows: 256 }),
+                  }),
+              )
+            }
+          >
+            <RefreshCw size={17} /> {t.workerCycle}
+          </button>
+          <button onClick={() => refresh()}>
+            <RefreshCw size={17} /> refresh
+          </button>
+        </div>
+        <div className="detectionGrid">
+          <article>
+            <span>{t.activePolicy}</span>
+            <strong>{detectionStatus?.active_policy.policy_id ?? 'none'}</strong>
+          </article>
+          <article>
+            <span>{t.fusion}</span>
+            <strong>{detectionStatus?.active_policy.fusion_method ?? 'none'}</strong>
+          </article>
+          <article>
+            <span>Mode / threshold</span>
+            <strong>
+              {detectionStatus
+                ? `${detectionStatus.active_policy.mode} / ${detectionStatus.active_policy.finding_threshold}`
+                : 'none'}
+            </strong>
+          </article>
+          <article>
+            <span>{t.worker}</span>
+            <strong>{detectionStatus?.worker?.status ?? 'stopped'}</strong>
+          </article>
+          <article>
+            <span>{t.evaluations}</span>
+            <strong>{detectionStatus?.evaluation_count ?? 0}</strong>
+          </article>
+          <article>
+            <span>{t.findings}</span>
+            <strong>{Object.values(detectionStatus?.finding_counts ?? {}).reduce((a, b) => a + b, 0)}</strong>
+          </article>
+          <article>
+            <span>Latest run</span>
+            <strong>
+              {latestDetectionRun
+                ? `${latestDetectionRun.status} ${latestDetectionRun.finding_count}/${latestDetectionRun.evaluated_count}`
+                : 'none'}
+            </strong>
+          </article>
+          <article>
+            <span>{t.watermark}</span>
+            <strong>{shortValue(latestWatermark?.last_window_start)}</strong>
+          </article>
+        </div>
+        <p className="warning">{t.findingWarning}</p>
+        <div className="table findingTable">
+          {detectionFindings.slice(0, 12).map((finding) => (
+            <div className="row" key={finding.finding_id}>
+              <span>{shortValue(finding.finding_id)}</span>
+              <span className={`risk ${finding.risk_level}`}>{finding.risk_level}</span>
+              <span>{finding.status}</span>
+              <span>{finding.detection_score}</span>
+              <span>{finding.primary_signal_id}</span>
+              <span>{finding.occurrence_count}</span>
+              <button
+                disabled={finding.status !== 'open'}
+                onClick={() =>
+                  run(
+                    'ack',
+                    () =>
+                      api(`/detection/findings/${finding.finding_id}/acknowledge`, {
+                        method: 'POST',
+                        body: JSON.stringify({ reason: 'Detection Center acknowledge' }),
+                      }),
+                  )
+                }
+              >
+                ack
+              </button>
+              <button
+                disabled={!['open', 'acknowledged'].includes(finding.status)}
+                onClick={() =>
+                  run(
+                    'investigate',
+                    () =>
+                      api(`/detection/findings/${finding.finding_id}/investigate`, {
+                        method: 'POST',
+                        body: JSON.stringify({ reason: 'Detection Center investigation' }),
+                      }),
+                  )
+                }
+              >
+                investigate
+              </button>
+              <button
+                disabled={!['open', 'acknowledged', 'investigating'].includes(finding.status)}
+                onClick={() => {
+                  if (window.confirm(`Resolve ${shortValue(finding.finding_id)}?`)) {
+                    run(
+                      'resolve',
+                      () =>
+                        api(`/detection/findings/${finding.finding_id}/resolve`, {
+                          method: 'POST',
+                          body: JSON.stringify({
+                            reason: 'Detection Center resolution',
+                            confirm: true,
+                          }),
+                        }),
+                    );
+                  }
+                }}
+              >
+                resolve
+              </button>
+            </div>
+          ))}
         </div>
       </section>
 
