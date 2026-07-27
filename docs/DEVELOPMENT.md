@@ -23,7 +23,7 @@ uv run sentinelueba collect --duration 60 --interval 5
 uv run sentinelueba collector-status
 ```
 
-Stage 2 data pipeline smoke:
+Stage 3 data and ML pipeline smoke:
 
 ```bash
 uv run sentinelueba generate-demo
@@ -31,7 +31,11 @@ uv run sentinelueba features materialize --dataset synthetic
 uv run sentinelueba datasets create --kind synthetic
 uv run sentinelueba datasets verify <dataset-id>
 uv run sentinelueba data-quality
+uv run sentinelueba ml train --dataset synthetic --families isolation-forest
+uv run sentinelueba ml models list
+uv run sentinelueba ml models verify <model-id>
+uv run sentinelueba ml score --dataset <dataset-id> --model <model-id>
 ```
 
-Generated SQLite databases, Parquet snapshots, manifests, checksums, models, logs, and
-local identity secrets must remain outside Git.
+Generated SQLite databases, Parquet snapshots, manifests, checksums, model bundles, logs,
+and local identity secrets must remain outside Git.

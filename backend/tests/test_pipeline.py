@@ -95,10 +95,9 @@ def test_api_endpoints(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-
     monkeypatch.setenv("SENTINELUEBA_MODEL_DIR", str(tmp_path / "model"))
     client = TestClient(app)
     assert client.get("/health").json()["data"]["ok"] is True
-    assert client.post("/demo/generate", json={"seed": 31}).status_code == 200
-    assert client.post("/model/train", json={"seed": 31}).status_code == 200
+    assert client.post("/demo/generate", json={"seed": 42}).status_code == 200
+    assert client.post("/model/train", json={"seed": 42}).status_code == 200
     assert client.post("/detect").status_code == 200
     anomalies = client.get("/anomalies").json()["anomalies"]
     assert anomalies
     assert client.get("/summary").json()["data"]["anomaly_count"] == len(anomalies)
-

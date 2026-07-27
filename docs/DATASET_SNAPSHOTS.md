@@ -36,6 +36,8 @@ sentinelueba datasets verify <dataset-id>
 Synthetic scenario metadata may appear in the manifest for demo evaluation, but scenario
 labels are never feature columns.
 
-Model training stores the dataset id and manifest SHA-256. Later detection reloads and
-verifies that same snapshot before scoring evaluation rows, so raw SQLite changes after
-training do not silently change the offline detection input.
+Stage 3 model training stores the dataset id and manifest SHA-256 in `training_runs`,
+`model_versions`, and the model bundle manifest. Later detection and offline scoring
+reload and verify a registered snapshot before scoring rows, so raw SQLite changes after
+training do not silently change the model input. Drift reports also require registered
+snapshots and reject incompatible dataset kind, profile, or feature schema.

@@ -15,10 +15,18 @@ features_app = typer.Typer(help="Materialized feature store commands.")
 datasets_app = typer.Typer(help="Immutable dataset snapshot commands.")
 retention_app = typer.Typer(help="Local retention policy commands.")
 quarantine_app = typer.Typer(help="Quarantine inspection commands.")
+ml_app = typer.Typer(help="Stage 3 ML pipeline commands.")
+ml_runs_app = typer.Typer(help="ML training run commands.")
+ml_models_app = typer.Typer(help="ML model registry commands.")
+ml_scoring_app = typer.Typer(help="Offline scoring run commands.")
 app.add_typer(features_app, name="features")
 app.add_typer(datasets_app, name="datasets")
 app.add_typer(retention_app, name="retention")
 app.add_typer(quarantine_app, name="quarantine")
+app.add_typer(ml_app, name="ml")
+ml_app.add_typer(ml_runs_app, name="runs")
+ml_app.add_typer(ml_models_app, name="models")
+ml_app.add_typer(ml_scoring_app, name="scoring-runs")
 
 
 def _pipeline() -> DemoPipeline:
@@ -218,6 +226,175 @@ def retention_apply(confirm: bool = typer.Option(False, "--confirm")) -> None:
 def quarantine_summary() -> None:
     """Summarize quarantined validation failures."""
     _print(_pipeline().quarantine_summary())
+
+
+@ml_app.command("status")
+def ml_status() -> None:
+    """Show model registry, champions, and scoring status."""
+    _print(_pipeline().ml_status())
+
+
+@ml_app.command("train")
+def ml_train(
+    dataset: str = typer.Option("synthetic", "--dataset"),
+    dataset_id: str | None = typer.Option(None, "--dataset-id"),
+    families: str = typer.Option("autoencoder,isolation-forest", "--families"),
+    seed: int = 42,
+    target_fpr: float = typer.Option(0.05, "--target-fpr"),
+) -> None:
+    """Train Stage 3 candidate model families from a registered snapshot."""
+    try:
+        selected = [item.strip() for item in families.split(",") if item.strip()]
+        _print(
+            _pipeline().ml_train(
+                dataset_kind=dataset,
+                dataset_id=dataset_id,
+                families=selected,
+                seed=seed,
+                target_fpr=target_fpr,
+            )
+        )
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+
+
+@ml_runs_app.command("list")
+def ml_runs_list() -> None:
+    """List ML training runs."""
+    _print({"training_runs": _pipeline().ml_training_runs()})
+
+
+@ml_runs_app.command("show")
+def ml_runs_show(training_run_id: str) -> None:
+    """Show one ML training run."""
+    run = _pipeline().ml_training_run(training_run_id)
+    if run is None:
+        typer.echo("training run not found", err=True)
+        raise typer.Exit(code=2)
+    _print(run)
+
+
+@ml_models_app.command("list")
+def ml_models_list() -> None:
+    """List registered model bundles."""
+    _print({"models": _pipeline().ml_models()})
+
+
+@ml_models_app.command("show")
+def ml_models_show(model_id: str) -> None:
+    """Show registered model metadata."""
+    try:
+        _print(_pipeline().ml_model(model_id))
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+
+
+@ml_models_app.command("verify")
+def ml_models_verify(model_id: str) -> None:
+    """Verify immutable model bundle and registry metadata."""
+    try:
+        _print(_pipeline().ml_verify_model(model_id))
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+
+
+@ml_models_app.command("compare")
+def ml_models_compare(model_id: str, other_model_id: str) -> None:
+    """Compare two registered model candidates."""
+    _print(_pipeline().ml_compare_models([model_id, other_model_id]))
+
+
+@ml_models_app.command("promote")
+def ml_models_promote(
+    model_id: str,
+    confirm: bool = typer.Option(False, "--confirm"),
+    reason: str = typer.Option("manual promotion", "--reason"),
+) -> None:
+    """Promote a verified model to champion."""
+    try:
+        _print(_pipeline().ml_promote_model(model_id, confirm=confirm, reason=reason))
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+
+
+@ml_models_app.command("retire")
+def ml_models_retire(
+    model_id: str,
+    confirm: bool = typer.Option(False, "--confirm"),
+    reason: str = typer.Option("manual retirement", "--reason"),
+) -> None:
+    """Retire a registered model without deleting artifacts."""
+    try:
+        _print(_pipeline().ml_retire_model(model_id, confirm=confirm, reason=reason))
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+
+
+@ml_models_app.command("rollback")
+def ml_models_rollback(
+    model_id: str,
+    confirm: bool = typer.Option(False, "--confirm"),
+    reason: str = typer.Option("manual rollback", "--reason"),
+) -> None:
+    """Promote a previously verified retired model back to champion."""
+    try:
+        _print(_pipeline().ml_rollback_model(model_id, confirm=confirm, reason=reason))
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+
+
+@ml_app.command("evaluate")
+def ml_evaluate(model_id: str) -> None:
+    """Show latest evaluation for a registered model."""
+    _print(_pipeline().ml_evaluate_model(model_id))
+
+
+@ml_app.command("score")
+def ml_score(
+    dataset_id: str = typer.Option(..., "--dataset"),
+    model_id: str | None = typer.Option(None, "--model"),
+) -> None:
+    """Run controlled offline scoring against a registered snapshot."""
+    try:
+        _print(_pipeline().ml_score(dataset_id=dataset_id, model_id=model_id))
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+
+
+@ml_scoring_app.command("list")
+def ml_scoring_runs_list() -> None:
+    """List offline scoring runs."""
+    _print({"scoring_runs": _pipeline().ml_scoring_runs()})
+
+
+@ml_scoring_app.command("show")
+def ml_scoring_runs_show(scoring_run_id: str) -> None:
+    """Show one offline scoring run."""
+    run = _pipeline().ml_scoring_run(scoring_run_id)
+    if run is None:
+        typer.echo("scoring run not found", err=True)
+        raise typer.Exit(code=2)
+    _print(run)
+
+
+@ml_app.command("drift")
+def ml_drift(
+    model_id: str = typer.Option(..., "--model"),
+    dataset_id: str = typer.Option(..., "--dataset"),
+) -> None:
+    """Compare a model training snapshot to another registered snapshot."""
+    try:
+        _print(_pipeline().ml_drift(model_id=model_id, dataset_id=dataset_id))
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
 
 
 @app.command("run-api")

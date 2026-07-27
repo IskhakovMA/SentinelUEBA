@@ -23,7 +23,6 @@ from sentinelueba.datasets import snapshots as snapshot_module
 from sentinelueba.domain.events import EventType, TelemetryEvent, deterministic_event_id
 from sentinelueba.features.materialization import FeatureMaterializer
 from sentinelueba.features.windows import align_window_start
-from sentinelueba.ml.autoencoder import model_info
 from sentinelueba.services.pipeline import DemoPipeline
 from sentinelueba.storage.sqlite import SchemaIntegrityError, SQLiteStorage
 from sentinelueba.validation import validate_event
@@ -176,13 +175,13 @@ def test_invalid_payload_for_each_event_type_is_quarantined(
     assert store.quarantine_summary()["count"] == 1
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4, 5])
-def test_historical_schema_migrations_to_v6(tmp_path: Path, version: int) -> None:
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 5, 6])
+def test_historical_schema_migrations_to_v7(tmp_path: Path, version: int) -> None:
     db = tmp_path / f"v{version}.sqlite3"
     create_historical_database(db, version)
     store = SQLiteStorage(db)
     store.initialize()
-    assert store.status()["schema_version"] == 6
+    assert store.status()["schema_version"] == 7
     assert store.status()["event_count"] == 1
     columns = {
         row[1] for row in sqlite3.connect(db).execute("PRAGMA table_info(telemetry_events)")
@@ -196,16 +195,19 @@ def test_historical_schema_migrations_to_v6(tmp_path: Path, version: int) -> Non
         )
     }
     assert "last_observation_id" in state_columns
+    assert "model_versions" in table_names(db)
+    assert "scoring_runs" in table_names(db)
 
 
-def test_fresh_schema_initializes_to_v6(tmp_path: Path) -> None:
+def test_fresh_schema_initializes_to_v7(tmp_path: Path) -> None:
     store = SQLiteStorage(tmp_path / "fresh.sqlite3")
     store.initialize()
-    assert store.status()["schema_version"] == 6
+    assert store.status()["schema_version"] == 7
     assert "collector_observations" in table_names(store.database_path)
+    assert "model_versions" in table_names(store.database_path)
 
 
-def test_repeated_initialize_v6_runs_no_migrations_or_event_updates(
+def test_repeated_initialize_v7_runs_no_migrations_or_event_updates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -220,11 +222,19 @@ def test_repeated_initialize_v6_runs_no_migrations_or_event_updates(
 
     def fail_migration(method_name: str):
         def fail(conn: sqlite3.Connection) -> None:
-            pytest.fail(f"{method_name} should not run for schema v6")
+            pytest.fail(f"{method_name} should not run for schema v7")
 
         return fail
 
-    for name in ["_apply_v1", "_apply_v2", "_apply_v3", "_apply_v4", "_apply_v5", "_apply_v6"]:
+    for name in [
+        "_apply_v1",
+        "_apply_v2",
+        "_apply_v3",
+        "_apply_v4",
+        "_apply_v5",
+        "_apply_v6",
+        "_apply_v7",
+    ]:
         monkeypatch.setattr(store, name, fail_migration(name))
     store.initialize()
 
@@ -235,11 +245,11 @@ def test_repeated_initialize_v6_runs_no_migrations_or_event_updates(
     assert after == before
 
 
-def test_v6_missing_required_table_raises_schema_integrity_error(tmp_path: Path) -> None:
-    store = SQLiteStorage(tmp_path / "corrupt-v6.sqlite3")
+def test_v7_missing_required_table_raises_schema_integrity_error(tmp_path: Path) -> None:
+    store = SQLiteStorage(tmp_path / "corrupt-v7.sqlite3")
     store.initialize()
     with sqlite3.connect(store.database_path) as conn:
-        conn.execute("DROP TABLE collector_observations")
+        conn.execute("DROP TABLE model_versions")
     with pytest.raises(SchemaIntegrityError, match="missing table"):
         store.initialize()
 
@@ -809,7 +819,8 @@ def test_detection_uses_model_dataset_snapshot_not_mutated_sqlite_windows(tmp_pa
     pipe.materialize_features("synthetic")
     detected_after = pipe.detect()
 
-    assert trained["dataset_id"] == model_info(pipe.model_dir("synthetic"))["dataset_id"]
+    model = pipe.ml_model(str(trained["champion_model_id"]))["model"]
+    assert trained["dataset_id"] == model["dataset_id"]
     assert detected_after["windows"] == original_windows
     assert detected_after["evaluation_windows"] == detected_before["evaluation_windows"]
 
@@ -1273,6 +1284,14 @@ def create_historical_database(db: Path, version: int) -> None:
         conn.execute(
             "CREATE INDEX idx_duplicate_events_kind "
             "ON duplicate_event_records(dataset_kind, duplicate_seen_at)"
+        )
+    if version >= 6:
+        conn.execute(
+            "ALTER TABLE feature_materialization_state ADD COLUMN last_observation_id INTEGER"
+        )
+        conn.execute(
+            "CREATE INDEX idx_observations_watermark "
+            "ON collector_observations(observed_at, observation_id)"
         )
     insert_historical_event(conn, version)
     conn.commit()

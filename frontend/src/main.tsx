@@ -1,6 +1,17 @@
 import React, { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Activity, Archive, Database, Languages, Play, Radar, RefreshCw, Shield, Sparkles, Square } from 'lucide-react';
+import {
+  Activity,
+  Archive,
+  Database,
+  Languages,
+  Play,
+  Radar,
+  RefreshCw,
+  Shield,
+  Sparkles,
+  Square,
+} from 'lucide-react';
 import './styles.css';
 
 type Risk = 'low' | 'medium' | 'high' | 'critical';
@@ -23,6 +34,8 @@ type Status = {
     database_path: string;
     quarantine_count?: number;
     feature_window_count?: number;
+    model_count?: number;
+    scoring_run_count?: number;
   };
   model: { trained?: boolean; model_version?: string };
   collection?: CollectionStatus;
@@ -86,9 +99,48 @@ type DataPipelineStatus = {
 type ScenarioValidation = {
   scenario_name: string;
   detected: boolean;
-  match_count: number;
+  match_count?: number;
   best_anomaly_score: number;
-  max_risk_level: string;
+  max_risk_level?: string;
+};
+
+type MLModel = {
+  model_id: string;
+  family: string;
+  lifecycle_status: string;
+  dataset_id: string;
+  dataset_kind: string;
+  threshold: number;
+  created_at: string;
+};
+
+type MLTrainingRun = {
+  training_run_id: string;
+  dataset_id: string;
+  dataset_kind: string;
+  split_id: string;
+  status: string;
+  started_at: string;
+  completed_at?: string | null;
+};
+
+type MLScoringRun = {
+  scoring_run_id: string;
+  model_id: string;
+  dataset_id: string;
+  status: string;
+  window_count: number;
+  anomaly_count: number;
+  started_at: string;
+};
+
+type MLStatus = {
+  schema_version: number;
+  models: MLModel[];
+  champions: MLModel[];
+  training_runs: MLTrainingRun[];
+  scoring_runs: MLScoringRun[];
+  legacy_unregistered: boolean;
 };
 
 const copy = {
@@ -121,6 +173,19 @@ const copy = {
     latestSynthetic: 'Latest synthetic snapshot',
     latestReal: 'Latest real snapshot',
     realDisabled: 'Real snapshot requires 24 usable hours in one profile.',
+    mlLab: 'ML Lab',
+    trainCandidates: 'Train candidates',
+    verifyChampion: 'Verify champion',
+    scoreChampion: 'Score champion',
+    drift: 'Drift report',
+    champion: 'Champion',
+    recommended: 'Recommended',
+    latestRun: 'Latest training run',
+    latestScore: 'Latest scoring run',
+    registry: 'SQLite registry',
+    modelBundles: 'Model bundles',
+    scoringRuns: 'Scoring runs',
+    mlWarning: 'Offline model scoring only. An anomaly is not proof of malicious activity.',
   },
   ru: {
     title: 'SentinelUEBA',
@@ -151,6 +216,19 @@ const copy = {
     latestSynthetic: 'Последний synthetic snapshot',
     latestReal: 'Последний real snapshot',
     realDisabled: 'Real snapshot требует 24 полезных часа в одном профиле.',
+    mlLab: 'ML Lab',
+    trainCandidates: 'Обучить кандидатов',
+    verifyChampion: 'Проверить champion',
+    scoreChampion: 'Score champion',
+    drift: 'Drift report',
+    champion: 'Champion',
+    recommended: 'Recommended',
+    latestRun: 'Последний training run',
+    latestScore: 'Последний scoring run',
+    registry: 'SQLite registry',
+    modelBundles: 'Model bundles',
+    scoringRuns: 'Scoring runs',
+    mlWarning: 'Только offline scoring. Аномалия не является доказательством атаки.',
   },
 };
 
@@ -173,17 +251,22 @@ export function App() {
   const [capabilities, setCapabilities] = React.useState<CollectorCapability[]>([]);
   const [scenarioValidation, setScenarioValidation] = React.useState<ScenarioValidation[]>([]);
   const [dataQuality, setDataQuality] = React.useState<DataQuality | null>(null);
+  const [mlStatus, setMlStatus] = React.useState<MLStatus | null>(null);
   const t = copy[locale];
 
   const refresh = React.useCallback(async () => {
     const statusResponse = await api<{ data: Status }>('/status');
     const anomalyResponse = await api<{ anomalies: Anomaly[] }>('/anomalies');
-    const capabilityResponse = await api<{ data: { collectors: CollectorCapability[] } }>('/collectors/capabilities');
+    const capabilityResponse = await api<{ data: { collectors: CollectorCapability[] } }>(
+      '/collectors/capabilities',
+    );
     const qualityResponse = await api<{ data: DataQuality }>('/data-quality');
+    const mlStatusResponse = await api<{ data: MLStatus }>('/ml/status');
     setStatus(statusResponse.data);
     setAnomalies(anomalyResponse.anomalies);
     setCapabilities(capabilityResponse.data.collectors);
     setDataQuality(qualityResponse.data);
+    setMlStatus(mlStatusResponse.data);
   }, []);
 
   React.useEffect(() => {
@@ -209,6 +292,10 @@ export function App() {
   const selectedAnomaly = anomalies[selected];
   const scores = anomalies.slice(0, 24).reverse();
   const maxScore = Math.max(...scores.map((item) => item.anomaly_score), 1);
+  const champion = mlStatus?.champions[0];
+  const recommended = mlStatus?.models.find((model) => model.lifecycle_status === 'recommended');
+  const latestTrainingRun = mlStatus?.training_runs[0];
+  const latestScoringRun = mlStatus?.scoring_runs[0];
 
   return (
     <main>
@@ -348,6 +435,121 @@ export function App() {
         </div>
       </section>
 
+      <section className="mlPanel">
+        <div className="panelTitle">
+          <Sparkles size={18} />
+          <span>{t.mlLab}</span>
+        </div>
+        <div className="pipelineActions">
+          <button
+            onClick={() =>
+              run(
+                'ml-train',
+                () =>
+                  api('/ml/train', {
+                    method: 'POST',
+                    body: JSON.stringify({ dataset_kind: 'synthetic', seed: 42 }),
+                  }),
+              )
+            }
+          >
+            <Sparkles size={17} /> {t.trainCandidates}
+          </button>
+          <button
+            disabled={!champion}
+            onClick={() =>
+              champion
+                ? run(
+                    'ml-verify',
+                    () => api(`/ml/models/${champion.model_id}/verify`, { method: 'POST' }),
+                  )
+                : undefined
+            }
+          >
+            <Shield size={17} /> {t.verifyChampion}
+          </button>
+          <button
+            disabled={!champion}
+            onClick={() =>
+              champion
+                ? run(
+                    'ml-score',
+                    () =>
+                      api('/ml/score', {
+                        method: 'POST',
+                        body: JSON.stringify({
+                          dataset_id: champion.dataset_id,
+                          model_id: champion.model_id,
+                        }),
+                      }),
+                  )
+                : undefined
+            }
+          >
+            <Play size={17} /> {t.scoreChampion}
+          </button>
+          <button
+            disabled={!champion}
+            onClick={() =>
+              champion
+                ? run(
+                    'ml-drift',
+                    () =>
+                      api('/ml/drift', {
+                        method: 'POST',
+                        body: JSON.stringify({
+                          dataset_id: champion.dataset_id,
+                          model_id: champion.model_id,
+                        }),
+                      }),
+                  )
+                : undefined
+            }
+          >
+            <Activity size={17} /> {t.drift}
+          </button>
+        </div>
+        <div className="mlGrid">
+          <article>
+            <span>{t.registry}</span>
+            <strong>v{mlStatus?.schema_version ?? 0}</strong>
+          </article>
+          <article>
+            <span>{t.modelBundles}</span>
+            <strong>{status?.storage.model_count ?? mlStatus?.models.length ?? 0}</strong>
+          </article>
+          <article>
+            <span>{t.scoringRuns}</span>
+            <strong>{status?.storage.scoring_run_count ?? mlStatus?.scoring_runs.length ?? 0}</strong>
+          </article>
+          <article>
+            <span>{t.champion}</span>
+            <strong>{shortValue(champion?.model_id)}</strong>
+          </article>
+          <article>
+            <span>{t.recommended}</span>
+            <strong>{shortValue(recommended?.model_id)}</strong>
+          </article>
+          <article>
+            <span>{t.latestRun}</span>
+            <strong>
+              {latestTrainingRun
+                ? `${latestTrainingRun.status} ${shortValue(latestTrainingRun.training_run_id)}`
+                : 'none'}
+            </strong>
+          </article>
+          <article>
+            <span>{t.latestScore}</span>
+            <strong>{latestScoringRun ? `${latestScoringRun.anomaly_count}/${latestScoringRun.window_count}` : 'none'}</strong>
+          </article>
+          <article>
+            <span>Threshold</span>
+            <strong>{champion ? champion.threshold.toFixed(4) : 'none'}</strong>
+          </article>
+        </div>
+        <p className="warning">{t.mlWarning}</p>
+      </section>
+
       <section className="grid">
         <div className="panel chartPanel">
           <div className="panelTitle">
@@ -407,7 +609,7 @@ export function App() {
               <article key={scenario.scenario_name}>
                 <strong>{scenario.scenario_name}</strong>
                 <span>{scenario.detected ? 'detected' : 'missed'}</span>
-                <span>{scenario.max_risk_level}</span>
+                <span>{scenario.max_risk_level ?? 'offline'}</span>
                 <span>{scenario.best_anomaly_score.toFixed(4)}</span>
               </article>
             ))}

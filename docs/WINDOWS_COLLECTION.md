@@ -36,6 +36,10 @@ Process and network collectors use polling. Polling can miss very short-lived pr
 
 Synthetic demo scenarios are validated after inference by matching the anomaly windows against a separate manifest. The manifest is not passed into model training, feature engineering, or anomaly scoring.
 
+Stage 3 keeps the same boundary: scenario windows are used only for held-out synthetic
+evaluation and recommendation after scoring. They are never training features or
+calibration inputs.
+
 ## Manual Windows Check
 
 ```powershell
