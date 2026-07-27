@@ -314,8 +314,13 @@ def _parse_time(value: str) -> datetime:
 
 
 def _close_evt_handle(evt: Any, handle: object) -> None:
-    close = evt.EvtClose
-    close(handle)
+    close = getattr(evt, "EvtClose", None)
+    if callable(close):
+        close(handle)
+        return
+    handle_close = getattr(handle, "Close", None)
+    if callable(handle_close):
+        handle_close()
 
 
 def _evt_module() -> Any:
