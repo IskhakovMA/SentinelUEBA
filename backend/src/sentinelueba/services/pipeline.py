@@ -589,12 +589,13 @@ class DemoPipeline:
         self.storage.initialize()
         return self.detection().revoke_suppression(suppression_id, confirm=confirm)
 
-    def detection_worker_status(self) -> dict[str, object]:
+    def detection_worker_status(self, *, dataset_kind: str = "synthetic") -> dict[str, object]:
         self.storage.initialize()
         return get_detection_worker_manager().status(
             database_path=self.settings.database_path,
             data_dir=self.settings.data_dir,
             model_dir=self.settings.model_dir,
+            dataset_kind=dataset_kind,
         )
 
     def detection_worker_start(
@@ -602,6 +603,7 @@ class DemoPipeline:
         *,
         dataset_kind: str = "synthetic",
         interval_seconds: int = 60,
+        max_windows: int | None = 256,
     ) -> dict[str, object]:
         self.storage.initialize()
         return get_detection_worker_manager().start(
@@ -610,15 +612,21 @@ class DemoPipeline:
             model_dir=self.settings.model_dir,
             dataset_kind=dataset_kind,
             interval_seconds=interval_seconds,
+            max_windows=max_windows,
         )
 
-    def detection_worker_stop(self, *, confirm: bool = False) -> dict[str, object]:
+    def detection_worker_stop(
+        self,
+        *,
+        dataset_kind: str = "synthetic",
+        confirm: bool = False,
+    ) -> dict[str, object]:
         self.storage.initialize()
         return get_detection_worker_manager().stop(
             database_path=self.settings.database_path,
             data_dir=self.settings.data_dir,
             model_dir=self.settings.model_dir,
-            dataset_kind=None,
+            dataset_kind=dataset_kind,
             confirm=confirm,
         )
 

@@ -766,9 +766,9 @@ def detection_suppressions_revoke(
 
 
 @detection_worker_app.command("status")
-def detection_worker_status() -> None:
+def detection_worker_status(dataset: str = typer.Option("synthetic", "--dataset")) -> None:
     """Show local detection worker lease state."""
-    _print(_pipeline().detection_worker_status())
+    _print(_pipeline().detection_worker_status(dataset_kind=dataset))
 
 
 @detection_worker_app.command("start")
@@ -788,13 +788,16 @@ def detection_worker_start(
             )
         )
     except KeyboardInterrupt:
-        _print(_pipeline().detection_worker_stop(confirm=True))
+        _print(_pipeline().detection_worker_stop(dataset_kind=dataset, confirm=True))
 
 
 @detection_worker_app.command("stop")
-def detection_worker_stop(confirm: bool = typer.Option(False, "--confirm")) -> None:
+def detection_worker_stop(
+    dataset: str = typer.Option("synthetic", "--dataset"),
+    confirm: bool = typer.Option(False, "--confirm"),
+) -> None:
     """Request local detection worker stop."""
-    _print(_pipeline().detection_worker_stop(confirm=confirm))
+    _print(_pipeline().detection_worker_stop(dataset_kind=dataset, confirm=confirm))
 
 
 @detection_worker_app.command("run-foreground")
@@ -815,7 +818,7 @@ def detection_worker_run_foreground(
             )
         )
     except KeyboardInterrupt:
-        _print(_pipeline().detection_worker_stop(confirm=True))
+        _print(_pipeline().detection_worker_stop(dataset_kind=dataset, confirm=True))
     except ValueError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=2) from exc

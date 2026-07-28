@@ -100,7 +100,7 @@ class DetectionService:
                     (policy.policy_hash,),
                 ).fetchone()
                 if row is not None:
-                    load_policy(dict(row))
+                    self._load_registered_policy(row)
                     continue
                 payload = policy_storage_payload(policy)
                 conn.execute(
@@ -132,7 +132,7 @@ class DetectionService:
             active = conn.execute(
                 "SELECT * FROM detection_policies WHERE active = 1 ORDER BY created_at DESC LIMIT 1"
             ).fetchone()
-        return load_policy(dict(active))
+        return self._load_registered_policy(active)
 
     def policies_list(self) -> list[dict[str, Any]]:
         self.ensure_default_policy()
@@ -326,6 +326,16 @@ class DetectionService:
             error_class = exc.__class__.__name__
             if not dry_run:
                 self._block_run(run_id, reason=safe_error, error_class=error_class)
+            else:
+                blocked = self._empty_dry_run_summary(
+                    policy,
+                    dataset_kind,
+                    model_record,
+                )
+                blocked["status"] = "blocked"
+                blocked["safe_error"] = safe_error
+                blocked["error_class"] = error_class
+                return blocked
             return self._run_result(run_id, policy, dataset_kind, model_record, dry_run)
         model_identity = str(model_record["model_id"]) if model_record else MODEL_ID_SENTINEL
         processed = 0
@@ -415,7 +425,7 @@ class DetectionService:
             ).fetchone()
         if row is None:
             raise DetectionEngineError("effective detection policy is not registered")
-        return load_policy(dict(row))
+        return self._load_registered_policy(row)
 
     def _model_hint(
         self,
@@ -1044,13 +1054,26 @@ class DetectionService:
             )
         return {"suppression_id": suppression_id, "revoked": True}
 
-    def worker_status(self) -> dict[str, Any]:
+    def worker_status(
+        self,
+        *,
+        dataset_kind: str = "synthetic",
+        profile: str | None = None,
+    ) -> dict[str, Any]:
+        worker_key = self._worker_key(dataset_kind, profile)
         with self.storage.connect() as conn:
             row = conn.execute(
-                "SELECT * FROM detection_worker_leases ORDER BY heartbeat_at DESC LIMIT 1"
+                "SELECT * FROM detection_worker_leases WHERE worker_key = ? LIMIT 1",
+                (worker_key,),
             ).fetchone()
         if row is None:
-            return {"status": "stopped"}
+            return {
+                "worker_key": worker_key,
+                "dataset_kind": dataset_kind,
+                "profile_label": f"profile-{profile[:8]}" if profile else None,
+                "status": "stopped",
+                "process_running": False,
+            }
         return self._public_worker_row(dict(row))
 
     def worker_start(
@@ -1067,7 +1090,7 @@ class DetectionService:
             profile=profile,
             lease_seconds=lease_seconds,
         )
-        return self.worker_status()
+        return self.worker_status(dataset_kind=dataset_kind, profile=profile)
 
     def _acquire_worker_lease(
         self,
@@ -1156,20 +1179,27 @@ class DetectionService:
             ).fetchone()
         return dict(row)
 
-    def worker_stop(self, *, confirm: bool = False) -> dict[str, Any]:
+    def worker_stop(
+        self,
+        *,
+        dataset_kind: str = "synthetic",
+        profile: str | None = None,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
         if not confirm:
             raise DetectionEngineError("worker stop requires confirm=true")
+        worker_key = self._worker_key(dataset_kind, profile)
         with self.storage.connect() as conn:
             conn.execute(
                 """
                 UPDATE detection_worker_leases
                 SET status = 'stopping', stop_requested = 1, heartbeat_at = ?,
                     safe_error = NULL
-                WHERE status IN ('running', 'idle')
+                WHERE worker_key = ? AND status IN ('running', 'idle')
                 """,
-                (datetime.now(UTC).isoformat(),),
+                (datetime.now(UTC).isoformat(), worker_key),
             )
-        return self.worker_status()
+        return self.worker_status(dataset_kind=dataset_kind, profile=profile)
 
     def worker_run_foreground(
         self,
@@ -1180,9 +1210,10 @@ class DetectionService:
         single_cycle: bool = False,
         stop_event: threading.Event | None = None,
         owner_id: str | None = None,
+        lease: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         stop_event = stop_event or threading.Event()
-        lease = self._acquire_worker_lease(
+        lease = lease or self._acquire_worker_lease(
             dataset_kind=dataset_kind,
             interval_seconds=interval_seconds,
             profile=None,
@@ -1191,11 +1222,29 @@ class DetectionService:
         )
         worker_id = str(lease["worker_id"])
         owner_id = str(lease["owner_id"])
+        worker_key = str(lease["worker_key"])
         runs = []
         result: dict[str, Any] = {}
         safe_error: str | None = None
         failed = False
         backoff_seconds = 1.0
+        heartbeat_stop = threading.Event()
+        ownership_lost = threading.Event()
+        heartbeat = threading.Thread(
+            target=self._worker_heartbeat_loop,
+            kwargs={
+                "worker_id": worker_id,
+                "owner_id": owner_id,
+                "worker_key": worker_key,
+                "interval_seconds": interval_seconds,
+                "status": "running",
+                "stop_event": heartbeat_stop,
+                "ownership_lost": ownership_lost,
+            },
+            daemon=True,
+            name=f"sentinelueba-detection-heartbeat-{worker_key}",
+        )
+        heartbeat.start()
         try:
             while not stop_event.is_set():
                 try:
@@ -1214,11 +1263,16 @@ class DetectionService:
                 self._worker_heartbeat(
                     worker_id=worker_id,
                     owner_id=owner_id,
+                    worker_key=worker_key,
                     interval_seconds=interval_seconds,
                     status="idle",
                     safe_error=safe_error,
                 )
-                if self._worker_stop_requested(worker_id, owner_id) or single_cycle:
+                if (
+                    ownership_lost.is_set()
+                    or self._worker_stop_requested(worker_id, owner_id)
+                    or single_cycle
+                ):
                     break
                 wait_seconds = (
                     min(backoff_seconds, float(interval_seconds))
@@ -1230,30 +1284,38 @@ class DetectionService:
                 if failed:
                     backoff_seconds = min(backoff_seconds * 2.0, float(interval_seconds))
         finally:
+            heartbeat_stop.set()
+            heartbeat.join(timeout=max(2.0, min(10.0, float(interval_seconds))))
             self._release_worker_lease(
                 worker_id=worker_id,
                 owner_id=owner_id,
+                worker_key=worker_key,
                 status="failed" if safe_error is not None else "stopped",
                 safe_error=safe_error,
             )
-        return {"worker": self.worker_status(), "run": result, "runs": runs}
+        return {
+            "worker": self.worker_status(dataset_kind=dataset_kind),
+            "run": result,
+            "runs": runs,
+        }
 
     def _worker_heartbeat(
         self,
         *,
         worker_id: str,
         owner_id: str,
+        worker_key: str,
         interval_seconds: int,
         status: str,
         safe_error: str | None,
-    ) -> None:
+    ) -> bool:
         now_dt = datetime.now(UTC)
         with self.storage.connect() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """
                 UPDATE detection_worker_leases
                 SET heartbeat_at = ?, status = ?, expires_at = ?, safe_error = ?
-                WHERE worker_id = ? AND owner_id = ?
+                WHERE worker_id = ? AND owner_id = ? AND worker_key = ?
                 """,
                 (
                     now_dt.isoformat(),
@@ -1262,8 +1324,34 @@ class DetectionService:
                     safe_error,
                     worker_id,
                     owner_id,
+                    worker_key,
                 ),
             )
+        return cursor.rowcount == 1
+
+    def _worker_heartbeat_loop(
+        self,
+        *,
+        worker_id: str,
+        owner_id: str,
+        worker_key: str,
+        interval_seconds: int,
+        status: str,
+        stop_event: threading.Event,
+        ownership_lost: threading.Event,
+    ) -> None:
+        heartbeat_seconds = max(1.0, min(5.0, float(max(interval_seconds * 2, 30)) / 4.0))
+        while not stop_event.wait(heartbeat_seconds):
+            if not self._worker_heartbeat(
+                worker_id=worker_id,
+                owner_id=owner_id,
+                worker_key=worker_key,
+                interval_seconds=interval_seconds,
+                status=status,
+                safe_error=None,
+            ):
+                ownership_lost.set()
+                return
 
     def _worker_stop_requested(self, worker_id: str, owner_id: str) -> bool:
         with self.storage.connect() as conn:
@@ -1282,6 +1370,7 @@ class DetectionService:
         *,
         worker_id: str,
         owner_id: str,
+        worker_key: str,
         status: str,
         safe_error: str | None,
     ) -> None:
@@ -1292,9 +1381,9 @@ class DetectionService:
                 UPDATE detection_worker_leases
                 SET heartbeat_at = ?, status = ?, stop_requested = 0,
                     expires_at = ?, safe_error = ?
-                WHERE worker_id = ? AND owner_id = ?
+                WHERE worker_id = ? AND owner_id = ? AND worker_key = ?
                 """,
-                (now, status, now, safe_error, worker_id, owner_id),
+                (now, status, now, safe_error, worker_id, owner_id, worker_key),
             )
 
     def _public_worker_row(self, row: dict[str, Any]) -> dict[str, Any]:
@@ -1320,29 +1409,6 @@ class DetectionService:
 
     def _worker_key(self, dataset_kind: str, profile: str | None) -> str:
         return "|".join(["stage4", dataset_kind, profile or "*"])
-
-    def _candidate_windows(
-        self,
-        *,
-        dataset_kind: str,
-        profile: str | None,
-        start: datetime | None,
-        end: datetime | None,
-        max_windows: int | None,
-    ) -> list[dict[str, Any]]:
-        windows = self.storage.list_feature_windows(
-            dataset_kind=dataset_kind,
-            start=start,
-            end=end,
-            limit=None,
-        )
-        filtered = [
-            window
-            for window in windows
-            if profile is None
-            or self._profile_key_for_window(window) == profile
-        ]
-        return filtered[:max_windows] if max_windows is not None else filtered
 
     def _resolve_model(
         self,
@@ -1706,254 +1772,6 @@ class DetectionService:
         )
         return result.model_dump(mode="json")
 
-    def _complete_run(
-        self,
-        run_id: str,
-        *,
-        status: str,
-        completed_at: str,
-        evaluated: int,
-        skipped: int,
-        findings: int,
-        noop: int,
-        safe_error: str | None,
-    ) -> None:
-        with self.storage.connect() as conn:
-            conn.execute(
-                """
-                UPDATE detection_runs
-                SET status = ?, completed_at = ?, window_count = ?,
-                    evaluated_count = ?, skipped_count = ?, finding_count = ?,
-                    no_op_count = ?, safe_error = ?
-                WHERE detection_run_id = ?
-                """,
-                (
-                    status,
-                    completed_at,
-                    evaluated + skipped + noop,
-                    evaluated,
-                    skipped,
-                    findings,
-                    noop,
-                    safe_error,
-                    run_id,
-                ),
-            )
-
-    def _persist_evaluation(
-        self,
-        run_id: str,
-        detection_input: DetectionInput,
-        policy: DetectionPolicy,
-        model_record: dict[str, Any] | None,
-        decision: DetectionDecision,
-        signals: list[DetectionSignal],
-        *,
-        status: str,
-        skipped_reason: str | None = None,
-    ) -> None:
-        evaluation_id = f"eval-{uuid4().hex}"
-        finding_id = None
-        now = datetime.now(UTC).isoformat()
-        if decision.finding:
-            finding_id = self._upsert_finding(
-                detection_input,
-                policy,
-                model_record,
-                decision,
-                signals,
-                evaluation_id,
-                now,
-            )
-        with self.storage.connect() as conn:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO detection_evaluations (
-                    evaluation_id, detection_run_id, window_id, dataset_kind, profile_key,
-                    window_start, window_end, feature_schema_version, feature_input_hash,
-                    policy_id, policy_version, policy_hash, model_id, model_version,
-                    model_hash, mode, status, detection_score, risk_level,
-                    matched_signal_ids_json, decision_json, finding_id, created_at,
-                    skipped_reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    evaluation_id,
-                    run_id,
-                    detection_input.window_id,
-                    detection_input.dataset_kind,
-                    detection_input.profile_key,
-                    detection_input.window_start.isoformat(),
-                    detection_input.window_end.isoformat(),
-                    detection_input.feature_schema_version,
-                    detection_input.feature_input_hash,
-                    policy.policy_id,
-                    policy.policy_version,
-                    policy.policy_hash,
-                    model_record["model_id"] if model_record else MODEL_ID_SENTINEL,
-                    model_record["model_version"] if model_record else None,
-                    model_record["model_artifact_sha256"] if model_record else None,
-                    policy.mode,
-                    status,
-                    decision.detection_score,
-                    decision.risk_level,
-                    json.dumps(decision.matched_signal_ids, sort_keys=True),
-                    json.dumps(
-                        {
-                            "decision": decision.model_dump(mode="json"),
-                            "signals": [signal.model_dump(mode="json") for signal in signals],
-                        },
-                        sort_keys=True,
-                    ),
-                    finding_id,
-                    now,
-                    skipped_reason,
-                ),
-            )
-
-    def _upsert_finding(
-        self,
-        detection_input: DetectionInput,
-        policy: DetectionPolicy,
-        model_record: dict[str, Any] | None,
-        decision: DetectionDecision,
-        signals: list[DetectionSignal],
-        evaluation_id: str,
-        now: str,
-    ) -> str:
-        fingerprint = self._fingerprint(detection_input, decision)
-        occurrence_id = f"occ-{uuid4().hex}"
-        title = f"{decision.risk_level} Stage 4 finding"
-        summary = decision.explanation[:500]
-        with self.storage.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            reuse_after = (detection_input.window_start - timedelta(minutes=60)).isoformat()
-            row = conn.execute(
-                """
-                SELECT * FROM findings
-                WHERE fingerprint = ?
-                    AND status IN ('open', 'acknowledged', 'investigating', 'suppressed')
-                    AND last_seen_at >= ?
-                ORDER BY last_seen_at DESC
-                LIMIT 1
-                """,
-                (fingerprint, reuse_after),
-            ).fetchone()
-            if row is None:
-                finding_id = f"find-{uuid4().hex}"
-                conn.execute(
-                    """
-                    INSERT INTO findings (
-                        finding_id, fingerprint, dataset_kind, profile_key, policy_id,
-                        policy_version, policy_hash, model_id, model_version, model_hash,
-                        status, risk_level, detection_score, primary_signal_id, title,
-                        summary, first_seen_at, last_seen_at, occurrence_count, created_at,
-                        updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
-                    """,
-                    (
-                        finding_id,
-                        fingerprint,
-                        detection_input.dataset_kind,
-                        detection_input.profile_key,
-                        policy.policy_id,
-                        policy.policy_version,
-                        policy.policy_hash,
-                        model_record["model_id"] if model_record else None,
-                        model_record["model_version"] if model_record else None,
-                        model_record["model_artifact_sha256"] if model_record else None,
-                        decision.risk_level,
-                        decision.detection_score,
-                        decision.primary_signal_id or "none",
-                        title,
-                        summary,
-                        detection_input.window_start.isoformat(),
-                        detection_input.window_start.isoformat(),
-                        now,
-                        now,
-                    ),
-                )
-                conn.execute(
-                    """
-                    INSERT INTO finding_state_history (
-                        history_id, finding_id, from_status, to_status, reason, created_at
-                    ) VALUES (?, ?, NULL, 'open', ?, ?)
-                    """,
-                    (
-                        f"hist-{uuid4().hex}",
-                        finding_id,
-                        "created by detection engine",
-                        now,
-                    ),
-                )
-            else:
-                finding_id = str(row["finding_id"])
-                conn.execute(
-                    """
-                    UPDATE findings
-                    SET last_seen_at = ?, occurrence_count = occurrence_count + 1,
-                        risk_level = CASE WHEN detection_score < ? THEN ? ELSE risk_level END,
-                        detection_score = MAX(detection_score, ?),
-                        updated_at = ?
-                    WHERE finding_id = ?
-                    """,
-                    (
-                        detection_input.window_start.isoformat(),
-                        decision.detection_score,
-                        decision.risk_level,
-                        decision.detection_score,
-                        now,
-                        finding_id,
-                    ),
-                )
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO finding_occurrences (
-                    occurrence_id, finding_id, evaluation_id, window_id, window_start,
-                    window_end, detection_score, risk_level, signals_json, evidence_json,
-                    created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    occurrence_id,
-                    finding_id,
-                    evaluation_id,
-                    detection_input.window_id,
-                    detection_input.window_start.isoformat(),
-                    detection_input.window_end.isoformat(),
-                    decision.detection_score,
-                    decision.risk_level,
-                    json.dumps(decision.matched_signal_ids, sort_keys=True),
-                    json.dumps(
-                        [signal.model_dump(mode="json") for signal in signals],
-                        sort_keys=True,
-                    ),
-                    now,
-                ),
-            )
-        return finding_id
-
-    def _evaluation_exists(
-        self,
-        window_id: str,
-        feature_input_hash: str,
-        policy_hash: str,
-        model_id: str,
-    ) -> bool:
-        with self.storage.connect() as conn:
-            row = conn.execute(
-                """
-                SELECT evaluation_id FROM detection_evaluations
-                WHERE window_id = ?
-                    AND feature_input_hash = ?
-                    AND policy_hash = ?
-                    AND model_id = ?
-                LIMIT 1
-                """,
-                (window_id, feature_input_hash, policy_hash, model_id),
-            ).fetchone()
-        return row is not None
-
     def _is_suppressed(
         self,
         detection_input: DetectionInput,
@@ -2212,12 +2030,18 @@ class DetectionService:
             return
 
     def _policy_row(self, row: Any) -> dict[str, Any]:
-        verified = load_policy(dict(row))
+        verified = self._load_registered_policy(row)
         payload = dict(row)
         payload["policy"] = verified.model_dump(mode="json")
         payload.pop("policy_json")
         payload["active"] = bool(payload["active"])
         return payload
+
+    def _load_registered_policy(self, row: Any) -> DetectionPolicy:
+        try:
+            return load_policy(dict(row))
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            raise DetectionEngineError("detection policy registry integrity check failed") from exc
 
     def _policy_from_public(self, payload: dict[str, Any]) -> DetectionPolicy:
         policy = dict(payload["policy"])

@@ -147,6 +147,7 @@ class SuppressionCreateRequest(BaseModel):
 class DetectionWorkerStartRequest(BaseModel):
     dataset_kind: str = Field(default="synthetic", pattern="^(synthetic|real)$")
     interval_seconds: int = Field(default=60, ge=5, le=3600)
+    max_windows: int | None = Field(default=256, ge=1, le=10_000)
 
 
 class DetectionWorkerRunRequest(BaseModel):
@@ -157,6 +158,11 @@ class DetectionWorkerRunRequest(BaseModel):
 
 
 class ConfirmRequest(BaseModel):
+    confirm: bool = False
+
+
+class DetectionWorkerStopRequest(BaseModel):
+    dataset_kind: str = Field(default="synthetic", pattern="^(synthetic|real)$")
     confirm: bool = False
 
 

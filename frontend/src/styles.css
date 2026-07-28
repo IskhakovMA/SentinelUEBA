@@ -146,6 +146,20 @@ button:hover {
   margin-bottom: 14px;
 }
 
+.detectionControls {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.8fr) minmax(220px, 1.6fr) repeat(2, minmax(180px, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.detectionFilters {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(150px, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
 .mlControls {
   display: grid;
   grid-template-columns: repeat(7, minmax(0, 1fr));
@@ -153,7 +167,9 @@ button:hover {
   margin-bottom: 14px;
 }
 
-.mlControls label {
+.mlControls label,
+.detectionControls label,
+.detectionFilters label {
   color: #aeb8c2;
   display: grid;
   gap: 5px;
@@ -161,7 +177,11 @@ button:hover {
 }
 
 .mlControls select,
-.mlControls input {
+.mlControls input,
+.detectionControls select,
+.detectionControls input,
+.detectionFilters select,
+.detectionFilters input {
   border: 1px solid #34414d;
   background: #101820;
   color: #f1f5f9;
@@ -214,7 +234,7 @@ button:hover {
 .findingTable .row {
   grid-template-columns:
     minmax(130px, 1.2fr) 88px 112px 72px minmax(140px, 1fr) 72px
-    repeat(3, minmax(86px, 0.8fr));
+    repeat(6, minmax(86px, 0.8fr));
 }
 
 .mlTables {
@@ -242,7 +262,7 @@ button:hover {
 
 .detailGrid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
   gap: 12px;
   margin-top: 14px;
 }
@@ -266,6 +286,13 @@ button:hover {
 
 .detailList span {
   overflow-wrap: anywhere;
+}
+
+.detailList button {
+  justify-content: center;
+  min-height: 30px;
+  padding: 5px 8px;
+  width: fit-content;
 }
 
 .collectorGrid {

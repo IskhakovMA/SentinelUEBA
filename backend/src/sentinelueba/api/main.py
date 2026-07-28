@@ -19,6 +19,7 @@ from sentinelueba.api.schemas import (
     DetectionRunRequest,
     DetectionWorkerRunRequest,
     DetectionWorkerStartRequest,
+    DetectionWorkerStopRequest,
     FindingTransitionRequest,
     MLCompareRequest,
     MLConfirmRequest,
@@ -32,7 +33,10 @@ from sentinelueba.api.schemas import (
     TrainingEligibilityRequest,
 )
 from sentinelueba.config import get_settings
-from sentinelueba.detection.worker_manager import get_detection_worker_manager
+from sentinelueba.detection.worker_manager import (
+    DetectionWorkerAlreadyRunningError,
+    get_detection_worker_manager,
+)
 from sentinelueba.services.pipeline import DemoPipeline
 
 
@@ -500,29 +504,48 @@ async def detection_suppression_revoke(
 
 
 @app.get("/detection/worker/status", response_model=ApiResponse)
-async def detection_worker_status() -> ApiResponse:
-    return ApiResponse(data=pipeline().detection_worker_status())
+async def detection_worker_status(dataset_kind: str = "synthetic") -> ApiResponse:
+    if dataset_kind not in {"synthetic", "real"}:
+        raise HTTPException(status_code=400, detail="dataset_kind must be synthetic or real")
+    return ApiResponse(data=pipeline().detection_worker_status(dataset_kind=dataset_kind))
 
 
 @app.post("/detection/worker/start", response_model=ApiResponse)
 async def detection_worker_start(request: DetectionWorkerStartRequest) -> ApiResponse:
-    return ApiResponse(
-        data=await run_blocking(
-            pipeline().detection_worker_start,
-            dataset_kind=request.dataset_kind,
-            interval_seconds=request.interval_seconds,
+    try:
+        return ApiResponse(
+            data=await run_blocking(
+                pipeline().detection_worker_start,
+                dataset_kind=request.dataset_kind,
+                interval_seconds=request.interval_seconds,
+                max_windows=request.max_windows,
+            )
         )
-    )
+    except DetectionWorkerAlreadyRunningError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = 409 if "active detection worker lease" in detail else 400
+        raise HTTPException(status_code=status_code, detail=detail) from exc
 
 
 @app.post("/detection/worker/stop", response_model=ApiResponse)
-async def detection_worker_stop(request: ConfirmRequest | None = None) -> ApiResponse:
-    return ApiResponse(
-        data=await run_blocking(
-            pipeline().detection_worker_stop,
-            confirm=request.confirm if request is not None else False,
+async def detection_worker_stop(request: DetectionWorkerStopRequest | None = None) -> ApiResponse:
+    request = request or DetectionWorkerStopRequest()
+    try:
+        return ApiResponse(
+            data=await run_blocking(
+                pipeline().detection_worker_stop,
+                dataset_kind=request.dataset_kind,
+                confirm=request.confirm,
+            )
         )
-    )
+    except TimeoutError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = 400 if "confirm=true" in detail else 409
+        raise HTTPException(status_code=status_code, detail=detail) from exc
 
 
 @app.post("/detection/worker/run-foreground", response_model=ApiResponse)
