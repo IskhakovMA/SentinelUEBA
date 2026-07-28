@@ -44,6 +44,13 @@ Synthetic local demo pipeline, PyTorch autoencoder, FastAPI, React, tests, CI, a
 - Runtime roots outside the installation directory for desktop and optional Windows Service mode.
 - Build manifest, SHA-256 installation verification, optional SignTool integration, and package smoke CI.
 
+## Stage 6
+
+- Unified local dashboard with permanent navigation: Overview, Telemetry, Data Pipeline, ML Lab, Detection Center, Findings, and Runtime.
+- Guided synthetic flow from demo generation through features, dataset snapshot, model training, champion promotion, detection, finding lifecycle, and suppression.
+- Safe runtime presentation of version, build identity, installation verification, doctor state, schema version, host readiness, and service/desktop mode without exposing tokens, usernames, hostnames, or absolute paths.
+- Frontend unit coverage for critical screens and safety states plus browser smoke against real local APIs.
+
 ## Future Scope
 
-Installer signing, MSI/MSIX, auto-update, alerts, SIEM export, cloud backends, response actions, ETW/kernel collection, online learning, automatic retraining, and automatic model promotion remain out of scope until explicitly planned.
+Stage 7 has not started. Installer signing, MSI/MSIX, auto-update, alerts, SIEM export, cloud backends, response actions, ETW/kernel collection, reports export, online learning, automatic retraining, and automatic model promotion remain out of scope until explicitly planned.

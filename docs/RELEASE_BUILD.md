@@ -13,8 +13,8 @@ The script:
 3. runs PyInstaller one-folder;
 4. optionally signs binaries when SignTool configuration exists;
 5. writes canonical `release-manifest.json`;
-6. creates `SentinelUEBA-0.5.0-windows-x64-portable.zip`;
-7. writes `SentinelUEBA-0.5.0-windows-x64-portable.zip.sha256`.
+6. creates `SentinelUEBA-0.6.0-windows-x64-portable.zip`;
+7. writes `SentinelUEBA-0.6.0-windows-x64-portable.zip.sha256`.
 
 Optional signing inputs:
 

@@ -1,6 +1,6 @@
 # Architecture
 
-SentinelUEBA Stage 5 is a local modular monolith. The backend owns telemetry generation, opt-in Windows collectors, validation, canonical normalization, storage, feature materialization, dataset snapshots, model training, calibration, registry-backed promotion, offline scoring, drift reports, collection accounting, the Stage 4 detection engine, and the Stage 5 runtime supervisor. The frontend calls same-origin FastAPI endpoints in packaged mode and the Vite proxy in development.
+SentinelUEBA Stage 6 is a local modular monolith with a productized dashboard layer. The backend owns telemetry generation, opt-in Windows collectors, validation, canonical normalization, storage, feature materialization, dataset snapshots, model training, calibration, registry-backed promotion, offline scoring, drift reports, collection accounting, the Stage 4 detection engine, and the Stage 5 runtime supervisor. The frontend calls same-origin FastAPI endpoints in packaged mode and the Vite proxy in development.
 
 The primary identity boundary is `user_id + host_id`. Synthetic events use safe demo identifiers. Real Windows events use pseudonymous local identifiers by default; raw identity mode is explicit configuration only.
 
@@ -101,3 +101,31 @@ The host binds only to `127.0.0.1`. Mutating HTTP endpoints require a per-proces
 Model signals are loaded only through the public Stage 3 verifier and SQLite registry. A user cannot provide an artifact path. Direct persisted feature-window scoring is used only for Stage 4 detection, not for training, calibration, evaluation, promotion, or drift. Scoring is exact by dataset/profile/model namespace; no-profile requests fan out into per-profile child runs instead of mixing profiles in one run.
 
 The local worker is a controlled foreground/API worker lease, not an installed Windows Service or autostart mechanism. API start uses a process-level manager keyed by database path and worker key so start/stop/status share thread state across requests; public status returns an allowlist and never exposes owner ids, hostnames, thread ids, config JSON, or local paths. Watermarks are keyed by dataset kind, profile, policy hash, and model identity so policy or champion changes trigger fresh evaluations without silently rescoring history. Pending detection windows are selected by SQL anti-join; watermarks are only an audit/optimization aid and not a replacement for idempotency. Registered-snapshot backfill verifies the public snapshot and proves current feature windows still match the snapshot rows before processing exactly those window ids.
+
+## Stage 6 Dashboard
+
+```mermaid
+flowchart LR
+  A["SentinelUEBALauncher.exe"] --> B["Loopback FastAPI host"]
+  B --> C["Embedded React dashboard"]
+  C --> D["Overview guided flow"]
+  C --> E["Telemetry"]
+  C --> F["Data Pipeline"]
+  C --> G["ML Lab"]
+  C --> H["Detection Center"]
+  C --> I["Findings"]
+  C --> J["Runtime"]
+  D --> K["Generate demo -> features -> dataset -> train -> promote -> detect -> triage"]
+```
+
+Stage 6 does not add new ML algorithms, detection rules, response actions, or remote access. It exposes the Stage 0-5 operational contracts through seven stable pages:
+
+- Overview summarizes host readiness, events, feature windows, datasets, model registry, champion, findings, workers, real-data readiness, and the next guided action.
+- Telemetry shows collector capabilities, collection progress, sessions, safe event summaries, and disables user-session collection controls in service mode.
+- Data Pipeline shows data quality, quarantine, feature schema, feature windows, snapshot verification, training eligibility, and confirmed retention apply.
+- ML Lab shows eligibility, manual candidate training, Autoencoder/Isolation Forest candidates, model metrics, champion promotion, rollback, scoring, and drift.
+- Detection Center shows active policy, rules, model-signal availability, run-once, dry-run, exact snapshot backfill, worker controls, evaluations, findings, suppressions, and no-op counts.
+- Findings supports filters, detail cards, occurrence history, lifecycle transitions, and suppression create/revoke with confirmation.
+- Runtime shows version, build commit, build timestamp, packaged/development mode, signed state, installation verification, doctor state, schema version, frontend hashes, safe log guidance, and desktop-only shutdown.
+
+The dashboard keeps the control token in process memory only. It never writes the token to `localStorage`, renders it in DOM, logs it, or bypasses Host/Origin/CORS protection. On a mutating 403 it refreshes bootstrap once and retries once.

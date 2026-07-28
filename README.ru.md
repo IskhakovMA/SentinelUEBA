@@ -1,6 +1,6 @@
 # SentinelUEBA
 
-SentinelUEBA — local-first Windows-focused UEBA портфолио-проект. Stage 5 сохраняет Stage 0-4 synthetic telemetry, Windows collectors, validation-first data pipeline, ML registry и detection engine, затем добавляет Windows x64 PyInstaller portable bundle со встроенным production React, loopback runtime supervisor, single-instance desktop launcher, optional Windows Service, local control-token protection, release manifest verification и package smoke CI.
+SentinelUEBA — local-first Windows-focused UEBA портфолио-проект. Stage 6 сохраняет Stage 0-5 telemetry, validation-first data pipeline, ML registry, detection engine и Windows portable runtime, затем превращает React-интерфейс в единый локальный продукт для demo, ручного тестирования и triage.
 
 [English version](README.md)
 
@@ -25,6 +25,8 @@ SentinelUEBA — local-first Windows-focused UEBA портфолио-проек�
 - Уровни риска: low, medium, high, critical.
 - FastAPI endpoints и двуязычная EN/RU панель на React.
 - Windows x64 portable Technical Preview package с `SentinelUEBA.exe`, `SentinelUEBALauncher.exe`, `SentinelUEBAService.exe`, embedded frontend assets, runtime roots вне installation directory и SHA-256 release manifest verification.
+- Product dashboard страницы: Overview, Telemetry, Data Pipeline, ML Lab, Detection Center, Findings и Runtime.
+- Guided synthetic demo flow от генерации данных до lifecycle finding и suppression без CLI.
 
 Аномалия или finding является triage-сигналом. Это не доказательство атаки.
 
@@ -45,7 +47,9 @@ pnpm --dir frontend install
 pnpm --dir frontend dev
 ```
 
-Откройте `http://localhost:5173`.
+Откройте `http://localhost:5173` или запустите `SentinelUEBALauncher.exe` из Windows portable bundle.
+
+5-10 минутный сценарий описан в [demo flow](docs/DEMO_FLOW.md). Роли страниц и safety rules описаны в [dashboard](docs/DASHBOARD.md).
 
 ## Windows Portable
 
@@ -129,9 +133,9 @@ Stage 4 DetectionInput содержит только window id, dataset kind, ps
 
 Подробнее: [detection engine](docs/DETECTION_ENGINE.md), [rules](docs/DETECTION_RULES.md), [policies](docs/DETECTION_POLICIES.md), [finding lifecycle](docs/FINDING_LIFECYCLE.md), [continuous detection](docs/CONTINUOUS_DETECTION.md).
 
-## Ограничения Stage 5
+## Ограничения Stage 6
 
-Не реализованы MSI, automatic install, autostart, firewall rule, Linux collectors, ETW, kernel driver, cloud backend, SIEM, alerts, packet capture, keylogging, clipboard, browser history, traffic payload inspection, live blocking, automated response, arbitrary user Python/SQL/shell rules, online learning, retraining, autopromotion, supervised security labels и production alerting. Windows Service является optional, manual-start, loopback-only и запускается из portable package только после explicit install.
+Не реализованы reports export, benchmarking, formal validation, alerts, email/Telegram/webhooks, SIEM export, cloud backend, remote access, auto-update, installer, новые ML algorithms, новые detection rules, automatic training, automatic response, live blocking, online learning, retraining, autopromotion, supervised security labels и production alerting. Windows Service является optional, manual-start, loopback-only и запускается из portable package только после explicit install.
 
 ## Разработка
 
@@ -142,5 +146,7 @@ uv run mypy backend/src
 uv run pytest
 pnpm --dir frontend lint
 pnpm --dir frontend typecheck
+pnpm --dir frontend test
+pnpm --dir frontend dashboard:smoke
 pnpm --dir frontend build
 ```

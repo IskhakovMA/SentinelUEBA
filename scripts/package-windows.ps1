@@ -1,6 +1,6 @@
 param(
   [string]$PackageDir = "dist\SentinelUEBA",
-  [string]$Version = "0.5.0",
+  [string]$Version = "0.6.0",
   [string]$GitCommit = $env:GITHUB_SHA,
   [string]$BuildTimestampUtc = $env:SENTINELUEBA_BUILD_TIMESTAMP_UTC
 )

@@ -1,6 +1,6 @@
 # Windows Portable
 
-Stage 5 adds an unsigned Technical Preview Windows x64 portable bundle:
+Stage 6 uses the unsigned Technical Preview Windows x64 portable bundle from Stage 5 and adds a productized local dashboard:
 
 - `SentinelUEBA.exe` for console CLI commands;
 - `SentinelUEBALauncher.exe` for desktop startup without a console window;
@@ -27,6 +27,11 @@ The desktop launcher is single-instance. A second launch reads the first host st
 existing loopback URL when configured, and exits without rewriting or deleting the owning host's
 `status.json` or `control.token`.
 
+`SentinelUEBALauncher.exe` opens a local dashboard with Overview, Telemetry, Data Pipeline, ML Lab,
+Detection Center, Findings, and Runtime. The frontend is served from the package root and uses
+same-origin `/api` requests only. Mutating requests require the process-local control token, but the
+token is never displayed, stored in browser local storage, or written to logs.
+
 Start desktop mode with `SentinelUEBALauncher.exe` or:
 
 ```powershell
@@ -49,3 +54,8 @@ Unsigned PR builds are expected to report `unsigned_verified`. That status means
 manifest consistency, dependency inventory integrity, and runtime-path safety passed. It does not
 prove publisher authenticity. A package with `signed=true` reports `verified` only after the expected
 EXE/DLL/PYD files pass Authenticode verification.
+
+The Runtime page mirrors safe installation state: application version, build commit, build timestamp,
+packaged/development mode, signed status, release manifest verification, SQLite schema version,
+frontend build hash, doctor status, host readiness, service/desktop mode, and safe log guidance.
+It intentionally avoids absolute paths, username, hostname, and the control token.
