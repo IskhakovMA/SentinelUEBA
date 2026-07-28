@@ -23,6 +23,7 @@ datas += collect_data_files("pyarrow")
 hiddenimports = (
     collect_submodules("uvicorn")
     + collect_submodules("sentinelueba")
+    + collect_submodules("skops")
     + ["win32timezone", "win32serviceutil", "win32service", "win32event", "servicemanager"]
 )
 

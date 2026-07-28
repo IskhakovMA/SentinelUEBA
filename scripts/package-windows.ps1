@@ -22,11 +22,15 @@ $env:SENTINELUEBA_SIGNED = if ($signed) { "1" } else { "0" }
 $signedLiteral = if ($signed) { "True" } else { "False" }
 
 uv run python -c "from pathlib import Path; from sentinelueba.runtime.installation import create_release_manifest, dependency_inventory_hash, sha256_file, canonical_json; package=Path('$PackageDir'); frontend=package/'frontend'/'frontend-assets.json'; manifest=create_release_manifest(package, version='$Version', git_commit='$GitCommit', build_timestamp_utc='$BuildTimestampUtc', signed=$signedLiteral, frontend_manifest_sha256=sha256_file(frontend) if frontend.exists() else None, dependency_inventory_sha256=dependency_inventory_hash()); (package/'release-manifest.json').write_bytes(canonical_json(manifest))"
+$manifestHash = (Get-FileHash -Algorithm SHA256 (Join-Path $PackageDir "release-manifest.json")).Hash.ToLowerInvariant()
 
 $zip = "dist\SentinelUEBA-$Version-windows-x64-portable.zip"
 Remove-Item -Force -ErrorAction SilentlyContinue $zip, "$zip.sha256"
 Compress-Archive -Path $PackageDir -DestinationPath $zip
 $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+$zipSize = (Get-Item $zip).Length
 "$hash  $(Split-Path -Leaf $zip)" | Set-Content -Encoding ascii "$zip.sha256"
 Write-Host "ZIP=$zip"
+Write-Host "SIZE_BYTES=$zipSize"
 Write-Host "SHA256=$hash"
+Write-Host "MANIFEST_SHA256=$manifestHash"

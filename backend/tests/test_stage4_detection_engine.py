@@ -816,8 +816,11 @@ def test_stage4_concurrent_same_namespace_rejects_second_run_without_duplicates(
     thread_a.start()
     assert first_window_started.wait(timeout=2.0)
     thread_b.start()
-    thread_a.join(timeout=5.0)
-    thread_b.join(timeout=5.0)
+    thread_a.join(timeout=30.0)
+    thread_b.join(timeout=30.0)
+
+    assert not thread_a.is_alive()
+    assert not thread_b.is_alive()
 
     assert len(results) == 1
     assert results[0]["evaluated_count"] == 96
