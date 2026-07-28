@@ -765,9 +765,17 @@ jobs:
           } finally {
             if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force }
           }
+          $packageRoot = (Resolve-Path $package).Path
           $runtimeInsidePackage = Get-ChildItem -Path $package -Recurse -File |
-            Where-Object { $_.FullName -match "\\(data|artifacts|models|logs)\\" -or $_.Extension -in ".sqlite3", ".parquet", ".skops", ".pt" }
-          if ($runtimeInsidePackage) { throw "runtime artifacts are present inside package" }
+            Where-Object {
+              $relative = $_.FullName.Substring($packageRoot.Length).TrimStart("\")
+              ($relative -match "^(data|artifacts|models|logs)\\") -or
+                ($_.Extension -in ".sqlite3", ".parquet", ".skops", ".pt")
+            }
+          if ($runtimeInsidePackage) {
+            $runtimeInsidePackage | Select-Object -First 20 -ExpandProperty FullName
+            throw "runtime artifacts are present inside package"
+          }
       - name: Upload package artifacts
         if: github.event_name == 'push'
         uses: actions/upload-artifact@v4
