@@ -322,7 +322,12 @@ jobs:
           )
           assert started["worker_key"] == "stage4|synthetic|*", started
           assert started["status"] in {"running", "idle"}, started
-          status = manager.status(database_path=settings.database_path, dataset_kind="synthetic")
+          status = manager.status(
+              database_path=settings.database_path,
+              data_dir=settings.data_dir,
+              model_dir=settings.model_dir,
+              dataset_kind="synthetic",
+          )
           assert status["worker_key"] == "stage4|synthetic|*", status
           stopped = manager.stop(
               database_path=settings.database_path,
@@ -587,7 +592,12 @@ jobs:
               max_windows=1,
           )
           assert started["worker_key"] == "stage4|synthetic|*", started
-          status = manager.status(database_path=settings.database_path, dataset_kind="synthetic")
+          status = manager.status(
+              database_path=settings.database_path,
+              data_dir=settings.data_dir,
+              model_dir=settings.model_dir,
+              dataset_kind="synthetic",
+          )
           assert status["worker_key"] == "stage4|synthetic|*", status
           stopped = manager.stop(
               database_path=settings.database_path,
