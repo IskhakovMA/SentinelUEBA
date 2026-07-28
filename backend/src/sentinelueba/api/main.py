@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from functools import partial
 from typing import Any
 
 import anyio
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse, Response
 
+from sentinelueba import __version__
 from sentinelueba.api.schemas import (
     AnomalyListResponse,
     ApiResponse,
@@ -37,6 +39,11 @@ from sentinelueba.detection.worker_manager import (
     DetectionWorkerAlreadyRunningError,
     get_detection_worker_manager,
 )
+from sentinelueba.runtime.build_info import get_build_info
+from sentinelueba.runtime.control import CONTROL_HEADER
+from sentinelueba.runtime.installation import verify_installation
+from sentinelueba.runtime.paths import resolve_runtime_paths
+from sentinelueba.runtime.state import get_runtime_context
 from sentinelueba.services.pipeline import DemoPipeline
 
 
@@ -47,13 +54,48 @@ def parse_api_datetime(value: str | None) -> Any:
 
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
-app = FastAPI(title="SentinelUEBA API", version="0.1.0")
+app = FastAPI(title="SentinelUEBA API", version=__version__)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+TOKEN_EXEMPT_PATHS = {"/runtime/bootstrap"}
+
+
+@app.middleware("http")
+async def runtime_security(
+    request: Request,
+    call_next: Callable[[Request], Awaitable[Response]],
+) -> Response:
+    if request.scope["path"].startswith("/api/"):
+        request.scope["path"] = request.scope["path"][4:]
+    context = get_runtime_context()
+    if context.mode in {"desktop", "service"}:
+        host = request.headers.get("host", "")
+        allowed_hosts = {"localhost", "127.0.0.1"}
+        if context.port is not None:
+            allowed_hosts.update({f"localhost:{context.port}", f"127.0.0.1:{context.port}"})
+        if host not in allowed_hosts:
+            return JSONResponse({"detail": "host header is not allowed"}, status_code=400)
+        origin = request.headers.get("origin")
+        if origin and origin not in {
+            f"http://localhost:{context.port}",
+            f"http://127.0.0.1:{context.port}",
+        }:
+            return JSONResponse({"detail": "origin is not allowed"}, status_code=403)
+    path = str(request.scope["path"])
+    if (
+        request.method in MUTATING_METHODS
+        and context.require_token
+        and path not in TOKEN_EXEMPT_PATHS
+        and request.headers.get(CONTROL_HEADER) != context.control_token
+    ):
+        return JSONResponse({"detail": "control token is required"}, status_code=403)
+    return await call_next(request)
 
 
 def pipeline() -> DemoPipeline:
@@ -79,9 +121,84 @@ async def health() -> ApiResponse:
     return ApiResponse(data={"ok": True})
 
 
+@app.get("/health/live", response_model=ApiResponse)
+async def health_live() -> ApiResponse:
+    return ApiResponse(data={"ok": True})
+
+
+@app.get("/health/ready", response_model=ApiResponse)
+async def health_ready() -> ApiResponse:
+    context = get_runtime_context()
+    ready = (
+        context.state in {"ready", "degraded"}
+        and (context.mode == "development" or context.frontend_ready)
+        and (context.mode == "development" or context.database_ready)
+        and (context.mode == "development" or context.data_root_writable)
+    )
+    return ApiResponse(
+        data={
+            "ready": ready,
+            "state": context.state,
+            "mode": context.mode,
+            "frontend_ready": context.frontend_ready or context.mode == "development",
+            "database_ready": context.database_ready or context.mode == "development",
+            "data_root_writable": context.data_root_writable or context.mode == "development",
+        }
+    )
+
+
+@app.get("/runtime/status", response_model=ApiResponse)
+async def runtime_status() -> ApiResponse:
+    context = get_runtime_context()
+    return ApiResponse(
+        data={
+            "state": context.state,
+            "mode": context.mode,
+            "port": context.port,
+            "version": __version__,
+        }
+    )
+
+
+@app.get("/runtime/build", response_model=ApiResponse)
+async def runtime_build() -> ApiResponse:
+    return ApiResponse(data=get_build_info().safe_dict())
+
+
+@app.get("/runtime/bootstrap", response_model=ApiResponse)
+async def runtime_bootstrap() -> ApiResponse:
+    context = get_runtime_context()
+    return ApiResponse(
+        data={
+            "version": __version__,
+            "mode": context.mode,
+            "service_mode": context.mode == "service",
+            "control_token": context.control_token,
+        }
+    )
+
+
+@app.post("/runtime/shutdown", response_model=ApiResponse)
+async def runtime_shutdown(request: ConfirmRequest) -> ApiResponse:
+    context = get_runtime_context()
+    if context.mode == "service" or context.shutdown_disabled:
+        raise HTTPException(status_code=409, detail="runtime shutdown is disabled in service mode")
+    if not request.confirm:
+        raise HTTPException(status_code=400, detail="runtime shutdown requires confirm=true")
+    from sentinelueba.runtime.supervisor import request_shutdown
+
+    request_shutdown()
+    return ApiResponse(data={"state": "stopping"})
+
+
+@app.get("/runtime/verify-installation", response_model=ApiResponse)
+async def runtime_verify_installation() -> ApiResponse:
+    return ApiResponse(data=verify_installation(resolve_runtime_paths().package_dir).safe_dict())
+
+
 @app.get("/status", response_model=ApiResponse)
 async def status() -> ApiResponse:
-    return ApiResponse(data=pipeline().status())
+    return ApiResponse(data=_safe_public_payload(pipeline().status()))
 
 
 @app.post("/demo/generate", response_model=ApiResponse)
@@ -584,6 +701,11 @@ async def collector_status() -> ApiResponse:
 
 @app.post("/collection/start", response_model=ApiResponse)
 async def start_collection(request: CollectionStartRequest) -> ApiResponse:
+    if get_runtime_context().mode == "service":
+        raise HTTPException(
+            status_code=409,
+            detail="user-session telemetry collection is disabled in service mode",
+        )
     try:
         return ApiResponse(
             data=await run_blocking(
@@ -722,3 +844,34 @@ async def anomaly_details(index: int) -> ApiResponse:
 @app.get("/summary", response_model=ApiResponse)
 async def summary() -> ApiResponse:
     return ApiResponse(data=pipeline().summary())
+
+
+@app.get("/{full_path:path}")
+async def serve_frontend(full_path: str) -> Response:
+    if full_path.startswith("api/"):
+        return JSONResponse({"detail": "not found"}, status_code=404)
+    from sentinelueba.runtime.supervisor import frontend_dir
+
+    root = frontend_dir(resolve_runtime_paths())
+    target = (root / full_path).resolve()
+    try:
+        target.relative_to(root.resolve())
+    except ValueError:
+        return JSONResponse({"detail": "not found"}, status_code=404)
+    if target.is_file():
+        return FileResponse(target)
+    index = root / "index.html"
+    if index.is_file():
+        return FileResponse(index)
+    return JSONResponse({"detail": "frontend assets are unavailable"}, status_code=503)
+
+
+def _safe_public_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: ("<runtime-managed>" if key.endswith("_path") else _safe_public_payload(item))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_safe_public_payload(item) for item in value]
+    return value

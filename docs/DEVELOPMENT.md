@@ -1,5 +1,30 @@
 # Development
 
+## Stage 5 Packaging
+
+Development mode keeps the existing backend and Vite workflow:
+
+```bash
+uv run sentinelueba run-api
+pnpm --dir frontend dev
+```
+
+Packaged mode is Windows-only and built with:
+
+```powershell
+.\scripts\package-windows.ps1
+```
+
+Do not commit `frontend/dist`, databases, snapshots, model bundles, logs, certificates, or local `.env` files. Build identity is injected through environment variables such as `SENTINELUEBA_BUILD_COMMIT` and `SENTINELUEBA_BUILD_TIMESTAMP_UTC`; the installed app does not run `git`.
+
+Runtime supervisor commands are available in development for smoke testing:
+
+```bash
+uv run sentinelueba host doctor
+uv run sentinelueba host run
+uv run sentinelueba verify-installation
+```
+
 Use Python 3.12, `uv`, `pnpm`, and Node 22.
 
 Backend:

@@ -46,6 +46,13 @@ type Status = {
 
 type Locale = 'en' | 'ru';
 
+type RuntimeBootstrap = {
+  version: string;
+  mode: string;
+  service_mode: boolean;
+  control_token?: string | null;
+};
+
 type CollectorCapability = {
   collector_id: string;
   status: string;
@@ -97,6 +104,21 @@ type DataPipelineStatus = {
   };
   snapshots: DataQuality['dataset_snapshots'];
 };
+
+let runtimeBootstrapPromise: Promise<RuntimeBootstrap | null> | null = null;
+
+async function runtimeBootstrap(): Promise<RuntimeBootstrap | null> {
+  if (!runtimeBootstrapPromise) {
+    runtimeBootstrapPromise = fetch('/api/runtime/bootstrap')
+      .then(async (response) => {
+        if (!response.ok) return null;
+        const payload = (await response.json()) as { data: RuntimeBootstrap };
+        return payload.data;
+      })
+      .catch(() => null);
+  }
+  return runtimeBootstrapPromise;
+}
 
 type ScenarioValidation = {
   scenario_name: string;
@@ -411,9 +433,18 @@ const copy = {
 };
 
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
+  const method = (options?.method ?? 'GET').toUpperCase();
+  const headers = new Headers(options?.headers);
+  headers.set('Content-Type', 'application/json');
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+    const bootstrap = await runtimeBootstrap();
+    if (bootstrap?.control_token) {
+      headers.set('X-SentinelUEBA-Control-Token', bootstrap.control_token);
+    }
+  }
   const response = await fetch(`/api${path}`, {
-    headers: { 'Content-Type': 'application/json' },
     ...options,
+    headers,
   });
   if (!response.ok) throw new Error(await response.text());
   return (await response.json()) as T;
@@ -460,9 +491,12 @@ export function App() {
   const [findingRiskFilter, setFindingRiskFilter] = React.useState<string>('all');
   const [findingSignalFilter, setFindingSignalFilter] = React.useState<string>('');
   const [findingSinceFilter, setFindingSinceFilter] = React.useState<string>('');
+  const [runtime, setRuntime] = React.useState<RuntimeBootstrap | null>(null);
   const t = copy[locale];
 
   const refresh = React.useCallback(async () => {
+    const runtimeResponse = await runtimeBootstrap();
+    setRuntime(runtimeResponse);
     const statusResponse = await api<{ data: Status }>('/status');
     const anomalyResponse = await api<{ anomalies: Anomaly[] }>('/anomalies');
     const capabilityResponse = await api<{ data: { collectors: CollectorCapability[] } }>(
@@ -586,12 +620,40 @@ export function App() {
       <header className="topbar">
         <div>
           <h1>{t.title}</h1>
-          <p>{t.subtitle}</p>
+          <p>
+            {t.subtitle}
+            {runtime ? ` · v${runtime.version} · ${runtime.mode}` : ''}
+          </p>
         </div>
-        <button className="iconButton" onClick={() => setLocale(locale === 'en' ? 'ru' : 'en')} title="Language">
-          <Languages size={18} />
-          {locale.toUpperCase()}
-        </button>
+        <div className="topActions">
+          {runtime?.mode === 'desktop' && (
+            <button
+              className="iconButton"
+              onClick={() => {
+                if (window.confirm('Exit local application?')) {
+                  run('shutdown', () =>
+                    api('/runtime/shutdown', {
+                      method: 'POST',
+                      body: JSON.stringify({ confirm: true }),
+                    }),
+                  );
+                }
+              }}
+              title="Exit local application"
+            >
+              <Square size={18} />
+              Exit
+            </button>
+          )}
+          <button
+            className="iconButton"
+            onClick={() => setLocale(locale === 'en' ? 'ru' : 'en')}
+            title="Language"
+          >
+            <Languages size={18} />
+            {locale.toUpperCase()}
+          </button>
+        </div>
       </header>
 
       <section className="toolbar">

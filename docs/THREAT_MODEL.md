@@ -1,5 +1,20 @@
 # Threat Model
 
+## Stage 5 Local Host Boundary
+
+The packaged host listens only on `127.0.0.1` and does not open firewall rules. Host and Origin
+headers are checked in packaged desktop/service mode. Mutating browser/API operations require a
+per-start cryptographically random control token via `X-SentinelUEBA-Control-Token`; the token is
+delivered through same-origin bootstrap and is not exposed in safe status/build endpoints.
+
+The release manifest detects missing, modified, and extra executable/library files. Tampered
+installations block automatic host startup while leaving read-only doctor and verification commands
+available.
+
+Out of scope: LAN access, cloud control, telemetry upload, crash upload, alerts, SIEM export,
+automatic response, process/network blocking, arbitrary scripts, auto-update, and automatic model
+promotion.
+
 SentinelUEBA detects statistical anomalies in synthetic or explicitly collected local Windows behavior windows. It does not classify malware, attribute attacks, inspect packet payloads, read file contents, record keystrokes, inspect clipboard data, or collect browser history.
 
 The main risks are false positives, misunderstood explanations, missed short-lived process events due to polling, Security Log permission confusion, and accidental inclusion of private artifacts. The implementation mitigates them with opt-in collection, pseudonymous identity, honest explanations, `.gitignore`, and documentation.

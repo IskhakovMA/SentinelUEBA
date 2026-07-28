@@ -5,6 +5,8 @@ from pathlib import Path
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from sentinelueba.runtime.paths import resolve_runtime_paths
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="SENTINELUEBA_", env_file=".env")
@@ -22,4 +24,11 @@ class Settings(BaseSettings):
 
 
 def get_settings() -> Settings:
-    return Settings()
+    runtime = resolve_runtime_paths()
+    if runtime.mode == "development":
+        return Settings()
+    return Settings(
+        data_dir=runtime.data_dir,
+        database_path=runtime.database_path,
+        model_dir=runtime.model_dir,
+    )

@@ -690,3 +690,90 @@ jobs:
               )
           )
           '@ | uv run python -
+
+  package-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Install backend
+        run: uv sync --all-extras --dev
+      - name: Package portable bundle
+        shell: pwsh
+        run: .\scripts\package-windows.ps1 -GitCommit "${{ github.sha }}"
+      - name: Verify package smoke
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = "dist\SentinelUEBA-0.5.0-windows-x64-portable.zip"
+          $sidecar = Get-Content "$zip.sha256"
+          $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+          if (-not $sidecar.Contains($actual)) { throw "ZIP SHA-256 sidecar mismatch" }
+          $unpack = Join-Path $env:RUNNER_TEMP "SentinelUEBA Package Тест"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $unpack
+          New-Item -ItemType Directory -Path $unpack | Out-Null
+          Expand-Archive -Path $zip -DestinationPath $unpack
+          $package = Join-Path $unpack "SentinelUEBA"
+          $env:SENTINELUEBA_PACKAGED = "1"
+          $env:SENTINELUEBA_RUNTIME_ROOT = Join-Path $env:RUNNER_TEMP "SentinelUEBA Runtime Тест"
+          $env:SENTINELUEBA_PACKAGE_ROOT = $package
+          & "$package\SentinelUEBA.exe" --version
+          & "$package\SentinelUEBA.exe" verify-installation
+          & "$package\SentinelUEBA.exe" host doctor
+          & "$package\SentinelUEBA.exe" generate-demo
+          & "$package\SentinelUEBA.exe" features materialize
+          & "$package\SentinelUEBA.exe" detection run-once --dataset synthetic --dry-run
+          & "$package\SentinelUEBAService.exe" --debug-smoke
+          $process = Start-Process -FilePath "$package\SentinelUEBA.exe" -ArgumentList @("host", "run") -PassThru -WindowStyle Hidden
+          try {
+            $ready = $false
+            for ($i = 0; $i -lt 60; $i++) {
+              $statusFile = Join-Path $env:SENTINELUEBA_RUNTIME_ROOT "runtime\status.json"
+              if (Test-Path $statusFile) {
+                $status = Get-Content $statusFile | ConvertFrom-Json
+                if ($status.state -in @("ready", "degraded")) {
+                  $ready = $true
+                  break
+                }
+              }
+              Start-Sleep -Seconds 1
+            }
+            if (-not $ready) { throw "packaged host did not become ready" }
+            $port = $status.port
+            Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$port/health/ready" | Out-Null
+            Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$port/" | Out-Null
+            try {
+              Invoke-WebRequest -UseBasicParsing -Method POST -Uri "http://127.0.0.1:$port/demo/generate" -Body '{"seed":42}' -ContentType "application/json" | Out-Null
+              throw "mutation without token succeeded"
+            } catch {
+              if ($_.Exception.Response.StatusCode.value__ -ne 403) { throw }
+            }
+            $bootstrap = Invoke-RestMethod "http://127.0.0.1:$port/runtime/bootstrap"
+            $headers = @{ "X-SentinelUEBA-Control-Token" = $bootstrap.data.control_token }
+            Invoke-RestMethod -Method POST -Uri "http://127.0.0.1:$port/demo/generate" -Headers $headers -Body '{"seed":42}' -ContentType "application/json" | Out-Null
+            Invoke-RestMethod -Method POST -Uri "http://127.0.0.1:$port/runtime/shutdown" -Headers $headers -Body '{"confirm":true}' -ContentType "application/json" | Out-Null
+            $process.WaitForExit(20000) | Out-Null
+            if (-not $process.HasExited) { throw "packaged host did not stop" }
+          } finally {
+            if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force }
+          }
+          $runtimeInsidePackage = Get-ChildItem -Path $package -Recurse -File |
+            Where-Object { $_.FullName -match "\\(data|artifacts|models|logs)\\" -or $_.Extension -in ".sqlite3", ".parquet", ".skops", ".pt" }
+          if ($runtimeInsidePackage) { throw "runtime artifacts are present inside package" }
+      - name: Upload package artifacts
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sentinelueba-windows-portable
+          path: |
+            dist/SentinelUEBA-0.5.0-windows-x64-portable.zip
+            dist/SentinelUEBA-0.5.0-windows-x64-portable.zip.sha256
+            dist/SentinelUEBA/release-manifest.json

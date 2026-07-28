@@ -1,6 +1,6 @@
 # SentinelUEBA
 
-SentinelUEBA — local-first Windows-focused UEBA портфолио-проект. Stage 4 сохраняет synthetic demo, opt-in Windows telemetry, validation-first ingestion, SQLite feature store, immutable snapshots и Stage 3 ML registry, затем добавляет privacy-safe detection engine с immutable policies, встроенными rules по feature windows, verified champion model signals, deterministic fusion, findings, suppressions, CLI/API controls, local worker lease и React Detection Center.
+SentinelUEBA — local-first Windows-focused UEBA портфолио-проект. Stage 5 сохраняет Stage 0-4 synthetic telemetry, Windows collectors, validation-first data pipeline, ML registry и detection engine, затем добавляет Windows x64 PyInstaller portable bundle со встроенным production React, loopback runtime supervisor, single-instance desktop launcher, optional Windows Service, local control-token protection, release manifest verification и package smoke CI.
 
 [English version](README.md)
 
@@ -24,6 +24,7 @@ SentinelUEBA — local-first Windows-focused UEBA портфолио-проек�
 - Immutable findings, occurrences, lifecycle history, exact TTL suppressions, idempotent SQL anti-join evaluations, exact profile/model isolation и worker watermarks.
 - Уровни риска: low, medium, high, critical.
 - FastAPI endpoints и двуязычная EN/RU панель на React.
+- Windows x64 portable Technical Preview package с `SentinelUEBA.exe`, `SentinelUEBALauncher.exe`, `SentinelUEBAService.exe`, embedded frontend assets, runtime roots вне installation directory и SHA-256 release manifest verification.
 
 Аномалия или finding является triage-сигналом. Это не доказательство атаки.
 
@@ -45,6 +46,20 @@ pnpm --dir frontend dev
 ```
 
 Откройте `http://localhost:5173`.
+
+## Windows Portable
+
+```powershell
+SentinelUEBA.exe --version
+SentinelUEBA.exe verify-installation
+SentinelUEBA.exe host run --open-browser
+SentinelUEBA.exe host doctor
+SentinelUEBA.exe host stop --confirm
+```
+
+Portable builds — это PyInstaller one-folder Windows x64 bundles. Runtime data хранится в `%LOCALAPPDATA%\SentinelUEBA` для desktop mode и `%PROGRAMDATA%\SentinelUEBA` для service mode, не в installation directory. Unsigned PR builds являются Technical Preview artifacts и должны проверяться как `unsigned_verified`.
+
+Подробнее: [Windows portable](docs/WINDOWS_PORTABLE.md), [runtime supervisor](docs/RUNTIME_SUPERVISOR.md), [installation integrity](docs/INSTALLATION_INTEGRITY.md), [Windows Service](docs/WINDOWS_SERVICE.md).
 
 ## Windows Collection
 

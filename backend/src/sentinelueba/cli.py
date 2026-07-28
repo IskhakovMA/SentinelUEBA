@@ -3,15 +3,32 @@ from __future__ import annotations
 import json
 import time
 from datetime import datetime
+from pathlib import Path
 
+import httpx
 import typer
 import uvicorn
 
+from sentinelueba import __version__
 from sentinelueba.api.main import app as fastapi_app
 from sentinelueba.config import get_settings
+from sentinelueba.runtime.diagnostics import doctor, exit_code
+from sentinelueba.runtime.import_data import import_data, preview_import
+from sentinelueba.runtime.installation import verify_installation
+from sentinelueba.runtime.paths import resolve_runtime_paths
+from sentinelueba.runtime.service import (
+    install_service,
+    run_service_debug_smoke,
+    service_adapter,
+    uninstall_service,
+)
+from sentinelueba.runtime.supervisor import host_status, run_host
 from sentinelueba.services.pipeline import DemoPipeline
 
 app = typer.Typer(help="SentinelUEBA local-first UEBA CLI.")
+host_app = typer.Typer(help="Local packaged host supervisor commands.")
+runtime_app = typer.Typer(help="Runtime data management commands.")
+service_app = typer.Typer(help="Optional Windows Service commands.")
 features_app = typer.Typer(help="Materialized feature store commands.")
 datasets_app = typer.Typer(help="Immutable dataset snapshot commands.")
 retention_app = typer.Typer(help="Local retention policy commands.")
@@ -27,6 +44,9 @@ detection_runs_app = typer.Typer(help="Detection run commands.")
 detection_findings_app = typer.Typer(help="Finding lifecycle commands.")
 detection_suppressions_app = typer.Typer(help="Detection suppression commands.")
 detection_worker_app = typer.Typer(help="Controlled local detection worker commands.")
+app.add_typer(host_app, name="host")
+app.add_typer(runtime_app, name="runtime")
+app.add_typer(service_app, name="service")
 app.add_typer(features_app, name="features")
 app.add_typer(datasets_app, name="datasets")
 app.add_typer(retention_app, name="retention")
@@ -42,6 +62,20 @@ detection_app.add_typer(detection_runs_app, name="runs")
 detection_app.add_typer(detection_findings_app, name="findings")
 detection_app.add_typer(detection_suppressions_app, name="suppressions")
 detection_app.add_typer(detection_worker_app, name="worker")
+
+
+@app.callback()
+def main(
+    version: bool = typer.Option(
+        False,
+        "--version",
+        help="Show SentinelUEBA version and exit.",
+        is_eager=True,
+    ),
+) -> None:
+    if version:
+        typer.echo(f"SentinelUEBA {__version__}")
+        raise typer.Exit()
 
 
 def _pipeline() -> DemoPipeline:
@@ -78,10 +112,184 @@ def _parse_datetime(value: str | None) -> datetime | None:
         raise typer.BadParameter("must be an ISO-8601 datetime") from exc
 
 
+def _runtime_paths() -> object:
+    paths = resolve_runtime_paths()
+    paths.ensure()
+    return paths
+
+
 @app.command()
 def init() -> None:
     """Initialize local SQLite schema and artifact directories."""
     _print(_pipeline().initialize())
+
+
+@app.command("verify-installation")
+def verify_installation_command() -> None:
+    """Verify packaged files against release-manifest.json."""
+    result = verify_installation(resolve_runtime_paths().package_dir)
+    _print(result.safe_dict())
+    if result.status not in {"verified", "unsigned_verified"}:
+        raise typer.Exit(code=2)
+
+
+@host_app.command("run")
+def host_run(open_browser: bool = typer.Option(False, "--open-browser")) -> None:
+    """Run the local loopback host supervisor."""
+    result = run_host(open_browser=open_browser)
+    _print(result.safe_dict())
+
+
+@host_app.command("status")
+def host_status_command() -> None:
+    """Show safe local host state."""
+    _print(host_status(resolve_runtime_paths()))
+
+
+@host_app.command("open")
+def host_open() -> None:
+    """Open the browser for the existing local host."""
+    status_payload = host_status(resolve_runtime_paths())
+    port = status_payload.get("port")
+    if not isinstance(port, int):
+        typer.echo("host is not running", err=True)
+        raise typer.Exit(code=2)
+    import webbrowser
+
+    webbrowser.open(f"http://127.0.0.1:{port}/")
+    _print({"opened": True, "port": port})
+
+
+@host_app.command("stop")
+def host_stop(confirm: bool = typer.Option(False, "--confirm")) -> None:
+    """Gracefully stop the desktop local host."""
+    if not confirm:
+        typer.echo("host stop requires --confirm", err=True)
+        raise typer.Exit(code=2)
+    paths = resolve_runtime_paths()
+    status_payload = host_status(paths)
+    port = status_payload.get("port")
+    if not isinstance(port, int):
+        _print({"state": "stopped"})
+        return
+    token_path = paths.runtime_dir / "control.token"
+    try:
+        token = token_path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        typer.echo("control token is not available", err=True)
+        raise typer.Exit(code=2) from exc
+    response = httpx.post(
+        f"http://127.0.0.1:{port}/runtime/shutdown",
+        headers={"X-SentinelUEBA-Control-Token": token},
+        json={"confirm": True},
+        timeout=5,
+    )
+    _print({"status_code": response.status_code, "body": response.json()})
+    if response.status_code >= 400:
+        raise typer.Exit(code=2)
+
+
+@host_app.command("doctor")
+def host_doctor() -> None:
+    """Run safe runtime diagnostics."""
+    report = doctor(resolve_runtime_paths())
+    _print(report)
+    raise typer.Exit(code=exit_code(report))
+
+
+@runtime_app.command("import-data")
+def runtime_import_data(
+    source: Path = typer.Option(..., "--source"),
+    confirm: bool = typer.Option(False, "--confirm"),
+) -> None:
+    """Preview or import prior runtime data into the managed runtime root."""
+    paths = resolve_runtime_paths()
+    if not confirm:
+        _print(preview_import(source))
+        raise typer.Exit(code=2)
+    _print(import_data(source, paths, confirm=confirm))
+
+
+@service_app.command("install")
+def service_install(confirm: bool = typer.Option(False, "--confirm")) -> None:
+    """Install optional Windows Service; Windows admin only."""
+    try:
+        _print(install_service(confirm=confirm))
+    except (PermissionError, RuntimeError, ValueError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+
+
+@service_app.command("uninstall")
+def service_uninstall(confirm: bool = typer.Option(False, "--confirm")) -> None:
+    """Uninstall optional Windows Service without deleting user data."""
+    try:
+        _print(uninstall_service(confirm=confirm))
+    except (RuntimeError, ValueError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+
+
+@service_app.command("start")
+def service_start() -> None:
+    """Start optional Windows Service."""
+    adapter = service_adapter()
+    try:
+        adapter.start()
+        _print({"service": "SentinelUEBA", "status": adapter.status()})
+    except RuntimeError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+
+
+@service_app.command("stop")
+def service_stop(confirm: bool = typer.Option(False, "--confirm")) -> None:
+    """Stop optional Windows Service."""
+    if not confirm:
+        typer.echo("service stop requires --confirm", err=True)
+        raise typer.Exit(code=2)
+    adapter = service_adapter()
+    try:
+        adapter.stop()
+        _print({"service": "SentinelUEBA", "status": adapter.status()})
+    except RuntimeError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+
+
+@service_app.command("restart")
+def service_restart(confirm: bool = typer.Option(False, "--confirm")) -> None:
+    """Restart optional Windows Service."""
+    if not confirm:
+        typer.echo("service restart requires --confirm", err=True)
+        raise typer.Exit(code=2)
+    adapter = service_adapter()
+    try:
+        adapter.stop()
+        adapter.start()
+        _print({"service": "SentinelUEBA", "status": adapter.status()})
+    except RuntimeError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+
+
+@service_app.command("status")
+def service_status() -> None:
+    """Show optional Windows Service status."""
+    adapter = service_adapter()
+    _print({"service": "SentinelUEBA", "status": adapter.status()})
+
+
+@service_app.command("logs")
+def service_logs() -> None:
+    """Show safe service log location hint."""
+    _print({"logs": service_adapter().logs()})
+
+
+@service_app.command("debug-smoke")
+def service_debug_smoke() -> None:
+    """Validate service entry metadata without SCM install."""
+    _print(run_service_debug_smoke())
 
 
 @app.command("generate-demo")
