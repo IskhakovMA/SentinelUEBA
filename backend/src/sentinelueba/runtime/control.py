@@ -63,11 +63,20 @@ def read_status(path: Path) -> RuntimeStatus | None:
         return None
 
 
-def status_now(*, port: int, mode: str, version: str, state: str, identity: str) -> RuntimeStatus:
+def status_now(
+    *,
+    port: int,
+    mode: str,
+    version: str,
+    state: str,
+    identity: str,
+    started_at: str | None = None,
+) -> RuntimeStatus:
     return RuntimeStatus(
         pid=os.getpid(),
         process_identity=identity,
-        started_at=datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        started_at=started_at
+        or datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         port=port,
         mode=mode,
         version=version,

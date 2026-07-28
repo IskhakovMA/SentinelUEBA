@@ -53,14 +53,14 @@ def _windows_known_folder(name: str, fallback: Path) -> Path:
 
 
 def runtime_mode(service: bool = False) -> RuntimeMode:
+    if service:
+        return "service"
     override = os.getenv("SENTINELUEBA_RUNTIME_MODE")
     if override == "development":
         return "development"
     if override == "desktop":
         return "desktop"
     if override == "service":
-        return "service"
-    if service:
         return "service"
     if is_packaged():
         return "desktop"
@@ -83,12 +83,14 @@ def default_root(mode: RuntimeMode) -> Path:
 
 def resolve_runtime_paths(*, service: bool = False) -> RuntimePaths:
     mode = runtime_mode(service=service)
-    root = (_env_path("SENTINELUEBA_RUNTIME_ROOT") or default_root(mode)).resolve()
-    data_dir = (_env_path("SENTINELUEBA_DATA_DIR") or root / "data").resolve()
-    database_path = (
-        _env_path("SENTINELUEBA_DATABASE_PATH") or data_dir / "sentinelueba.sqlite3"
-    ).resolve()
-    model_dir = (_env_path("SENTINELUEBA_MODEL_DIR") or root / "models").resolve()
+    root_override = None if mode == "service" else _env_path("SENTINELUEBA_RUNTIME_ROOT")
+    root = (root_override or default_root(mode)).resolve()
+    data_override = None if mode == "service" else _env_path("SENTINELUEBA_DATA_DIR")
+    data_dir = (data_override or root / "data").resolve()
+    database_override = None if mode == "service" else _env_path("SENTINELUEBA_DATABASE_PATH")
+    database_path = (database_override or data_dir / "sentinelueba.sqlite3").resolve()
+    model_override = None if mode == "service" else _env_path("SENTINELUEBA_MODEL_DIR")
+    model_dir = (model_override or root / "models").resolve()
     paths = RuntimePaths(
         mode=mode,
         root=root,

@@ -134,7 +134,7 @@ def verify_installation_command() -> None:
 
 
 @host_app.command("run")
-def host_run(open_browser: bool = typer.Option(False, "--open-browser")) -> None:
+def host_run(open_browser: bool | None = typer.Option(None, "--open-browser")) -> None:
     """Run the local loopback host supervisor."""
     result = run_host(open_browser=open_browser)
     _print(result.safe_dict())

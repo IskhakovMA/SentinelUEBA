@@ -156,6 +156,7 @@ async def runtime_status() -> ApiResponse:
             "mode": context.mode,
             "port": context.port,
             "version": __version__,
+            "config_warning": context.config_warning,
         }
     )
 

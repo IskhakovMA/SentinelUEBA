@@ -6,6 +6,8 @@ Service id: `SentinelUEBA`
 
 Display name: `SentinelUEBA Local Host`
 
+Account: `NT AUTHORITY\LocalService`
+
 Install:
 
 ```powershell
@@ -26,7 +28,12 @@ SentinelUEBA.exe service stop --confirm
 ```
 
 The service is Windows-only, manual-start, loopback-only, and uses `%PROGRAMDATA%\SentinelUEBA`.
-It does not change Windows Firewall rules and does not delete user data on uninstall.
+It does not change Windows Firewall rules, does not create an autostart entry, and does not delete
+user data on uninstall. Install writes a quoted `SentinelUEBAService.exe` service path and configures
+three bounded restart attempts rather than an infinite restart policy.
+
+The frozen service entry uses the pywin32 SCM dispatcher for normal service execution. Explicit
+management/debug commands use the pywin32 command-line handler or the safe debug smoke path.
 
 User-session telemetry collection is disabled in service mode by default. `POST /collection/start`
 returns HTTP 409 with a safe explanation because desktop user collectors belong to an interactive

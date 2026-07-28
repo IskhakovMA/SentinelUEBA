@@ -40,7 +40,12 @@ def default_config(mode: str = "development") -> RuntimeConfig:
 
 def load_config(path: Path, *, mode: str = "development") -> tuple[RuntimeConfig, str | None]:
     try:
-        return RuntimeConfig.model_validate_json(path.read_text(encoding="utf-8")), None
+        config = RuntimeConfig.model_validate_json(path.read_text(encoding="utf-8"))
+        if config.runtime_mode != mode:
+            warning = "config runtime_mode ignored because process mode is authoritative"
+            config = config.model_copy(update={"runtime_mode": mode})
+            return config, warning
+        return config, None
     except FileNotFoundError:
         return default_config(mode), None
     except ValueError as exc:

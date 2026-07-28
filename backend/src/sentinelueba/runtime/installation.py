@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 import os
 import sys
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Literal
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Literal, Protocol
+
+from sentinelueba import __version__
 
 VerificationStatus = Literal[
     "verified",
@@ -51,6 +54,39 @@ class VerificationResult:
             "checked_files": self.checked_files,
             "errors": self.errors,
         }
+
+
+class AuthenticodeVerifier(Protocol):
+    def verify(self, path: Path) -> bool: ...
+
+
+class WindowsTrustAdapter:
+    def verify(self, path: Path) -> bool:
+        if os.name != "nt":
+            return False
+        try:
+            import subprocess
+
+            escaped = str(path).replace("'", "''")
+            result = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    (
+                        "$sig=Get-AuthenticodeSignature -LiteralPath "
+                        f"'{escaped}'; "
+                        "if ($sig.Status -eq 'Valid') { exit 0 } else { exit 1 }"
+                    ),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
 
 
 def create_frontend_asset_manifest(frontend_dir: Path) -> dict[str, object]:
@@ -106,12 +142,21 @@ def create_release_manifest(
         "files": files,
         "frontend_manifest_sha256": frontend_manifest_sha256,
         "dependency_inventory_sha256": dependency_inventory_sha256,
+        "executables": [
+            "SentinelUEBA.exe",
+            "SentinelUEBALauncher.exe",
+            "SentinelUEBAService.exe",
+        ],
     }
     payload["manifest_payload_sha256"] = sha256_bytes(canonical_json(payload))
     return payload
 
 
-def verify_installation(package_dir: Path) -> VerificationResult:
+def verify_installation(
+    package_dir: Path,
+    *,
+    authenticode: AuthenticodeVerifier | None = None,
+) -> VerificationResult:
     manifest_path = package_dir / "release-manifest.json"
     try:
         manifest_bytes = manifest_path.read_bytes()
@@ -150,13 +195,26 @@ def verify_installation(package_dir: Path) -> VerificationResult:
 
     errors: list[str] = []
     checked = 0
-    shipped = {str(item.get("path")) for item in manifest["files"] if isinstance(item, dict)}
+    root = package_dir.resolve()
+    seen: set[str] = set()
+    shipped: set[str] = set()
     for item in manifest["files"]:
         if not isinstance(item, dict):
             errors.append("release manifest contains an invalid file record")
             continue
         rel = str(item.get("path"))
-        target = package_dir / rel
+        if not _valid_manifest_path(rel):
+            errors.append(f"unsafe shipped file path: {rel}")
+            continue
+        if rel in seen:
+            errors.append(f"duplicate shipped file path: {rel}")
+            continue
+        seen.add(rel)
+        target = (package_dir / rel).resolve()
+        if target != root and root not in target.parents:
+            errors.append(f"shipped file escapes package root: {rel}")
+            continue
+        shipped.add(rel)
         if not target.exists():
             errors.append(f"missing shipped file: {rel}")
             continue
@@ -170,6 +228,37 @@ def verify_installation(package_dir: Path) -> VerificationResult:
         if sha256_file(target) != item.get("sha256"):
             errors.append(f"modified shipped file: {rel}")
 
+    if manifest.get("application_version") != __version__:
+        errors.append("release manifest application version does not match runtime version")
+    if manifest.get("target_platform") != "Windows":
+        errors.append("release manifest target platform is invalid")
+    if manifest.get("target_architecture") != "x64":
+        errors.append("release manifest target architecture is invalid")
+    if manifest.get("packaged_mode") != "pyinstaller-one-folder":
+        errors.append("release manifest packaged mode is invalid")
+    expected_exes = {"SentinelUEBA.exe", "SentinelUEBALauncher.exe", "SentinelUEBAService.exe"}
+    manifest_exes = set(manifest.get("executables", []))
+    if manifest_exes != expected_exes:
+        errors.append("release manifest executable list is invalid")
+    for executable in expected_exes:
+        if executable not in shipped:
+            errors.append(f"missing expected executable record: {executable}")
+
+    frontend_manifest = package_dir / "frontend" / "frontend-assets.json"
+    expected_frontend_hash = manifest.get("frontend_manifest_sha256")
+    if expected_frontend_hash is not None:
+        if not frontend_manifest.is_file():
+            errors.append("frontend asset manifest is missing")
+        elif sha256_file(frontend_manifest) != expected_frontend_hash:
+            errors.append("frontend asset manifest hash mismatch")
+
+    inventory = package_dir / "dependency-inventory.json"
+    expected_inventory_hash = manifest.get("dependency_inventory_sha256")
+    if not inventory.is_file():
+        errors.append("dependency inventory is missing")
+    elif sha256_file(inventory) != expected_inventory_hash:
+        errors.append("dependency inventory hash mismatch")
+
     executable_suffixes = {".exe", ".dll", ".pyd"}
     for path in package_dir.rglob("*"):
         if path.is_file() and path.suffix.lower() in executable_suffixes:
@@ -179,20 +268,75 @@ def verify_installation(package_dir: Path) -> VerificationResult:
 
     manifest_sha = sha256_file(manifest_path)
     signed = bool(manifest.get("signed"))
+    if signed:
+        verifier = authenticode or WindowsTrustAdapter()
+        signed_targets = [
+            path
+            for path in package_dir.rglob("*")
+            if path.is_file() and path.suffix.lower() in executable_suffixes
+        ]
+        invalid = [
+            path.relative_to(package_dir).as_posix()
+            for path in signed_targets
+            if not verifier.verify(path)
+        ]
+        if invalid:
+            errors.append(f"invalid Authenticode signature: {invalid[0]}")
     if errors:
         return VerificationResult("tampered", signed, manifest_sha, checked, errors)
     status: VerificationStatus = "verified" if signed else "unsigned_verified"
     return VerificationResult(status, signed, manifest_sha, checked, [])
 
 
+def _valid_manifest_path(value: str) -> bool:
+    if not value or "\\" in value:
+        return False
+    posix = PurePosixPath(value)
+    windows = PureWindowsPath(value)
+    return (
+        not posix.is_absolute()
+        and ".." not in posix.parts
+        and not windows.is_absolute()
+        and windows.drive == ""
+        and not value.startswith("//")
+    )
+
+
 def current_executable_name() -> str:
     return Path(sys.executable).name if getattr(sys, "frozen", False) else Path(sys.argv[0]).name
 
 
-def dependency_inventory_hash() -> str:
-    payload = {
+def create_dependency_inventory() -> dict[str, object]:
+    packages: list[dict[str, object]] = []
+    for distribution in importlib.metadata.distributions():
+        metadata = distribution.metadata
+        name = metadata.get("Name")
+        if not name:
+            continue
+        packages.append(
+            {
+                "name": name.casefold().replace("_", "-"),
+                "version": distribution.version,
+                "license": metadata.get("License") or metadata.get("Classifier", "unknown"),
+            }
+        )
+    packages.sort(key=lambda item: (str(item["name"]), str(item["version"])))
+    return {
+        "schema_version": 1,
         "python": sys.version.split()[0],
-        "executable": current_executable_name(),
-        "path_lookup": os.getenv("PATH") is not None,
+        "packages": packages,
     }
-    return sha256_bytes(canonical_json(payload))
+
+
+def write_dependency_inventory(package_dir: Path) -> Path:
+    target = package_dir / "dependency-inventory.json"
+    target.write_bytes(canonical_json(create_dependency_inventory()))
+    return target
+
+
+def dependency_inventory_hash(package_dir: Path | None = None) -> str:
+    if package_dir is not None:
+        inventory = package_dir / "dependency-inventory.json"
+        if inventory.is_file():
+            return sha256_file(inventory)
+    return sha256_bytes(canonical_json(create_dependency_inventory()))

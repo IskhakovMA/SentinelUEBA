@@ -24,6 +24,16 @@ class Settings(BaseSettings):
 
 
 def get_settings() -> Settings:
+    from sentinelueba.runtime.state import get_runtime_context
+
+    context = get_runtime_context()
+    if context.mode in {"desktop", "service"} and context.database_path is not None:
+        return Settings(
+            data_dir=context.data_dir or context.database_path.parent,
+            database_path=context.database_path,
+            model_dir=context.model_dir or context.database_path.parent.parent / "models",
+            log_level=context.log_level,
+        )
     runtime = resolve_runtime_paths()
     if runtime.mode == "development":
         return Settings()

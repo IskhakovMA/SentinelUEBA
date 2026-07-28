@@ -148,9 +148,9 @@ The repository is a full-stack monorepo with a modular monolith backend:
 - `frontend`: React, TypeScript, Vite dashboard.
 - `docs`: architecture, privacy, threat model, and development notes.
 
-## Stage 4 Limits
+## Stage 5 Limits
 
-No Windows Service, MSI, autostart, Linux collectors, ETW, kernel driver, cloud backend, SIEM integration, alerts, packet capture, keylogging, clipboard, browser history, traffic payload inspection, live blocking, automated response, arbitrary user Python/SQL/shell rules, online learning, retraining, autopromotion, supervised security labels, or production alerting are implemented. Generated databases, snapshots, model bundles, identity secrets, logs, and reports are excluded from Git.
+No MSI, automatic install, autostart, firewall rule, Linux collectors, ETW, kernel driver, cloud backend, SIEM integration, alerts, packet capture, keylogging, clipboard, browser history, traffic payload inspection, live blocking, automated response, arbitrary user Python/SQL/shell rules, online learning, retraining, autopromotion, supervised security labels, or production alerting are implemented. The Windows Service is optional, manual-start, loopback-only, and runs from the portable package after explicit install. Generated databases, snapshots, model bundles, identity secrets, logs, and reports are excluded from Git.
 
 ## Development
 
@@ -168,4 +168,4 @@ Python dependencies are managed with `uv`; frontend dependencies use `pnpm`.
 
 ## Roadmap
 
-Stage 5 can focus on packaging and operational hardening. Live alerts, Windows Service packaging, SIEM export, and cloud backends remain out of scope for Stage 4.
+Stage 6 can focus on post-Stage 5 productization only after the portable runtime, optional service, and package integrity checks are stable. Live alerts, SIEM export, and cloud backends remain out of scope for Stage 5.

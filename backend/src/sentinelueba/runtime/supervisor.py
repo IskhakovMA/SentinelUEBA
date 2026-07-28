@@ -6,6 +6,7 @@ import time
 import webbrowser
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,7 @@ from sentinelueba.collectors.manager import get_manager
 from sentinelueba.config import Settings
 from sentinelueba.detection.worker_manager import get_detection_worker_manager
 from sentinelueba.runtime.build_info import is_packaged
+from sentinelueba.runtime.configuration import load_config
 from sentinelueba.runtime.control import (
     new_control_token,
     new_process_identity,
@@ -24,13 +26,13 @@ from sentinelueba.runtime.control import (
     write_private_text,
     write_status,
 )
-from sentinelueba.runtime.diagnostics import backup_before_migration, doctor
+from sentinelueba.runtime.diagnostics import doctor, migrate_with_backup
 from sentinelueba.runtime.installation import verify_installation
 from sentinelueba.runtime.instance import InstanceAlreadyRunningError, SingleInstanceLock
 from sentinelueba.runtime.logging import configure_runtime_logging, log_event
 from sentinelueba.runtime.paths import RuntimePaths, resolve_runtime_paths
+from sentinelueba.runtime.security import protect_runtime_secret
 from sentinelueba.runtime.state import get_runtime_context, update_runtime_context
-from sentinelueba.storage.sqlite import SQLiteStorage
 
 
 @dataclass(frozen=True)
@@ -100,12 +102,20 @@ def host_status(paths: RuntimePaths | None = None) -> dict[str, object]:
 
 def run_host(
     *,
-    open_browser: bool = False,
+    open_browser: bool | None = None,
     preferred_port: int | None = None,
     service: bool = False,
+    startup_timeout_seconds: float = 15.0,
 ) -> HostRunResult:
     paths = resolve_runtime_paths(service=service)
     paths.ensure()
+    mode = "service" if service else paths.mode
+    for directory in (paths.root, paths.runtime_dir, paths.config_dir):
+        with suppress(Exception):
+            protect_runtime_secret(directory, mode=mode, directory=True)
+    config, config_warning = load_config(paths.config_dir / "config.json", mode=mode)
+    effective_port = preferred_port if preferred_port is not None else config.preferred_port
+    effective_open_browser = bool(open_browser) if open_browser is not None else config.open_browser
     token = new_control_token()
     configure_runtime_logging(
         paths.logs_dir,
@@ -114,9 +124,14 @@ def run_host(
     status_path = paths.runtime_dir / "status.json"
     token_path = paths.runtime_dir / "control.token"
     identity = new_process_identity()
-    mode = "service" if service else paths.mode
+    started_at = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    owns_instance = False
+    owns_runtime_files = False
+    server: uvicorn.Server | None = None
+    thread: threading.Thread | None = None
     try:
         with SingleInstanceLock(paths.data_dir, paths.runtime_dir, status_path):
+            owns_instance = True
             update_runtime_context(
                 mode=mode,
                 state="starting",
@@ -124,9 +139,19 @@ def run_host(
                 process_identity=identity,
                 shutdown_disabled=service,
                 service_collection_disabled=service,
+                runtime_root=paths.root,
+                data_dir=paths.data_dir,
+                database_path=paths.database_path,
+                model_dir=paths.model_dir,
+                logs_dir=paths.logs_dir,
+                config_warning=config_warning,
+                log_level=config.log_level,
             )
             write_private_text(token_path, token)
-            port = find_loopback_port(preferred_port)
+            with suppress(Exception):
+                protect_runtime_secret(token_path, mode=mode)
+            owns_runtime_files = True
+            port = find_loopback_port(effective_port)
             write_status(
                 status_path,
                 status_now(
@@ -135,8 +160,11 @@ def run_host(
                     version=__version__,
                     state="starting",
                     identity=identity,
+                    started_at=started_at,
                 ),
             )
+            with suppress(Exception):
+                protect_runtime_secret(status_path, mode=mode)
             if is_packaged():
                 verification = verify_installation(paths.package_dir)
                 if verification.status not in {"verified", "unsigned_verified"}:
@@ -149,43 +177,86 @@ def run_host(
                             version=__version__,
                             state="failed",
                             identity=identity,
+                            started_at=started_at,
                         ),
                     )
                     return HostRunResult("failed", port, None)
-            backup_before_migration(paths)
-            storage = SQLiteStorage(paths.database_path)
-            storage.initialize()
+            migration = migrate_with_backup(paths)
+            if migration.get("status") == "failed":
+                update_runtime_context(state="failed")
+                write_status(
+                    status_path,
+                    status_now(
+                        port=port,
+                        mode=mode,
+                        version=__version__,
+                        state="failed",
+                        identity=identity,
+                        started_at=started_at,
+                    ),
+                )
+                return HostRunResult("failed", port, None)
             frontend_ready = check_frontend_assets(paths)
             update_runtime_context(
                 port=port,
-                state="ready" if frontend_ready else "degraded",
+                state="starting",
                 frontend_ready=frontend_ready,
                 database_ready=True,
                 data_root_writable=True,
             )
+            uvicorn_config = uvicorn.Config(
+                fastapi_app,
+                host=config.bind_host,
+                port=port,
+                log_config=None if service else uvicorn.config.LOGGING_CONFIG,
+                log_level=config.log_level.lower(),
+                access_log=False,
+            )
+            server = uvicorn.Server(uvicorn_config)
+            thread = threading.Thread(target=server.run, daemon=True)
+            thread.start()
+            if not _wait_for_server_start(server, thread, port, startup_timeout_seconds):
+                update_runtime_context(state="failed")
+                write_status(
+                    status_path,
+                    status_now(
+                        port=port,
+                        mode=mode,
+                        version=__version__,
+                        state="failed",
+                        identity=identity,
+                        started_at=started_at,
+                    ),
+                )
+                server.should_exit = True
+                thread.join(timeout=5)
+                return HostRunResult("failed", port, None)
+            final_state = "ready" if frontend_ready else "degraded"
+            update_runtime_context(state=final_state)
             write_status(
                 status_path,
                 status_now(
                     port=port,
                     mode=mode,
                     version=__version__,
-                    state="ready" if frontend_ready else "degraded",
+                    state=final_state,
                     identity=identity,
+                    started_at=started_at,
                 ),
             )
-            config = uvicorn.Config(
-                fastapi_app,
-                host="127.0.0.1",
-                port=port,
-                log_level="warning",
-                access_log=False,
-            )
-            server = uvicorn.Server(config)
-            thread = threading.Thread(target=server.run, daemon=True)
-            thread.start()
             url = f"http://127.0.0.1:{port}/"
-            if open_browser and not service:
+            if effective_open_browser and not service:
                 webbrowser.open(url)
+            if config.detection_worker_enabled:
+                with suppress(Exception):
+                    get_detection_worker_manager().start(
+                        database_path=paths.database_path,
+                        data_dir=paths.data_dir,
+                        model_dir=paths.model_dir,
+                        dataset_kind=config.worker_dataset_kind,
+                        interval_seconds=config.worker_interval_seconds,
+                        max_windows=config.worker_max_windows,
+                    )
             log_event("supervisor", "host_ready", "SentinelUEBA host is ready")
             while thread.is_alive():
                 if get_runtime_context().shutdown_requested:
@@ -199,7 +270,10 @@ def run_host(
     except InstanceAlreadyRunningError as exc:
         status = exc.status
         existing_url = f"http://127.0.0.1:{status.port}/" if status is not None else None
-        if open_browser and existing_url is not None:
+        should_open_existing = open_browser is True or (
+            open_browser is None and config.open_browser
+        )
+        if should_open_existing and existing_url is not None:
             webbrowser.open(existing_url)
         return HostRunResult(
             "ready",
@@ -208,15 +282,20 @@ def run_host(
             already_running=True,
         )
     finally:
-        token_path.unlink(missing_ok=True)
-        status_path.unlink(missing_ok=True)
-        update_runtime_context(
-            state="stopped",
-            port=None,
-            control_token=None,
-            process_identity=None,
-            shutdown_requested=False,
-        )
+        if owns_instance and owns_runtime_files:
+            if server is not None:
+                server.should_exit = True
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=5)
+            token_path.unlink(missing_ok=True)
+            status_path.unlink(missing_ok=True)
+            update_runtime_context(
+                state="stopped",
+                port=None,
+                control_token=None,
+                process_identity=None,
+                shutdown_requested=False,
+            )
 
 
 def request_shutdown() -> None:
@@ -236,6 +315,30 @@ def _shutdown_owned_managers(paths: RuntimePaths) -> None:
         data_dir=paths.data_dir,
         model_dir=paths.model_dir,
     )
+
+
+def _wait_for_server_start(
+    server: uvicorn.Server,
+    thread: threading.Thread,
+    port: int,
+    timeout_seconds: float,
+) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if getattr(server, "started", False):
+            return _live_probe(port)
+        if not thread.is_alive():
+            return False
+        if _live_probe(port):
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def _live_probe(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.2)
+        return sock.connect_ex(("127.0.0.1", port)) == 0
 
 
 def doctor_report() -> dict[str, Any]:

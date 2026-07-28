@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
+import sys
+import types
+from contextlib import suppress
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -16,15 +21,23 @@ from sentinelueba.runtime.diagnostics import backup_before_migration
 from sentinelueba.runtime.installation import (
     canonical_json,
     create_release_manifest,
-    dependency_inventory_hash,
+    sha256_bytes,
     sha256_file,
     verify_installation,
+    write_dependency_inventory,
 )
 from sentinelueba.runtime.instance import InstanceAlreadyRunningError, SingleInstanceLock
 from sentinelueba.runtime.paths import reject_escape, resolve_runtime_paths
-from sentinelueba.runtime.service import UnsupportedServiceAdapter, install_service
+from sentinelueba.runtime.service import (
+    SERVICE_ACCOUNT,
+    SERVICE_DISPLAY_NAME,
+    SERVICE_ID,
+    PyWin32ServiceAdapter,
+    UnsupportedServiceAdapter,
+    install_service,
+)
 from sentinelueba.runtime.state import update_runtime_context
-from sentinelueba.runtime.supervisor import check_frontend_assets
+from sentinelueba.runtime.supervisor import check_frontend_assets, run_host
 from sentinelueba.storage.sqlite import DB_SCHEMA_VERSION, SQLiteStorage
 
 
@@ -41,7 +54,42 @@ def reset_runtime_context() -> None:
         data_root_writable=False,
         service_collection_disabled=False,
         shutdown_requested=False,
+        runtime_root=None,
+        data_dir=None,
+        database_path=None,
+        model_dir=None,
+        logs_dir=None,
+        config_warning=None,
+        log_level="INFO",
     )
+
+
+def create_package_fixture(
+    package: Path,
+    *,
+    signed: bool = False,
+    version: str = "0.5.0",
+) -> dict[str, object]:
+    package.mkdir(parents=True, exist_ok=True)
+    for name in ("SentinelUEBA.exe", "SentinelUEBALauncher.exe", "SentinelUEBAService.exe"):
+        (package / name).write_text(name, encoding="utf-8")
+    frontend = package / "frontend"
+    frontend.mkdir()
+    (frontend / "index.html").write_text("<div>SentinelUEBA</div>", encoding="utf-8")
+    frontend_manifest = frontend / "frontend-assets.json"
+    frontend_manifest.write_text("{}", encoding="utf-8")
+    inventory = write_dependency_inventory(package)
+    manifest = create_release_manifest(
+        package,
+        version=version,
+        git_commit="abc123",
+        build_timestamp_utc="2026-07-28T10:00:00Z",
+        signed=signed,
+        frontend_manifest_sha256=sha256_file(frontend_manifest),
+        dependency_inventory_sha256=sha256_file(inventory),
+    )
+    (package / "release-manifest.json").write_bytes(canonical_json(manifest))
+    return manifest
 
 
 def test_stage5_version_and_build_identity_are_safe(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -59,6 +107,29 @@ def test_stage5_version_and_build_identity_are_safe(monkeypatch: pytest.MonkeyPa
     username = os.getenv("USER")
     if username:
         assert username not in blob
+
+
+def test_stage5_packaged_build_identity_comes_from_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "SentinelUEBA"
+    manifest = create_package_fixture(package)
+    monkeypatch.setenv("SENTINELUEBA_PACKAGED", "1")
+    monkeypatch.setenv("SENTINELUEBA_PACKAGE_ROOT", str(package))
+    monkeypatch.setenv("SENTINELUEBA_BUILD_COMMIT", "development")
+    monkeypatch.setenv("SENTINELUEBA_BUILD_TIMESTAMP_UTC", "now")
+    monkeypatch.setenv("SENTINELUEBA_SIGNED", "1")
+
+    first = get_build_info().safe_dict()
+    second = get_build_info().safe_dict()
+
+    assert first["application_version"] == __version__
+    assert first["git_commit"] == manifest["git_commit"]
+    assert first["git_commit"] != "development"
+    assert first["build_timestamp_utc"] == "2026-07-28T10:00:00Z"
+    assert second["build_timestamp_utc"] == first["build_timestamp_utc"]
+    assert first["signed"] is False
 
 
 def test_stage5_runtime_paths_desktop_service_dev_and_escape(
@@ -83,6 +154,11 @@ def test_stage5_runtime_paths_desktop_service_dev_and_escape(
     assert service.mode == "service"
     assert service.root == (program_data / "SentinelUEBA").resolve()
 
+    monkeypatch.setenv("SENTINELUEBA_RUNTIME_ROOT", str(tmp_path / "desktop override"))
+    service_isolated = resolve_runtime_paths(service=True)
+    assert service_isolated.root == (program_data / "SentinelUEBA").resolve()
+    assert local_appdata not in service_isolated.database_path.parents
+
     monkeypatch.setenv("SENTINELUEBA_RUNTIME_MODE", "development")
     monkeypatch.setenv("SENTINELUEBA_RUNTIME_ROOT", str(tmp_path / "dev root"))
     dev = resolve_runtime_paths()
@@ -93,31 +169,110 @@ def test_stage5_runtime_paths_desktop_service_dev_and_escape(
         reject_escape(tmp_path / "outside", desktop.root)
 
 
-def test_stage5_installation_verification_detects_tamper(tmp_path: Path) -> None:
+def test_stage5_installation_verification_detects_tamper_and_path_attacks(tmp_path: Path) -> None:
     package = tmp_path / "SentinelUEBA"
-    package.mkdir()
-    (package / "SentinelUEBA.exe").write_text("exe", encoding="utf-8")
-    frontend = package / "frontend"
-    frontend.mkdir()
-    frontend_manifest = frontend / "frontend-assets.json"
-    frontend_manifest.write_text("{}", encoding="utf-8")
+    manifest = create_package_fixture(package)
+
+    verified = verify_installation(package)
+    assert verified.status == "unsigned_verified"
+    assert verified.checked_files >= 5
+
+    (package / "SentinelUEBA.exe").write_text("tampered", encoding="utf-8")
+    assert verify_installation(package).status == "tampered"
+
+    (package / "SentinelUEBA.exe").write_text("SentinelUEBA.exe", encoding="utf-8")
+    bad = dict(manifest)
+    bad["files"] = [*manifest["files"], {"path": "../escape.txt", "size": 0, "sha256": "x"}]
+    bad.pop("manifest_payload_sha256", None)
+    bad["manifest_payload_sha256"] = sha256_file(package / "SentinelUEBA.exe")
+    (package / "release-manifest.json").write_bytes(canonical_json(bad))
+    assert "canonical hash mismatch" in verify_installation(package).errors[0]
+
+
+def test_stage5_manifest_rejects_duplicate_absolute_and_fake_signed(
+    tmp_path: Path,
+) -> None:
+    package = tmp_path / "SentinelUEBA"
+    manifest = create_package_fixture(package, signed=True)
+    files = list(manifest["files"])
+    files.append(dict(files[0]))
+    files.append({"path": "C:/escape.exe", "size": 1, "sha256": "x"})
+    payload = dict(manifest, files=files)
+    payload.pop("manifest_payload_sha256", None)
+    payload["manifest_payload_sha256"] = sha256_bytes(canonical_json(payload))
+    (package / "release-manifest.json").write_bytes(canonical_json(payload))
+
+    class RejectingTrust:
+        def verify(self, path: Path) -> bool:
+            return False
+
+    result = verify_installation(package, authenticode=RejectingTrust())
+    assert result.status == "tampered"
+    assert any("duplicate" in error for error in result.errors)
+    assert any("unsafe" in error for error in result.errors)
+    assert any("Authenticode" in error for error in result.errors)
+
+
+def test_stage5_manifest_rejects_consistency_and_inventory_mismatches(tmp_path: Path) -> None:
+    package = tmp_path / "wrong-version"
+    manifest = create_package_fixture(package)
+
+    changed = dict(manifest)
+    changed["application_version"] = "9.9.9"
+    changed.pop("manifest_payload_sha256", None)
+    changed["manifest_payload_sha256"] = sha256_bytes(canonical_json(changed))
+    (package / "release-manifest.json").write_bytes(canonical_json(changed))
+    assert "application version" in " ".join(verify_installation(package).errors)
+
+    package = tmp_path / "wrong-frontend-manifest"
+    create_package_fixture(package)
+    (package / "frontend" / "frontend-assets.json").write_text("changed", encoding="utf-8")
+    assert "frontend asset manifest hash mismatch" in verify_installation(package).errors
+
+    package = tmp_path / "wrong-inventory"
+    create_package_fixture(package)
+    (package / "dependency-inventory.json").write_text("changed", encoding="utf-8")
+    assert "dependency inventory hash mismatch" in verify_installation(package).errors
+
+    package = tmp_path / "modified-frontend"
+    create_package_fixture(package)
+    (package / "frontend" / "index.html").write_text("changed", encoding="utf-8")
+    result = verify_installation(package)
+    assert any("modified shipped file: frontend/index.html" in error for error in result.errors)
+
+    package = tmp_path / "extra-exe"
+    create_package_fixture(package)
+    (package / "extra.exe").write_text("extra", encoding="utf-8")
+    assert "extra executable or library: extra.exe" in verify_installation(package).errors
+
+
+def test_stage5_manifest_rejects_symlink_escape(tmp_path: Path) -> None:
+    package = tmp_path / "SentinelUEBA"
+    create_package_fixture(package)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside", encoding="utf-8")
+    link = package / "linked.txt"
+    with suppress(OSError):
+        link.symlink_to(outside)
+    if not link.exists():
+        pytest.skip("symlink creation is unavailable")
+    inventory = package / "dependency-inventory.json"
+    frontend_manifest = package / "frontend" / "frontend-assets.json"
     manifest = create_release_manifest(
         package,
-        version="0.5.0",
+        version=__version__,
         git_commit="abc123",
         build_timestamp_utc="2026-07-28T10:00:00Z",
         signed=False,
         frontend_manifest_sha256=sha256_file(frontend_manifest),
-        dependency_inventory_sha256=dependency_inventory_hash(),
+        dependency_inventory_sha256=sha256_file(inventory),
     )
     (package / "release-manifest.json").write_bytes(canonical_json(manifest))
 
-    verified = verify_installation(package)
-    assert verified.status == "unsigned_verified"
-    assert verified.checked_files == 2
+    result = verify_installation(package)
 
-    (package / "SentinelUEBA.exe").write_text("tampered", encoding="utf-8")
-    assert verify_installation(package).status == "tampered"
+    assert result.status == "tampered"
+    assert "shipped file escapes package root: linked.txt" in result.errors
 
 
 def test_stage5_control_token_host_origin_shutdown_and_service_collection(
@@ -216,6 +371,87 @@ def test_stage5_single_instance_file_lock_and_stale_recovery(tmp_path: Path) -> 
         pass
 
 
+def test_stage5_second_launcher_preserves_owner_runtime_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SENTINELUEBA_RUNTIME_MODE", "desktop")
+    monkeypatch.setenv("SENTINELUEBA_RUNTIME_ROOT", str(tmp_path / "runtime"))
+    paths = resolve_runtime_paths()
+    paths.ensure()
+    status_path = paths.runtime_dir / "status.json"
+    token_path = paths.runtime_dir / "control.token"
+    status = status_now(
+        port=8765,
+        mode="desktop",
+        version="0.5.0",
+        state="ready",
+        identity="owner",
+        started_at="2026-07-28T10:00:00Z",
+    )
+    write_status(status_path, status)
+    token_path.write_text("owner-token", encoding="utf-8")
+    before_status = status_path.read_text(encoding="utf-8")
+    before_token = token_path.read_text(encoding="utf-8")
+
+    class BusyLock:
+        def __init__(self, *_args: Any) -> None:
+            pass
+
+        def __enter__(self) -> None:
+            raise InstanceAlreadyRunningError(status)
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+    monkeypatch.setattr("sentinelueba.runtime.supervisor.SingleInstanceLock", BusyLock)
+
+    result = run_host(open_browser=False)
+
+    assert result.already_running is True
+    assert status_path.read_text(encoding="utf-8") == before_status
+    assert token_path.read_text(encoding="utf-8") == before_token
+
+
+def test_stage5_service_host_disables_uvicorn_console_logging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PROGRAMDATA", str(tmp_path / "ProgramData"))
+    captured: dict[str, object] = {}
+
+    class FakeServer:
+        def __init__(self, _config: object) -> None:
+            self.should_exit = False
+
+        def run(self) -> None:
+            return None
+
+    def fake_config(*_args: object, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr("sentinelueba.runtime.supervisor.uvicorn.Config", fake_config)
+    monkeypatch.setattr("sentinelueba.runtime.supervisor.uvicorn.Server", FakeServer)
+    monkeypatch.setattr(
+        "sentinelueba.runtime.supervisor.migrate_with_backup",
+        lambda _paths: {"status": "success"},
+    )
+    monkeypatch.setattr(
+        "sentinelueba.runtime.supervisor.check_frontend_assets",
+        lambda _paths: True,
+    )
+    monkeypatch.setattr(
+        "sentinelueba.runtime.supervisor._wait_for_server_start",
+        lambda *_args: False,
+    )
+
+    result = run_host(service=True, startup_timeout_seconds=0.01)
+
+    assert result.state == "failed"
+    assert captured["log_config"] is None
+
+
 def test_stage5_config_strict_validation_and_atomic_backup(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
     config = RuntimeConfig(runtime_mode="desktop", preferred_port=8765)
@@ -232,6 +468,11 @@ def test_stage5_config_strict_validation_and_atomic_backup(tmp_path: Path) -> No
     assert warning is not None
     with pytest.raises(ValueError):
         RuntimeConfig.model_validate({"config_schema_version": 1, "bind_host": "0.0.0.0"})
+
+    write_config(config_path, RuntimeConfig(runtime_mode="service", preferred_port=8767))
+    loaded_mismatch, mode_warning = load_config(config_path, mode="desktop")
+    assert loaded_mismatch.runtime_mode == "desktop"
+    assert mode_warning is not None
 
 
 def test_stage5_migration_backup_and_frontend_asset_check(
@@ -253,6 +494,33 @@ def test_stage5_migration_backup_and_frontend_asset_check(
     assert check_frontend_assets(resolve_runtime_paths()) is False
 
 
+def test_stage5_wal_migration_backup_is_consistent(tmp_path: Path) -> None:
+    monkeypatch_root = tmp_path / "runtime"
+    monkeypatch_root.mkdir()
+    database = monkeypatch_root / "data" / "sentinelueba.sqlite3"
+    database.parent.mkdir()
+    with sqlite3.connect(database) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE schema_version(version INTEGER PRIMARY KEY, applied_at TEXT)")
+        conn.execute("INSERT INTO schema_version(version, applied_at) VALUES (1, 'x')")
+        conn.execute("CREATE TABLE wal_rows(value TEXT)")
+        conn.execute("INSERT INTO wal_rows(value) VALUES ('from-wal')")
+        conn.commit()
+    paths = resolve_runtime_paths()
+    object.__setattr__(paths, "root", monkeypatch_root.resolve())
+    object.__setattr__(paths, "data_dir", database.parent.resolve())
+    object.__setattr__(paths, "database_path", database.resolve())
+    object.__setattr__(paths, "backups_dir", (monkeypatch_root / "backups").resolve())
+
+    result = backup_before_migration(paths)
+
+    assert result["created"] is True
+    backup = paths.backups_dir / str(result["backup"])
+    with sqlite3.connect(backup) as conn:
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert conn.execute("SELECT value FROM wal_rows").fetchone()[0] == "from-wal"
+
+
 def test_stage5_service_unsupported_platform_is_safe() -> None:
     if os.name == "nt":
         pytest.skip("unsupported platform path is non-Windows only")
@@ -260,3 +528,114 @@ def test_stage5_service_unsupported_platform_is_safe() -> None:
     assert adapter.status() == "unsupported"
     with pytest.raises(RuntimeError):
         install_service(confirm=True, adapter=adapter)
+
+
+def test_stage5_service_debug_contract_mentions_localservice() -> None:
+    from sentinelueba.runtime.service import run_service_debug_smoke
+
+    smoke = run_service_debug_smoke()
+    assert smoke["service"] == "SentinelUEBA"
+    assert smoke["account"] == SERVICE_ACCOUNT
+
+
+def test_stage5_pywin32_adapter_installs_real_scm_service(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, object]] = []
+
+    fake_win32service = types.SimpleNamespace(
+        SC_MANAGER_CREATE_SERVICE=1,
+        SERVICE_ALL_ACCESS=2,
+        SERVICE_WIN32_OWN_PROCESS=3,
+        SERVICE_DEMAND_START=4,
+        SERVICE_ERROR_NORMAL=5,
+        SERVICE_CHANGE_CONFIG=6,
+        SERVICE_CONFIG_FAILURE_ACTIONS=7,
+        SC_ACTION_RESTART=8,
+        SC_ACTION_NONE=9,
+        OpenSCManager=lambda *args: calls.append(("open_manager", args)) or "manager",
+        CreateService=lambda *args: calls.append(("create_service", args)) or "service",
+        CloseServiceHandle=lambda handle: calls.append(("close", handle)),
+        ChangeServiceConfig2=lambda *args: calls.append(("recovery", args)),
+    )
+    fake_service_util = types.SimpleNamespace(
+        QueryServiceStatus=lambda *_args: (_ for _ in ()).throw(RuntimeError("missing")),
+        SmartOpenService=lambda *args: calls.append(("smart_open", args)) or "recovery-service",
+        StartService=lambda *_args: None,
+        StopService=lambda *_args: None,
+        RemoveService=lambda *_args: None,
+    )
+    monkeypatch.setitem(sys.modules, "win32service", fake_win32service)
+    monkeypatch.setitem(sys.modules, "win32serviceutil", fake_service_util)
+
+    PyWin32ServiceAdapter().install(tmp_path / "SentinelUEBAService.exe")
+
+    create = next(call for call in calls if call[0] == "create_service")
+    args = create[1]
+    assert args[1] == SERVICE_ID
+    assert args[2] == SERVICE_DISPLAY_NAME
+    assert args[4] == fake_win32service.SERVICE_WIN32_OWN_PROCESS
+    assert args[5] == fake_win32service.SERVICE_DEMAND_START
+    assert str(args[7]).startswith('"')
+    assert str(args[7]).endswith('SentinelUEBAService.exe"')
+    assert args[11] == SERVICE_ACCOUNT
+    recovery = next(call for call in calls if call[0] == "recovery")
+    actions = recovery[1][2]["Actions"]
+    assert actions[:3] == [(fake_win32service.SC_ACTION_RESTART, 60_000)] * 3
+    assert actions[3] == (fake_win32service.SC_ACTION_NONE, 0)
+
+
+def test_stage5_service_dispatcher_and_management_paths_are_mockable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sentinelueba.runtime import service as service_module
+
+    calls: list[tuple[str, object]] = []
+
+    fake_service_manager = types.SimpleNamespace(
+        Initialize=lambda *args: calls.append(("initialize", args)),
+        PrepareToHostSingle=lambda service_class: calls.append(("prepare", service_class)),
+        StartServiceCtrlDispatcher=lambda: calls.append(("dispatch", None)),
+    )
+    fake_service_util = types.SimpleNamespace(
+        HandleCommandLine=lambda service_class: calls.append(("handle", service_class))
+    )
+    monkeypatch.setattr(service_module.os, "name", "nt", raising=False)
+    monkeypatch.setitem(sys.modules, "servicemanager", fake_service_manager)
+    monkeypatch.setitem(sys.modules, "win32serviceutil", fake_service_util)
+
+    service_module.dispatch_service()
+    service_module.handle_service_command_line()
+
+    assert calls[0][0] == "initialize"
+    assert calls[1] == ("prepare", service_module.SentinelUEBAWindowsService)
+    assert calls[2] == ("dispatch", None)
+    assert calls[3] == ("handle", service_module.SentinelUEBAWindowsService)
+
+
+def test_stage5_import_data_rejects_symlink_escape_and_secret(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "event.json").write_text("{}", encoding="utf-8")
+    (source / "control.token").write_text("secret", encoding="utf-8")
+    outside = tmp_path / "outside.secret"
+    outside.write_text("secret", encoding="utf-8")
+    with suppress(OSError):
+        (source / "linked.txt").symlink_to(outside)
+    monkeypatch.setenv("SENTINELUEBA_RUNTIME_MODE", "desktop")
+    monkeypatch.setenv("SENTINELUEBA_RUNTIME_ROOT", str(tmp_path / "runtime"))
+    paths = resolve_runtime_paths()
+
+    result = __import__(
+        "sentinelueba.runtime.import_data",
+        fromlist=["import_data"],
+    ).import_data(source, paths, confirm=True)
+
+    assert result["imported"] == 1
+    assert result["partial"] is True
+    assert not (paths.data_dir / "control.token").exists()
+    assert not (paths.data_dir / "linked.txt").exists()

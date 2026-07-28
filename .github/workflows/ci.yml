@@ -713,6 +713,24 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          function Invoke-ExpectFailure {
+            param(
+              [scriptblock] $Command,
+              [string] $Name
+            )
+            try {
+              & $Command
+              $exitCode = $LASTEXITCODE
+              if ($null -eq $exitCode -or $exitCode -eq 0) {
+                throw "$Name unexpectedly succeeded"
+              }
+              Write-Host "$Name failed as expected with exit code $exitCode"
+              $global:LASTEXITCODE = 0
+            } catch {
+              if ($_.Exception.Message -like "*unexpectedly succeeded*") { throw }
+              Write-Host "$Name failed as expected: $($_.Exception.Message)"
+            }
+          }
           $zip = "dist\SentinelUEBA-0.5.0-windows-x64-portable.zip"
           $sidecar = Get-Content "$zip.sha256"
           $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
@@ -725,14 +743,40 @@ jobs:
           $env:SENTINELUEBA_PACKAGED = "1"
           $env:SENTINELUEBA_RUNTIME_ROOT = Join-Path $env:RUNNER_TEMP "SentinelUEBA Runtime Тест"
           $env:SENTINELUEBA_PACKAGE_ROOT = $package
-          & "$package\SentinelUEBA.exe" --version
-          & "$package\SentinelUEBA.exe" verify-installation
-          & "$package\SentinelUEBA.exe" host doctor
-          & "$package\SentinelUEBA.exe" generate-demo
-          & "$package\SentinelUEBA.exe" features materialize
-          & "$package\SentinelUEBA.exe" detection run-once --dataset synthetic --dry-run
-          & "$package\SentinelUEBAService.exe" --debug-smoke
+          $manifestPath = Join-Path $package "release-manifest.json"
+          $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+          if ($manifest.git_commit -ne "${{ github.sha }}") {
+            throw "release manifest git_commit does not match GitHub SHA"
+          }
+          if ($manifest.application_version -ne "0.5.0") {
+            throw "release manifest application_version mismatch"
+          }
+          if (-not (Test-Path (Join-Path $package "dependency-inventory.json"))) {
+            throw "dependency inventory missing from package"
+          }
+          $savedPath = $env:PATH
+          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+          try {
+            if (Get-Command python -ErrorAction SilentlyContinue) {
+              throw "python is unexpectedly available in packaged runtime PATH"
+            }
+            if (Get-Command node -ErrorAction SilentlyContinue) {
+              throw "node is unexpectedly available in packaged runtime PATH"
+            }
+            Get-ChildItem -Path $package -Recurse -Force |
+              ForEach-Object { $_.Attributes = $_.Attributes -bor [IO.FileAttributes]::ReadOnly }
+            & "$package\SentinelUEBA.exe" --version
+            & "$package\SentinelUEBA.exe" verify-installation
+            & "$package\SentinelUEBA.exe" host doctor
+            & "$package\SentinelUEBA.exe" generate-demo
+            & "$package\SentinelUEBA.exe" features materialize
+            & "$package\SentinelUEBA.exe" detection run-once --dataset synthetic --dry-run
+            & "$package\SentinelUEBAService.exe" --debug-smoke
+          } finally {
+            $env:PATH = $savedPath
+          }
           $process = Start-Process -FilePath "$package\SentinelUEBA.exe" -ArgumentList @("host", "run") -PassThru -WindowStyle Hidden
+          $controlToken = $null
           try {
             $ready = $false
             for ($i = 0; $i -lt 60; $i++) {
@@ -750,6 +794,27 @@ jobs:
             $port = $status.port
             Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$port/health/ready" | Out-Null
             Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$port/" | Out-Null
+            $build1 = Invoke-RestMethod "http://127.0.0.1:$port/runtime/build"
+            $build2 = Invoke-RestMethod "http://127.0.0.1:$port/runtime/build"
+            $manifestHash = (Get-FileHash -Algorithm SHA256 $manifestPath).Hash.ToLowerInvariant()
+            if ($build1.data.git_commit -ne $manifest.git_commit) { throw "runtime build git_commit mismatch" }
+            if ($build1.data.git_commit -ne "${{ github.sha }}") { throw "runtime build git_commit is not exact head SHA" }
+            if ($build1.data.build_timestamp_utc -ne $manifest.build_timestamp_utc) { throw "runtime build timestamp mismatch" }
+            if ($build2.data.build_timestamp_utc -ne $build1.data.build_timestamp_utc) { throw "runtime build timestamp changed between calls" }
+            if ($build1.data.frontend_build_hash -ne $manifest.frontend_manifest_sha256) { throw "runtime frontend hash mismatch" }
+            if ($build1.data.release_manifest_sha256 -ne $manifestHash) { throw "runtime manifest hash mismatch" }
+            if ($build1.data.signed -ne $manifest.signed) { throw "runtime signed status mismatch" }
+            $statusBefore = Get-Content $statusFile -Raw
+            $tokenFile = Join-Path $env:SENTINELUEBA_RUNTIME_ROOT "runtime\control.token"
+            $tokenBefore = Get-Content $tokenFile -Raw
+            $launcher = Start-Process -FilePath "$package\SentinelUEBALauncher.exe" -PassThru -WindowStyle Hidden
+            $launcher.WaitForExit(20000) | Out-Null
+            if (-not $launcher.HasExited) {
+              Stop-Process -Id $launcher.Id -Force
+              throw "second launcher did not exit"
+            }
+            if ((Get-Content $statusFile -Raw) -ne $statusBefore) { throw "second launcher modified owner status.json" }
+            if ((Get-Content $tokenFile -Raw) -ne $tokenBefore) { throw "second launcher modified owner control.token" }
             try {
               Invoke-WebRequest -UseBasicParsing -Method POST -Uri "http://127.0.0.1:$port/demo/generate" -Body '{"seed":42}' -ContentType "application/json" | Out-Null
               throw "mutation without token succeeded"
@@ -757,13 +822,115 @@ jobs:
               if ($_.Exception.Response.StatusCode.value__ -ne 403) { throw }
             }
             $bootstrap = Invoke-RestMethod "http://127.0.0.1:$port/runtime/bootstrap"
-            $headers = @{ "X-SentinelUEBA-Control-Token" = $bootstrap.data.control_token }
+            $controlToken = $bootstrap.data.control_token
+            $headers = @{ "X-SentinelUEBA-Control-Token" = $controlToken }
             Invoke-RestMethod -Method POST -Uri "http://127.0.0.1:$port/demo/generate" -Headers $headers -Body '{"seed":42}' -ContentType "application/json" | Out-Null
             Invoke-RestMethod -Method POST -Uri "http://127.0.0.1:$port/runtime/shutdown" -Headers $headers -Body '{"confirm":true}' -ContentType "application/json" | Out-Null
             $process.WaitForExit(20000) | Out-Null
             if (-not $process.HasExited) { throw "packaged host did not stop" }
           } finally {
             if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force }
+          }
+          if ($controlToken) {
+            $logs = Get-ChildItem -Path (Join-Path $env:SENTINELUEBA_RUNTIME_ROOT "logs") -File -Recurse -ErrorAction SilentlyContinue
+            foreach ($log in $logs) {
+              if ((Get-Content $log.FullName -Raw -ErrorAction SilentlyContinue) -like "*$controlToken*") {
+                throw "control token leaked to logs"
+              }
+            }
+          }
+          $serviceSmoke = & "$package\SentinelUEBAService.exe" --debug-smoke
+          if ($serviceSmoke -notmatch "LocalService") { throw "service smoke did not report LocalService account" }
+          $principal = New-Object Security.Principal.WindowsPrincipal(
+            [Security.Principal.WindowsIdentity]::GetCurrent()
+          )
+          $isAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+          if ($isAdmin) {
+            $programDataRoot = Join-Path $env:PROGRAMDATA "SentinelUEBA"
+            $serviceStatusFile = Join-Path $programDataRoot "runtime\status.json"
+            New-Item -ItemType Directory -Force -Path $programDataRoot | Out-Null
+            icacls $programDataRoot /grant "NT AUTHORITY\LOCAL SERVICE:(OI)(CI)F" /T | Out-Null
+            icacls $unpack /grant "NT AUTHORITY\LOCAL SERVICE:(OI)(CI)RX" /T | Out-Null
+            & "$package\SentinelUEBA.exe" service uninstall --confirm | Out-Null
+            try {
+              & "$package\SentinelUEBA.exe" service install --confirm
+              & "$package\SentinelUEBA.exe" service start
+              $serviceReady = $false
+              for ($i = 0; $i -lt 90; $i++) {
+                if (Test-Path $serviceStatusFile) {
+                  $serviceStatus = Get-Content $serviceStatusFile | ConvertFrom-Json
+                  if ($serviceStatus.state -in @("ready", "degraded")) {
+                    $serviceReady = $true
+                    break
+                  }
+                }
+                Start-Sleep -Seconds 1
+              }
+              if (-not $serviceReady) {
+                & "$package\SentinelUEBA.exe" service status
+                Get-ChildItem -Path $programDataRoot -Force -Recurse -ErrorAction SilentlyContinue |
+                  Select-Object FullName, Length, LastWriteTime |
+                  Format-Table -AutoSize | Out-String | Write-Host
+                Get-ChildItem -Path (Join-Path $programDataRoot "logs") -File -Recurse -ErrorAction SilentlyContinue |
+                  ForEach-Object {
+                    Write-Host "---- $($_.FullName)"
+                    Get-Content $_.FullName -Tail 200 -ErrorAction SilentlyContinue
+                  }
+                Get-EventLog -LogName Application -Source SentinelUEBA -Newest 20 -ErrorAction SilentlyContinue |
+                  Format-Table -AutoSize | Out-String | Write-Host
+                throw "Windows Service host did not become ready"
+              }
+              $servicePort = $serviceStatus.port
+              Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$servicePort/health/ready" | Out-Null
+              $serviceBootstrap = Invoke-RestMethod "http://127.0.0.1:$servicePort/runtime/bootstrap"
+              $serviceHeaders = @{
+                "X-SentinelUEBA-Control-Token" = $serviceBootstrap.data.control_token
+              }
+              try {
+                Invoke-WebRequest -UseBasicParsing -Method POST -Uri "http://127.0.0.1:$servicePort/collection/start" -Headers $serviceHeaders -Body '{"interval_seconds":5}' -ContentType "application/json" | Out-Null
+                throw "service collection start unexpectedly succeeded"
+              } catch {
+                if ($_.Exception.Response.StatusCode.value__ -ne 409) { throw }
+              }
+            } finally {
+              try {
+                & "$package\SentinelUEBA.exe" service stop --confirm | Out-Null
+              } catch {
+                Write-Host "service stop cleanup skipped: $($_.Exception.Message)"
+              }
+              Start-Sleep -Seconds 3
+              try {
+                & "$package\SentinelUEBA.exe" service uninstall --confirm | Out-Null
+              } catch {
+                Write-Host "service uninstall cleanup skipped: $($_.Exception.Message)"
+              }
+            }
+          } else {
+            Write-Host "SCM integration unsupported: runner is not elevated; dispatcher smoke covered by tests."
+          }
+          Get-ChildItem -Path $package -Recurse -Force |
+            ForEach-Object { $_.Attributes = $_.Attributes -band (-bnot [IO.FileAttributes]::ReadOnly) }
+          $corruptUnpack = Join-Path $env:RUNNER_TEMP "SentinelUEBA Corrupt Manifest Тест"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $corruptUnpack
+          Expand-Archive -Path $zip -DestinationPath $corruptUnpack
+          $corruptPackage = Join-Path $corruptUnpack "SentinelUEBA"
+          Invoke-ExpectFailure -Name "corrupt release manifest" -Command {
+            Set-Content -Path (Join-Path $corruptPackage "release-manifest.json") -Value "{not-json" -Encoding UTF8
+            & "$corruptPackage\SentinelUEBA.exe" verify-installation
+          }
+          $tamperUnpack = Join-Path $env:RUNNER_TEMP "SentinelUEBA Tamper Тест"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $tamperUnpack
+          Expand-Archive -Path $zip -DestinationPath $tamperUnpack
+          $tamperPackage = Join-Path $tamperUnpack "SentinelUEBA"
+          $tamperManifest = Get-Content (Join-Path $tamperPackage "release-manifest.json") -Raw | ConvertFrom-Json
+          $tamperTarget = $tamperManifest.files |
+            Where-Object { $_.path -eq "frontend/index.html" -or $_.path -like "*/frontend/index.html" } |
+            Select-Object -First 1
+          if (-not $tamperTarget) { throw "frontend index asset missing from release manifest" }
+          $tamperTargetPath = Join-Path $tamperPackage ($tamperTarget.path.Replace("/", [string][IO.Path]::DirectorySeparatorChar))
+          Set-Content -Path $tamperTargetPath -Value "tampered" -Encoding UTF8
+          Invoke-ExpectFailure -Name "tampered frontend asset" -Command {
+            & "$tamperPackage\SentinelUEBA.exe" verify-installation
           }
           $packageRoot = (Resolve-Path $package).Path
           $runtimeInsidePackage = Get-ChildItem -Path $package -Recurse -File |
@@ -778,7 +945,6 @@ jobs:
             throw "runtime artifacts are present inside package"
           }
       - name: Upload package artifacts
-        if: github.event_name == 'push'
         uses: actions/upload-artifact@v4
         with:
           name: sentinelueba-windows-portable
@@ -786,3 +952,5 @@ jobs:
             dist/SentinelUEBA-0.5.0-windows-x64-portable.zip
             dist/SentinelUEBA-0.5.0-windows-x64-portable.zip.sha256
             dist/SentinelUEBA/release-manifest.json
+            dist/SentinelUEBA/dependency-inventory.json
+          retention-days: 3

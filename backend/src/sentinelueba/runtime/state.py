@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 RuntimeStateName = Literal["stopped", "starting", "ready", "degraded", "stopping", "failed"]
@@ -20,6 +21,13 @@ class RuntimeContext:
     data_root_writable: bool = False
     service_collection_disabled: bool = False
     shutdown_requested: bool = False
+    runtime_root: Path | None = None
+    data_dir: Path | None = None
+    database_path: Path | None = None
+    model_dir: Path | None = None
+    logs_dir: Path | None = None
+    config_warning: str | None = None
+    log_level: str = "INFO"
 
     @property
     def require_token(self) -> bool:

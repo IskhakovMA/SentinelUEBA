@@ -129,9 +129,9 @@ Stage 4 DetectionInput содержит только window id, dataset kind, ps
 
 Подробнее: [detection engine](docs/DETECTION_ENGINE.md), [rules](docs/DETECTION_RULES.md), [policies](docs/DETECTION_POLICIES.md), [finding lifecycle](docs/FINDING_LIFECYCLE.md), [continuous detection](docs/CONTINUOUS_DETECTION.md).
 
-## Ограничения Stage 4
+## Ограничения Stage 5
 
-Не реализованы Windows Service, MSI, autostart, Linux collectors, ETW, kernel driver, cloud backend, SIEM, alerts, packet capture, keylogging, clipboard, browser history, traffic payload inspection, live blocking, automated response, arbitrary user Python/SQL/shell rules, online learning, retraining, autopromotion, supervised security labels и production alerting.
+Не реализованы MSI, automatic install, autostart, firewall rule, Linux collectors, ETW, kernel driver, cloud backend, SIEM, alerts, packet capture, keylogging, clipboard, browser history, traffic payload inspection, live blocking, automated response, arbitrary user Python/SQL/shell rules, online learning, retraining, autopromotion, supervised security labels и production alerting. Windows Service является optional, manual-start, loopback-only и запускается из portable package только после explicit install.
 
 ## Разработка
 

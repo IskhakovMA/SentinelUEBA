@@ -21,7 +21,7 @@ $signed = [bool]($env:SENTINELUEBA_SIGN_CERT_THUMBPRINT -or $env:SENTINELUEBA_SI
 $env:SENTINELUEBA_SIGNED = if ($signed) { "1" } else { "0" }
 $signedLiteral = if ($signed) { "True" } else { "False" }
 
-uv run python -c "from pathlib import Path; from sentinelueba.runtime.installation import create_release_manifest, dependency_inventory_hash, sha256_file, canonical_json; package=Path('$PackageDir'); frontend=package/'frontend'/'frontend-assets.json'; manifest=create_release_manifest(package, version='$Version', git_commit='$GitCommit', build_timestamp_utc='$BuildTimestampUtc', signed=$signedLiteral, frontend_manifest_sha256=sha256_file(frontend) if frontend.exists() else None, dependency_inventory_sha256=dependency_inventory_hash()); (package/'release-manifest.json').write_bytes(canonical_json(manifest))"
+uv run python -c "from pathlib import Path; from sentinelueba.runtime.installation import create_release_manifest, dependency_inventory_hash, sha256_file, canonical_json, write_dependency_inventory; package=Path('$PackageDir'); inventory=write_dependency_inventory(package); frontend=package/'frontend'/'frontend-assets.json'; manifest=create_release_manifest(package, version='$Version', git_commit='$GitCommit', build_timestamp_utc='$BuildTimestampUtc', signed=$signedLiteral, frontend_manifest_sha256=sha256_file(frontend) if frontend.exists() else None, dependency_inventory_sha256=sha256_file(inventory)); (package/'release-manifest.json').write_bytes(canonical_json(manifest))"
 $manifestHash = (Get-FileHash -Algorithm SHA256 (Join-Path $PackageDir "release-manifest.json")).Hash.ToLowerInvariant()
 
 $zip = "dist\SentinelUEBA-$Version-windows-x64-portable.zip"
