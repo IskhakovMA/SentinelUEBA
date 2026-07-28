@@ -754,6 +754,18 @@ jobs:
           if (-not (Test-Path (Join-Path $package "dependency-inventory.json"))) {
             throw "dependency inventory missing from package"
           }
+          if (-not $manifest.frontend_manifest_sha256) {
+            throw "release manifest frontend_manifest_sha256 is missing"
+          }
+          if (-not (Test-Path (Join-Path $package "frontend\index.html"))) {
+            throw "packaged frontend index.html missing from top-level frontend"
+          }
+          if (-not (Test-Path (Join-Path $package "frontend\frontend-assets.json"))) {
+            throw "packaged frontend asset manifest missing from top-level frontend"
+          }
+          if (Test-Path (Join-Path $package "_internal\frontend")) {
+            throw "duplicate packaged frontend exists in _internal"
+          }
           $savedPath = $env:PATH
           $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
           try {
@@ -775,9 +787,25 @@ jobs:
           } finally {
             $env:PATH = $savedPath
           }
-          $process = Start-Process -FilePath "$package\SentinelUEBA.exe" -ArgumentList @("host", "run") -PassThru -WindowStyle Hidden
+          $repoRoot = (Get-Location).Path
+          $repoFrontendDist = Join-Path $repoRoot "frontend\dist"
+          $hiddenRepoFrontendDist = Join-Path $repoRoot "frontend\dist.hidden-package-windows"
+          $emptyCwd = Join-Path $env:RUNNER_TEMP "SentinelUEBA Empty CWD Тест"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $emptyCwd
+          New-Item -ItemType Directory -Path $emptyCwd | Out-Null
+          $repoFrontendHidden = $false
+          $emptyCwdActive = $false
+          $process = $null
           $controlToken = $null
           try {
+            if (Test-Path $repoFrontendDist) {
+              Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $hiddenRepoFrontendDist
+              Rename-Item -Path $repoFrontendDist -NewName (Split-Path -Leaf $hiddenRepoFrontendDist)
+              $repoFrontendHidden = $true
+            }
+            Push-Location $emptyCwd
+            $emptyCwdActive = $true
+            $process = Start-Process -FilePath "$package\SentinelUEBALauncher.exe" -WorkingDirectory $emptyCwd -PassThru -WindowStyle Hidden
             $ready = $false
             for ($i = 0; $i -lt 60; $i++) {
               $statusFile = Join-Path $env:SENTINELUEBA_RUNTIME_ROOT "runtime\status.json"
@@ -807,7 +835,7 @@ jobs:
             $statusBefore = Get-Content $statusFile -Raw
             $tokenFile = Join-Path $env:SENTINELUEBA_RUNTIME_ROOT "runtime\control.token"
             $tokenBefore = Get-Content $tokenFile -Raw
-            $launcher = Start-Process -FilePath "$package\SentinelUEBALauncher.exe" -PassThru -WindowStyle Hidden
+            $launcher = Start-Process -FilePath "$package\SentinelUEBALauncher.exe" -WorkingDirectory $emptyCwd -PassThru -WindowStyle Hidden
             $launcher.WaitForExit(20000) | Out-Null
             if (-not $launcher.HasExited) {
               Stop-Process -Id $launcher.Id -Force
@@ -829,7 +857,12 @@ jobs:
             $process.WaitForExit(20000) | Out-Null
             if (-not $process.HasExited) { throw "packaged host did not stop" }
           } finally {
-            if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force }
+            if ($process -and -not $process.HasExited) { Stop-Process -Id $process.Id -Force }
+            if ($emptyCwdActive) { Pop-Location }
+            if ($repoFrontendHidden) {
+              Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $repoFrontendDist
+              Rename-Item -Path $hiddenRepoFrontendDist -NewName "dist"
+            }
           }
           if ($controlToken) {
             $logs = Get-ChildItem -Path (Join-Path $env:SENTINELUEBA_RUNTIME_ROOT "logs") -File -Recurse -ErrorAction SilentlyContinue

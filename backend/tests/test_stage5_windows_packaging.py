@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import sqlite3
@@ -17,7 +18,12 @@ from sentinelueba.api.main import app
 from sentinelueba.runtime.build_info import get_build_info
 from sentinelueba.runtime.configuration import RuntimeConfig, load_config, write_config
 from sentinelueba.runtime.control import CONTROL_HEADER, status_now, write_status
-from sentinelueba.runtime.diagnostics import backup_before_migration
+from sentinelueba.runtime.diagnostics import (
+    backup_before_migration,
+    doctor,
+    inspect_schema,
+    migrate_with_backup,
+)
 from sentinelueba.runtime.installation import (
     canonical_json,
     create_release_manifest,
@@ -37,7 +43,7 @@ from sentinelueba.runtime.service import (
     install_service,
 )
 from sentinelueba.runtime.state import update_runtime_context
-from sentinelueba.runtime.supervisor import check_frontend_assets, run_host
+from sentinelueba.runtime.supervisor import check_frontend_assets, frontend_dir, run_host
 from sentinelueba.storage.sqlite import DB_SCHEMA_VERSION, SQLiteStorage
 
 
@@ -90,6 +96,19 @@ def create_package_fixture(
     )
     (package / "release-manifest.json").write_bytes(canonical_json(manifest))
     return manifest
+
+
+def execute_sql(database: Path, *statements: str | tuple[str, tuple[object, ...]]) -> None:
+    conn = sqlite3.connect(database)
+    try:
+        for statement in statements:
+            if isinstance(statement, tuple):
+                conn.execute(statement[0], statement[1])
+            else:
+                conn.execute(statement)
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def test_stage5_version_and_build_identity_are_safe(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -494,6 +513,32 @@ def test_stage5_migration_backup_and_frontend_asset_check(
     assert check_frontend_assets(resolve_runtime_paths()) is False
 
 
+def test_stage5_packaged_frontend_resolves_only_from_package_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "package"
+    package_frontend = package / "frontend"
+    package_frontend.mkdir(parents=True)
+    (package_frontend / "index.html").write_text("<html>packaged</html>", encoding="utf-8")
+    (package_frontend / "frontend-assets.json").write_text("{}", encoding="utf-8")
+    cwd = tmp_path / "empty cwd"
+    cwd.mkdir()
+    repo_frontend = cwd / "frontend" / "dist"
+    repo_frontend.mkdir(parents=True)
+    (repo_frontend / "index.html").write_text("<html>repo fallback</html>", encoding="utf-8")
+    monkeypatch.chdir(cwd)
+    monkeypatch.setenv("SENTINELUEBA_PACKAGED", "1")
+    monkeypatch.setenv("SENTINELUEBA_PACKAGE_ROOT", str(package))
+
+    paths = resolve_runtime_paths()
+
+    assert frontend_dir(paths) == package_frontend
+    assert check_frontend_assets(paths) is True
+    (package_frontend / "index.html").unlink()
+    assert check_frontend_assets(paths) is False
+
+
 def test_stage5_wal_migration_backup_is_consistent(tmp_path: Path) -> None:
     monkeypatch_root = tmp_path / "runtime"
     monkeypatch_root.mkdir()
@@ -519,6 +564,259 @@ def test_stage5_wal_migration_backup_is_consistent(tmp_path: Path) -> None:
     with sqlite3.connect(backup) as conn:
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert conn.execute("SELECT value FROM wal_rows").fetchone()[0] == "from-wal"
+
+
+def test_stage5_schema_inspection_distinguishes_current_corrupt_newer_and_unreadable(
+    tmp_path: Path,
+) -> None:
+    valid_database = tmp_path / "valid.sqlite3"
+    SQLiteStorage(valid_database).initialize()
+    assert inspect_schema(valid_database).status == "current_valid"
+
+    missing_table = tmp_path / "missing-table.sqlite3"
+    SQLiteStorage(missing_table).initialize()
+    execute_sql(missing_table, "DROP TABLE findings")
+    assert inspect_schema(missing_table).status == "current_corrupt"
+
+    missing_index = tmp_path / "missing-index.sqlite3"
+    SQLiteStorage(missing_index).initialize()
+    execute_sql(missing_index, "DROP INDEX idx_findings_status")
+    assert inspect_schema(missing_index).status == "current_corrupt"
+
+    newer_database = tmp_path / "newer.sqlite3"
+    execute_sql(
+        newer_database,
+        "CREATE TABLE schema_version(version INTEGER PRIMARY KEY, applied_at TEXT)",
+        ("INSERT INTO schema_version(version, applied_at) VALUES (?, 'x')", (11,)),
+    )
+    newer = inspect_schema(newer_database)
+    assert newer.status == "newer"
+    assert newer.unsupported_newer_schema is True
+
+    malformed = tmp_path / "malformed.sqlite3"
+    malformed.write_text("not sqlite", encoding="utf-8")
+    assert inspect_schema(malformed).status == "unreadable"
+
+
+def test_stage5_doctor_is_read_only_and_migration_blocks_invalid_schema(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "runtime"
+    paths = resolve_runtime_paths()
+    object.__setattr__(paths, "root", root.resolve())
+    object.__setattr__(paths, "config_dir", (root / "config").resolve())
+    object.__setattr__(paths, "data_dir", (root / "data").resolve())
+    object.__setattr__(paths, "database_path", (root / "data" / "sentinelueba.sqlite3").resolve())
+    object.__setattr__(paths, "model_dir", (root / "models").resolve())
+    object.__setattr__(paths, "logs_dir", (root / "logs").resolve())
+    object.__setattr__(paths, "runtime_dir", (root / "runtime").resolve())
+    object.__setattr__(paths, "backups_dir", (root / "backups").resolve())
+    paths.ensure()
+    execute_sql(
+        paths.database_path,
+        "CREATE TABLE schema_version(version INTEGER PRIMARY KEY, applied_at TEXT)",
+        "INSERT INTO schema_version(version, applied_at) VALUES (1, 'x')",
+    )
+    before = paths.database_path.read_bytes()
+
+    report = doctor(paths)
+
+    assert report["status"] == "degraded"
+    assert paths.database_path.read_bytes() == before
+
+    object.__setattr__(paths, "database_path", (root / "data" / "valid.sqlite3").resolve())
+    SQLiteStorage(paths.database_path).initialize()
+    execute_sql(paths.database_path, "DROP INDEX idx_findings_status")
+    migration = migrate_with_backup(paths)
+    assert migration["status"] == "failed"
+    assert migration["error_class"] == "SchemaIntegrityError"
+
+    execute_sql(
+        paths.database_path,
+        "DELETE FROM schema_version",
+        "INSERT INTO schema_version(version, applied_at) VALUES (11, 'x')",
+    )
+    newer = migrate_with_backup(paths)
+    assert newer["status"] == "failed"
+    assert newer["unsupported_newer_schema"] is True
+
+
+def test_stage5_host_never_ready_for_corrupt_or_newer_database(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SENTINELUEBA_RUNTIME_MODE", "desktop")
+    monkeypatch.setenv("SENTINELUEBA_RUNTIME_ROOT", str(tmp_path / "runtime"))
+    paths = resolve_runtime_paths()
+    paths.ensure()
+    SQLiteStorage(paths.database_path).initialize()
+    execute_sql(paths.database_path, "DROP INDEX idx_findings_status")
+
+    result = run_host(open_browser=False, startup_timeout_seconds=0.01)
+
+    assert result.state == "failed"
+    assert inspect_schema(paths.database_path).status == "current_corrupt"
+
+    reset_runtime_context()
+    newer_database = tmp_path / "runtime" / "data" / "newer.sqlite3"
+    monkeypatch.setenv("SENTINELUEBA_DATABASE_PATH", str(newer_database))
+    paths = resolve_runtime_paths()
+    execute_sql(
+        paths.database_path,
+        "CREATE TABLE schema_version(version INTEGER PRIMARY KEY, applied_at TEXT)",
+        "INSERT INTO schema_version(version, applied_at) VALUES (11, 'x')",
+    )
+
+    newer = run_host(open_browser=False, startup_timeout_seconds=0.01)
+
+    assert newer.state == "failed"
+    assert inspect_schema(paths.database_path).status == "newer"
+
+
+def test_stage5_runtime_acl_failure_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SENTINELUEBA_RUNTIME_MODE", "desktop")
+    monkeypatch.setenv("SENTINELUEBA_RUNTIME_ROOT", str(tmp_path / "runtime"))
+    package = tmp_path / "package"
+    package.mkdir()
+    monkeypatch.setenv("SENTINELUEBA_PACKAGED", "1")
+    monkeypatch.setenv("SENTINELUEBA_PACKAGE_ROOT", str(package))
+
+    def fail_acl(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise PermissionError("acl denied")
+
+    monkeypatch.setattr("sentinelueba.runtime.supervisor.protect_runtime_secret", fail_acl)
+
+    result = run_host(open_browser=True, startup_timeout_seconds=0.01)
+    paths = resolve_runtime_paths()
+
+    assert result.state == "failed"
+    assert not (paths.runtime_dir / "control.token").exists()
+    assert not (paths.runtime_dir / "status.json").exists()
+
+
+def test_stage5_windowed_host_disables_console_logging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SENTINELUEBA_RUNTIME_MODE", "desktop")
+    monkeypatch.setenv("SENTINELUEBA_RUNTIME_ROOT", str(tmp_path / "runtime"))
+    captured: dict[str, object] = {}
+
+    class FakeServer:
+        def __init__(self, _config: object) -> None:
+            self.should_exit = False
+
+        def run(self) -> None:
+            return None
+
+    def fake_config(*_args: object, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr("sentinelueba.runtime.supervisor.uvicorn.Config", fake_config)
+    monkeypatch.setattr("sentinelueba.runtime.supervisor.uvicorn.Server", FakeServer)
+    monkeypatch.setattr(
+        "sentinelueba.runtime.supervisor.migrate_with_backup",
+        lambda _paths: {"status": "success"},
+    )
+    monkeypatch.setattr(
+        "sentinelueba.runtime.supervisor.check_frontend_assets",
+        lambda _paths: True,
+    )
+    monkeypatch.setattr(
+        "sentinelueba.runtime.supervisor._wait_for_server_start",
+        lambda *_args: False,
+    )
+
+    result = run_host(open_browser=False, windowed=True, startup_timeout_seconds=0.01)
+
+    assert result.state == "failed"
+    assert captured["log_config"] is None
+
+
+def test_stage5_windowed_launcher_sets_stdio_before_host_import(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+    fake_supervisor = types.ModuleType("sentinelueba.runtime.supervisor")
+
+    def fake_run_host(**kwargs: object) -> None:
+        calls.append(kwargs)
+
+    fake_supervisor.run_host = fake_run_host  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "sentinelueba.runtime.supervisor", fake_supervisor)
+    launcher_path = (
+        Path(__file__).resolve().parents[2] / "packaging" / "windows" / "launcher_entry.py"
+    )
+    spec = importlib.util.spec_from_file_location("sentinelueba_launcher_entry", launcher_path)
+    assert spec is not None and spec.loader is not None
+    launcher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(launcher)
+    original_stdin = sys.stdin
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    monkeypatch.setattr(sys, "stdin", None)
+    monkeypatch.setattr(sys, "stdout", None)
+    monkeypatch.setattr(sys, "stderr", None)
+    try:
+        assert launcher.main() == 0
+        assert sys.stdin is not None
+        assert sys.stdout is not None
+        assert sys.stderr is not None
+    finally:
+        sys.stdin = original_stdin
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+
+    assert calls == [{"open_browser": True, "windowed": True}]
+
+
+def test_stage5_config_log_level_controls_runtime_file_logger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import logging
+
+    monkeypatch.setenv("SENTINELUEBA_RUNTIME_MODE", "desktop")
+    monkeypatch.setenv("SENTINELUEBA_RUNTIME_ROOT", str(tmp_path / "runtime"))
+    paths = resolve_runtime_paths()
+    write_config(
+        paths.config_dir / "config.json",
+        RuntimeConfig(runtime_mode="desktop", log_level="ERROR"),
+    )
+    monkeypatch.setattr(
+        "sentinelueba.runtime.supervisor.migrate_with_backup",
+        lambda _paths: {"status": "failed"},
+    )
+
+    run_host(open_browser=False, startup_timeout_seconds=0.01)
+
+    assert logging.getLogger("sentinelueba").level == logging.ERROR
+
+
+def test_stage5_service_failure_log_is_safe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sentinelueba.runtime.service import _write_service_failure_log
+
+    monkeypatch.setenv("PROGRAMDATA", str(tmp_path / "ProgramData"))
+
+    _write_service_failure_log("service_host_exception", error_class="RuntimeError")
+
+    payload = json.loads(
+        (tmp_path / "ProgramData" / "SentinelUEBA" / "logs" / "service-failure.log").read_text(
+            encoding="utf-8",
+        )
+    )
+    blob = json.dumps(payload)
+    assert payload["event"] == "service_host_exception"
+    assert payload["error_class"] == "RuntimeError"
+    assert "Traceback" not in blob
+    assert str(tmp_path) not in blob
 
 
 def test_stage5_service_unsupported_platform_is_safe() -> None:

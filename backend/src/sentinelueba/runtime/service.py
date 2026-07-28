@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
-import traceback
-from contextlib import suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
@@ -210,8 +210,7 @@ def install_service(*, confirm: bool, adapter: ServiceAdapter | None = None) -> 
         paths.runtime_dir,
         paths.backups_dir,
     ):
-        with suppress(Exception):
-            protect_runtime_secret(directory, mode="service", directory=True)
+        protect_runtime_secret(directory, mode="service", directory=True)
     selected = adapter or service_adapter()
     binary = service_binary_path()
     if not selected.is_installed():
@@ -268,13 +267,19 @@ if os.name == "nt":  # pragma: no cover - imported only by pywin32 on Windows
             try:
                 result = run_host(service=True, open_browser=False)
                 if result.state == "failed":
-                    message = "SentinelUEBA service host returned failed"
-                    _write_service_failure_log(message)
-                    servicemanager.LogErrorMsg(message)
+                    _write_service_failure_log(
+                        "service_host_failed",
+                        error_class="HostFailed",
+                    )
+                    servicemanager.LogErrorMsg("SentinelUEBA service host failed safely")
             except Exception as exc:
-                details = traceback.format_exc()
-                _write_service_failure_log(details)
-                servicemanager.LogErrorMsg(f"{SERVICE_DISPLAY_NAME} failed: {exc!r}")
+                _write_service_failure_log(
+                    "service_host_exception",
+                    error_class=exc.__class__.__name__,
+                )
+                servicemanager.LogErrorMsg(
+                    f"{SERVICE_DISPLAY_NAME} failed safely: {exc.__class__.__name__}"
+                )
                 raise
             finally:
                 servicemanager.LogInfoMsg(f"{SERVICE_DISPLAY_NAME} stopped")
@@ -307,11 +312,23 @@ def handle_service_command_line() -> None:
     win32serviceutil.HandleCommandLine(SentinelUEBAWindowsService)
 
 
-def _write_service_failure_log(message: str) -> None:
-    with suppress(Exception):
-        paths = resolve_runtime_paths(service=True)
-        paths.logs_dir.mkdir(parents=True, exist_ok=True)
-        (paths.logs_dir / "service-failure.log").write_text(message, encoding="utf-8")
+def _write_service_failure_log(event: str, *, error_class: str) -> None:
+    paths = resolve_runtime_paths(service=True)
+    paths.logs_dir.mkdir(parents=True, exist_ok=True)
+    protect_runtime_secret(paths.logs_dir, mode="service", directory=True)
+    payload = {
+        "timestamp_utc": datetime.now(UTC).replace(microsecond=0).isoformat().replace(
+            "+00:00",
+            "Z",
+        ),
+        "component": "service",
+        "event": event,
+        "error_class": error_class,
+        "message": "SentinelUEBA Windows Service failed safely; inspect runtime status.",
+    }
+    path = paths.logs_dir / "service-failure.log"
+    path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    protect_runtime_secret(path, mode="service")
 
 
 def wait_for_service_status(

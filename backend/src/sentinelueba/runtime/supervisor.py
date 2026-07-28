@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import socket
+import sys
 import threading
 import time
 import webbrowser
@@ -67,9 +68,8 @@ def find_loopback_port(preferred_port: int | None = None) -> int:
 
 
 def frontend_dir(paths: RuntimePaths) -> Path:
-    packaged = paths.package_dir / "frontend"
-    if packaged.exists():
-        return packaged
+    if is_packaged():
+        return paths.package_dir / "frontend"
     return Path.cwd() / "frontend" / "dist"
 
 
@@ -105,22 +105,37 @@ def run_host(
     open_browser: bool | None = None,
     preferred_port: int | None = None,
     service: bool = False,
+    windowed: bool = False,
     startup_timeout_seconds: float = 15.0,
 ) -> HostRunResult:
     paths = resolve_runtime_paths(service=service)
     paths.ensure()
     mode = "service" if service else paths.mode
-    for directory in (paths.root, paths.runtime_dir, paths.config_dir):
-        with suppress(Exception):
-            protect_runtime_secret(directory, mode=mode, directory=True)
+    strict_acl = _strict_acl_required(mode)
     config, config_warning = load_config(paths.config_dir / "config.json", mode=mode)
     effective_port = preferred_port if preferred_port is not None else config.preferred_port
     effective_open_browser = bool(open_browser) if open_browser is not None else config.open_browser
     token = new_control_token()
     configure_runtime_logging(
         paths.logs_dir,
+        level=config.log_level,
         secrets=[token, str(paths.root), str(paths.package_dir)],
     )
+    try:
+        _protect_runtime_surface(paths, mode=mode)
+    except Exception:
+        update_runtime_context(
+            mode=mode,
+            state="failed",
+            runtime_root=paths.root,
+            data_dir=paths.data_dir,
+            database_path=paths.database_path,
+            model_dir=paths.model_dir,
+            logs_dir=paths.logs_dir,
+            config_warning=config_warning,
+            log_level=config.log_level,
+        )
+        return HostRunResult("failed", None, None)
     status_path = paths.runtime_dir / "status.json"
     token_path = paths.runtime_dir / "control.token"
     identity = new_process_identity()
@@ -148,7 +163,7 @@ def run_host(
                 log_level=config.log_level,
             )
             write_private_text(token_path, token)
-            with suppress(Exception):
+            if strict_acl:
                 protect_runtime_secret(token_path, mode=mode)
             owns_runtime_files = True
             port = find_loopback_port(effective_port)
@@ -163,7 +178,7 @@ def run_host(
                     started_at=started_at,
                 ),
             )
-            with suppress(Exception):
+            if strict_acl:
                 protect_runtime_secret(status_path, mode=mode)
             if is_packaged():
                 verification = verify_installation(paths.package_dir)
@@ -208,7 +223,11 @@ def run_host(
                 fastapi_app,
                 host=config.bind_host,
                 port=port,
-                log_config=None if service else uvicorn.config.LOGGING_CONFIG,
+                log_config=(
+                    None
+                    if service or windowed or sys.stdout is None or sys.stderr is None
+                    else uvicorn.config.LOGGING_CONFIG
+                ),
                 log_level=config.log_level.lower(),
                 access_log=False,
             )
@@ -314,7 +333,26 @@ def _shutdown_owned_managers(paths: RuntimePaths) -> None:
         database_path=paths.database_path,
         data_dir=paths.data_dir,
         model_dir=paths.model_dir,
-    )
+            )
+
+
+def _protect_runtime_surface(paths: RuntimePaths, *, mode: str) -> None:
+    if not _strict_acl_required(mode):
+        return
+    for directory in (
+        paths.root,
+        paths.config_dir,
+        paths.data_dir,
+        paths.model_dir,
+        paths.logs_dir,
+        paths.runtime_dir,
+        paths.backups_dir,
+    ):
+        protect_runtime_secret(directory, mode=mode, directory=True)
+
+
+def _strict_acl_required(mode: str) -> bool:
+    return mode == "service" or is_packaged()
 
 
 def _wait_for_server_start(

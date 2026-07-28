@@ -5,7 +5,6 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 ROOT = Path.cwd()
-FRONTEND_DIST = ROOT / "frontend" / "dist"
 
 
 def without_test_data(files):
@@ -16,16 +15,7 @@ def without_test_data(files):
     ]
 
 
-datas = [
-    (str(ROOT / "LICENSE"), "."),
-    (str(ROOT / "README.md"), "."),
-    (str(ROOT / "README.ru.md"), "."),
-    (str(ROOT / "THIRD_PARTY_NOTICES.txt"), "."),
-    (str(ROOT / "docs"), "docs"),
-]
-if FRONTEND_DIST.exists():
-    datas.append((str(FRONTEND_DIST), "frontend"))
-
+datas = []
 datas += without_test_data(collect_data_files("skops"))
 datas += without_test_data(collect_data_files("pyarrow"))
 
