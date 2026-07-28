@@ -1,6 +1,6 @@
 # SentinelUEBA
 
-SentinelUEBA is a local-first Windows-focused UEBA portfolio project. Stage 4 keeps the synthetic demo, opt-in Windows telemetry, validation-first ingestion, SQLite feature store, immutable snapshots, and Stage 3 ML registry, then adds a privacy-safe detection engine with immutable policies, built-in feature-window rules, verified champion model signals, deterministic fusion, findings, suppressions, CLI/API controls, a local worker lease, and a React Detection Center.
+SentinelUEBA is a local-first Windows-focused UEBA portfolio project. Stage 5 keeps the Stage 0-4 synthetic telemetry, Windows collectors, validation-first data pipeline, ML registry, and detection engine, then adds a Windows x64 PyInstaller portable bundle with embedded production React, a loopback runtime supervisor, single-instance desktop launcher, optional Windows Service, local control-token protection, release manifest verification, and package smoke CI.
 
 [Русская версия](README.ru.md)
 
@@ -24,6 +24,7 @@ SentinelUEBA is a local-first Windows-focused UEBA portfolio project. Stage 4 ke
 - Immutable findings, occurrences, lifecycle history, exact TTL suppressions, idempotent SQL anti-join evaluations, exact profile/model isolation, and worker watermarks.
 - Risk levels: low, medium, high, critical.
 - FastAPI endpoints and a bilingual EN/RU React dashboard.
+- Windows x64 portable Technical Preview package with `SentinelUEBA.exe`, `SentinelUEBALauncher.exe`, `SentinelUEBAService.exe`, embedded frontend assets, runtime roots outside the install directory, and SHA-256 release manifest verification.
 
 An anomaly or finding is a triage signal. It is not proof of malicious activity.
 
@@ -45,6 +46,20 @@ pnpm --dir frontend dev
 ```
 
 Open `http://localhost:5173`.
+
+## Windows Portable
+
+```powershell
+SentinelUEBA.exe --version
+SentinelUEBA.exe verify-installation
+SentinelUEBA.exe host run --open-browser
+SentinelUEBA.exe host doctor
+SentinelUEBA.exe host stop --confirm
+```
+
+Portable builds are PyInstaller one-folder Windows x64 bundles. Runtime data is stored in `%LOCALAPPDATA%\SentinelUEBA` for desktop mode and `%PROGRAMDATA%\SentinelUEBA` for service mode, never in the installation directory. Unsigned PR builds are Technical Preview artifacts and should verify as `unsigned_verified`.
+
+See [Windows portable](docs/WINDOWS_PORTABLE.md), [runtime supervisor](docs/RUNTIME_SUPERVISOR.md), [installation integrity](docs/INSTALLATION_INTEGRITY.md), and [Windows Service](docs/WINDOWS_SERVICE.md).
 
 ## Windows Collection
 
@@ -133,9 +148,9 @@ The repository is a full-stack monorepo with a modular monolith backend:
 - `frontend`: React, TypeScript, Vite dashboard.
 - `docs`: architecture, privacy, threat model, and development notes.
 
-## Stage 4 Limits
+## Stage 5 Limits
 
-No Windows Service, MSI, autostart, Linux collectors, ETW, kernel driver, cloud backend, SIEM integration, alerts, packet capture, keylogging, clipboard, browser history, traffic payload inspection, live blocking, automated response, arbitrary user Python/SQL/shell rules, online learning, retraining, autopromotion, supervised security labels, or production alerting are implemented. Generated databases, snapshots, model bundles, identity secrets, logs, and reports are excluded from Git.
+No MSI, automatic install, autostart, firewall rule, Linux collectors, ETW, kernel driver, cloud backend, SIEM integration, alerts, packet capture, keylogging, clipboard, browser history, traffic payload inspection, live blocking, automated response, arbitrary user Python/SQL/shell rules, online learning, retraining, autopromotion, supervised security labels, or production alerting are implemented. The Windows Service is optional, manual-start, loopback-only, and runs from the portable package after explicit install. Generated databases, snapshots, model bundles, identity secrets, logs, and reports are excluded from Git.
 
 ## Development
 
@@ -153,4 +168,4 @@ Python dependencies are managed with `uv`; frontend dependencies use `pnpm`.
 
 ## Roadmap
 
-Stage 5 can focus on packaging and operational hardening. Live alerts, Windows Service packaging, SIEM export, and cloud backends remain out of scope for Stage 4.
+Stage 6 can focus on post-Stage 5 productization only after the portable runtime, optional service, and package integrity checks are stable. Live alerts, SIEM export, and cloud backends remain out of scope for Stage 5.

@@ -1,0 +1,4 @@
+SentinelUEBA bundles third-party open-source Python and JavaScript dependencies.
+
+Technical Preview portable builds include dependency inventory hashes in release-manifest.json.
+Authoritative license terms remain with each dependency package.

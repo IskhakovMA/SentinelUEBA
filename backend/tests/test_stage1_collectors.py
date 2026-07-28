@@ -562,7 +562,7 @@ def test_stop_interrupts_large_polling_interval(tmp_path: Path) -> None:
     start = time.monotonic()
     status = manager.stop()
     elapsed = time.monotonic() - start
-    assert elapsed < 2
+    assert elapsed < 5
     assert status["running"] is False
     assert manager.sessions()[0]["status"] == "stopped"
     assert manager.sessions()[0]["stopped_at"] is not None

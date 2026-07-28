@@ -89,7 +89,17 @@ class SQLiteStorage:
                 version = 9
             if version < 10:
                 self._apply_v10(conn)
+            self._ensure_required_indexes(conn)
             self._assert_schema_integrity(conn)
+
+    def verify_schema_integrity(self) -> None:
+        database_uri = f"file:{self.database_path}?mode=ro"
+        conn = sqlite3.connect(database_uri, uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            self._assert_schema_integrity(conn)
+        finally:
+            conn.close()
 
     def _record_migration(self, conn: sqlite3.Connection, version: int) -> None:
         conn.execute(
@@ -495,6 +505,140 @@ class SQLiteStorage:
                     "database schema integrity check failed; "
                     f"{table} missing column(s): {', '.join(missing_columns)}"
                 )
+        required_indexes = {
+            "idx_events_time",
+            "idx_events_type",
+            "idx_events_user",
+            "idx_events_host",
+            "idx_anomalies_time",
+            "idx_anomalies_risk",
+            "idx_sessions_started",
+            "idx_sessions_status",
+            "idx_events_ingested_at",
+            "idx_events_dataset_time",
+            "idx_quarantine_received",
+            "idx_windows_kind_time",
+            "idx_windows_quality",
+            "idx_observations_kind_time",
+            "idx_observations_session",
+            "idx_late_events_kind_time",
+            "idx_duplicate_events_kind",
+            "idx_observations_watermark",
+            "idx_model_versions_profile",
+            "idx_one_champion_per_profile",
+            "idx_scored_windows_run_score",
+            "idx_model_promotions_profile",
+            "idx_detection_policy_identity",
+            "idx_one_active_detection_policy",
+            "idx_detection_runs_started",
+            "idx_detection_evaluations_window",
+            "idx_findings_status",
+            "idx_findings_fingerprint",
+            "idx_suppressions_scope",
+            "idx_windows_detection_pending",
+            "idx_windows_feature_hash",
+            "idx_running_detection_namespace",
+            "idx_detection_eval_identity",
+            "idx_occurrence_evaluation",
+            "idx_worker_key",
+            "idx_policy_activations_created",
+        }
+        existing_indexes = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND name IS NOT NULL"
+            ).fetchall()
+        }
+        missing_indexes = sorted(required_indexes - existing_indexes)
+        if missing_indexes:
+            raise SchemaIntegrityError(
+                "database schema integrity check failed; missing index(es): "
+                + ", ".join(missing_indexes)
+            )
+
+    def _ensure_required_indexes(self, conn: sqlite3.Connection) -> None:
+        for statement in (
+            "CREATE INDEX IF NOT EXISTS idx_events_time ON telemetry_events(timestamp)",
+            "CREATE INDEX IF NOT EXISTS idx_events_type ON telemetry_events(event_type)",
+            "CREATE INDEX IF NOT EXISTS idx_events_user ON telemetry_events(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_events_host ON telemetry_events(host_id)",
+            "CREATE INDEX IF NOT EXISTS idx_anomalies_time ON anomalies(timestamp)",
+            "CREATE INDEX IF NOT EXISTS idx_anomalies_risk ON anomalies(risk_level)",
+            "CREATE INDEX IF NOT EXISTS idx_sessions_started ON collection_sessions(started_at)",
+            "CREATE INDEX IF NOT EXISTS idx_sessions_status ON collection_sessions(status)",
+            "CREATE INDEX IF NOT EXISTS idx_events_ingested_at ON telemetry_events(ingested_at)",
+            "CREATE INDEX IF NOT EXISTS idx_events_dataset_time "
+            "ON telemetry_events(synthetic, timestamp)",
+            "CREATE INDEX IF NOT EXISTS idx_quarantine_received "
+            "ON quarantined_events(received_at)",
+            "CREATE INDEX IF NOT EXISTS idx_windows_kind_time "
+            "ON feature_windows(dataset_kind, window_start)",
+            "CREATE INDEX IF NOT EXISTS idx_windows_quality "
+            "ON feature_windows(dataset_kind, quality_status)",
+            "CREATE INDEX IF NOT EXISTS idx_observations_kind_time "
+            "ON collector_observations(observed_at, collector_id)",
+            "CREATE INDEX IF NOT EXISTS idx_observations_session "
+            "ON collector_observations(session_id)",
+            "CREATE INDEX IF NOT EXISTS idx_late_events_kind_time "
+            "ON late_event_records(dataset_kind, event_timestamp)",
+            "CREATE INDEX IF NOT EXISTS idx_duplicate_events_kind "
+            "ON duplicate_event_records(dataset_kind, duplicate_seen_at)",
+            "CREATE INDEX IF NOT EXISTS idx_observations_watermark "
+            "ON collector_observations(observed_at, observation_id)",
+            "CREATE INDEX IF NOT EXISTS idx_model_versions_profile "
+            "ON model_versions(dataset_kind, profile_key, lifecycle_status)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_one_champion_per_profile "
+            "ON model_versions(dataset_kind, profile_key) "
+            "WHERE lifecycle_status = 'champion'",
+            "CREATE INDEX IF NOT EXISTS idx_scored_windows_run_score "
+            "ON scored_windows(scoring_run_id, anomaly_score)",
+            "CREATE INDEX IF NOT EXISTS idx_model_promotions_profile "
+            "ON model_promotions(dataset_kind, profile_key, created_at)",
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_detection_policy_identity
+            ON detection_policies(policy_id, policy_version)
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_detection_policy
+            ON detection_policies(active)
+            WHERE active = 1
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_detection_runs_started "
+            "ON detection_runs(started_at)",
+            "CREATE INDEX IF NOT EXISTS idx_detection_evaluations_window "
+            "ON detection_evaluations(dataset_kind, profile_key, window_start, window_id)",
+            "CREATE INDEX IF NOT EXISTS idx_findings_status ON findings(status, last_seen_at)",
+            "CREATE INDEX IF NOT EXISTS idx_findings_fingerprint "
+            "ON findings(fingerprint, status, last_seen_at)",
+            "CREATE INDEX IF NOT EXISTS idx_suppressions_scope "
+            "ON detection_suppressions(scope, active, expires_at)",
+            "CREATE INDEX IF NOT EXISTS idx_windows_detection_pending "
+            "ON feature_windows(dataset_kind, profile_key, window_start, window_id)",
+            "CREATE INDEX IF NOT EXISTS idx_windows_feature_hash "
+            "ON feature_windows(window_id, feature_input_hash)",
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_running_detection_namespace
+            ON detection_runs(dataset_kind, profile_key, policy_hash, model_id)
+            WHERE status = 'running'
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_detection_eval_identity
+            ON detection_evaluations(window_id, feature_input_hash, policy_hash, model_id)
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_occurrence_evaluation
+            ON finding_occurrences(evaluation_id)
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_key
+            ON detection_worker_leases(worker_key)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_policy_activations_created
+            ON detection_policy_activations(created_at)
+            """,
+        ):
+            conn.execute(statement)
 
     def _apply_v5(self, conn: sqlite3.Connection) -> None:
         state_columns = self._columns(conn, "feature_materialization_state")

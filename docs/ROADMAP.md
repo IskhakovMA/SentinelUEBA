@@ -35,9 +35,15 @@ Synthetic local demo pipeline, PyTorch autoencoder, FastAPI, React, tests, CI, a
 - SQLite schema v10 detection tables, SQL anti-join idempotent evaluations, composite worker watermarks, and local worker lease.
 - Detection CLI/API and React Detection Center.
 
-## Recommended Stage 5
+## Stage 5
 
-- Package the local app for easier Windows operation.
-- Harden long-running process supervision.
-- Consider signed local artifact metadata.
-- Keep live alerts, SIEM export, cloud backends, response actions, and online learning out of scope until explicitly planned.
+- Windows x64 PyInstaller one-folder portable ZIP.
+- Embedded production React frontend served by FastAPI on the same loopback origin.
+- Runtime supervisor with single-instance protection, safe status metadata, graceful shutdown, and rotating logs.
+- Local control-token contract for mutating browser/API actions.
+- Runtime roots outside the installation directory for desktop and optional Windows Service mode.
+- Build manifest, SHA-256 installation verification, optional SignTool integration, and package smoke CI.
+
+## Future Scope
+
+Installer signing, MSI/MSIX, auto-update, alerts, SIEM export, cloud backends, response actions, ETW/kernel collection, online learning, automatic retraining, and automatic model promotion remain out of scope until explicitly planned.

@@ -1,5 +1,13 @@
 # Privacy
 
+## Stage 5 Runtime Privacy
+
+Packaged runtime APIs do not expose absolute installation, home, CI workspace, database, model, or log paths. Runtime status files contain only PID, process creation identity, start time, port, mode, version, and state. The local control token is stored separately, removed on shutdown, not logged, and not returned by status, doctor, or build endpoints.
+
+Logs are rotating UTF-8 structured files and avoid raw telemetry payloads, raw username/hostname values, authentication identities, remote addresses, executable paths, full model feature rows, environment dumps, control tokens, PFX passwords, and certificate secrets.
+
+The Windows portable package has no cloud upload, crash upload, remote control plane, autoupdate agent, or external script execution.
+
 SentinelUEBA is local-first. Real collection is opt-in, local-only, and Windows-only. The application does not send telemetry to external services.
 
 User and host identifiers are pseudonymized by default using a local salt stored in the data directory. The salt is ignored by Git. Raw identity mode is explicit configuration only.

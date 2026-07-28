@@ -1,6 +1,6 @@
 # Architecture
 
-SentinelUEBA Stage 4 is a local modular monolith. The backend owns telemetry generation, opt-in Windows collectors, validation, canonical normalization, storage, feature materialization, dataset snapshots, model training, calibration, registry-backed promotion, offline scoring, drift reports, collection accounting, and the Stage 4 detection engine. The frontend calls FastAPI endpoints and renders pipeline, collector, anomaly, ML Lab, and Detection Center results.
+SentinelUEBA Stage 5 is a local modular monolith. The backend owns telemetry generation, opt-in Windows collectors, validation, canonical normalization, storage, feature materialization, dataset snapshots, model training, calibration, registry-backed promotion, offline scoring, drift reports, collection accounting, the Stage 4 detection engine, and the Stage 5 runtime supervisor. The frontend calls same-origin FastAPI endpoints in packaged mode and the Vite proxy in development.
 
 The primary identity boundary is `user_id + host_id`. Synthetic events use safe demo identifiers. Real Windows events use pseudonymous local identifiers by default; raw identity mode is explicit configuration only.
 
@@ -81,6 +81,22 @@ flowchart LR
 ```
 
 The built-in policy is `hybrid-policy-v1`, mode `hybrid`. Its rules are `rare-process-v1`, `new-remote-spike-v1`, `unusual-hour-activity-v1`, `resource-pressure-v1`, and `authentication-failure-burst-v1`. The fusion method is deterministic and explainable; corroboration increases the score, weak single signals do not become critical, and the output is a triage finding rather than proof of compromise.
+
+## Stage 5 Runtime
+
+```mermaid
+flowchart TD
+  A["Launcher / CLI / Windows Service"] --> B["Runtime Supervisor"]
+  B --> C["Loopback FastAPI + embedded React"]
+  B --> D["SQLite / snapshots / models"]
+  B --> E["Collector Manager"]
+  B --> F["Detection Worker Manager"]
+  B --> G["graceful shutdown and local logs"]
+```
+
+Packaged desktop mode uses `%LOCALAPPDATA%\SentinelUEBA`; service mode uses `%PROGRAMDATA%\SentinelUEBA`. The installation directory is read-only compatible and contains shipped binaries, docs, embedded frontend assets, and the release manifest. Runtime data, logs, databases, snapshots, and model artifacts are not written to the package directory.
+
+The host binds only to `127.0.0.1`. Mutating HTTP endpoints require a per-process control token in `X-SentinelUEBA-Control-Token`. `GET /runtime/build` and `GET /runtime/status` return safe metadata without absolute paths or tokens.
 
 Model signals are loaded only through the public Stage 3 verifier and SQLite registry. A user cannot provide an artifact path. Direct persisted feature-window scoring is used only for Stage 4 detection, not for training, calibration, evaluation, promotion, or drift. Scoring is exact by dataset/profile/model namespace; no-profile requests fan out into per-profile child runs instead of mixing profiles in one run.
 

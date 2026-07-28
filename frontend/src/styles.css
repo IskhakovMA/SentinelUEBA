@@ -36,6 +36,14 @@ main {
   gap: 20px;
 }
 
+.topActions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
 h1 {
   margin: 0;
   font-size: 34px;
