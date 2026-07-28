@@ -743,6 +743,7 @@ jobs:
           $env:SENTINELUEBA_PACKAGED = "1"
           $env:SENTINELUEBA_RUNTIME_ROOT = Join-Path $env:RUNNER_TEMP "SentinelUEBA Runtime Тест"
           $env:SENTINELUEBA_PACKAGE_ROOT = $package
+          $normalRuntimeRoot = $env:SENTINELUEBA_RUNTIME_ROOT
           $manifestPath = Join-Path $package "release-manifest.json"
           $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
           if ($manifest.git_commit -ne "${{ github.sha }}") {
@@ -820,7 +821,11 @@ jobs:
             }
             if (-not $ready) { throw "packaged host did not become ready" }
             $port = $status.port
-            Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$port/health/ready" | Out-Null
+            $readyResponse = Invoke-RestMethod "http://127.0.0.1:$port/health/ready"
+            if ($readyResponse.data.ready -ne $true) { throw "health/ready data.ready was not true" }
+            if ($readyResponse.data.state -ne "ready") { throw "health/ready data.state was not ready" }
+            if ($readyResponse.data.frontend_ready -ne $true) { throw "health/ready frontend_ready was not true" }
+            if ($readyResponse.data.database_ready -ne $true) { throw "health/ready database_ready was not true" }
             Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$port/" | Out-Null
             $build1 = Invoke-RestMethod "http://127.0.0.1:$port/runtime/build"
             $build2 = Invoke-RestMethod "http://127.0.0.1:$port/runtime/build"
@@ -872,6 +877,67 @@ jobs:
               }
             }
           }
+          function Invoke-LauncherFailureSmoke {
+            param(
+              [string] $Name,
+              [int] $SchemaVersion
+            )
+            $failureRoot = Join-Path $env:RUNNER_TEMP "SentinelUEBA $Name Runtime Тест"
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $failureRoot
+            New-Item -ItemType Directory -Force -Path (Join-Path $failureRoot "data") | Out-Null
+            $env:SENTINELUEBA_RUNTIME_ROOT = $failureRoot
+            $env:SENTINELUEBA_DATABASE_PATH = Join-Path $failureRoot "data\sentinelueba.sqlite3"
+            $env:SENTINELUEBA_HEADLESS = "1"
+            $env:FAILURE_DB_PATH = $env:SENTINELUEBA_DATABASE_PATH
+            $env:FAILURE_SCHEMA_VERSION = "$SchemaVersion"
+            @'
+          import os
+          import sqlite3
+          from pathlib import Path
+
+          db = Path(os.environ["FAILURE_DB_PATH"])
+          db.parent.mkdir(parents=True, exist_ok=True)
+          conn = sqlite3.connect(db)
+          try:
+              conn.execute("CREATE TABLE schema_version(version INTEGER PRIMARY KEY, applied_at TEXT)")
+              conn.execute(
+                  "INSERT INTO schema_version(version, applied_at) VALUES (?, 'x')",
+                  (int(os.environ["FAILURE_SCHEMA_VERSION"]),),
+              )
+              conn.commit()
+          finally:
+              conn.close()
+          '@ | uv run python -
+            $failure = Start-Process -FilePath "$package\SentinelUEBALauncher.exe" -WorkingDirectory $emptyCwd -PassThru -WindowStyle Hidden
+            $failure.WaitForExit(20000) | Out-Null
+            if (-not $failure.HasExited) {
+              Stop-Process -Id $failure.Id -Force
+              throw "$Name launcher did not exit"
+            }
+            if ($failure.ExitCode -ne 2) {
+              throw "$Name launcher exit code $($failure.ExitCode), expected 2"
+            }
+            if (Test-Path (Join-Path $failureRoot "runtime\control.token")) {
+              throw "$Name launcher left control.token"
+            }
+            if (Test-Path (Join-Path $failureRoot "runtime\status.json")) {
+              throw "$Name launcher left status.json"
+            }
+            $logs = Get-ChildItem -Path (Join-Path $failureRoot "logs") -File -Recurse -ErrorAction SilentlyContinue
+            foreach ($log in $logs) {
+              $blob = Get-Content $log.FullName -Raw -ErrorAction SilentlyContinue
+              if ($blob -like "*Traceback*") { throw "$Name safe failure leaked traceback" }
+              if ($blob -like "*$failureRoot*") { throw "$Name safe failure leaked runtime path" }
+            }
+            Write-Host "$Name launcher failed safely with exit code 2"
+          }
+          Invoke-LauncherFailureSmoke -Name "CorruptV10" -SchemaVersion 10
+          Invoke-LauncherFailureSmoke -Name "NewerV11" -SchemaVersion 11
+          $env:SENTINELUEBA_RUNTIME_ROOT = $normalRuntimeRoot
+          Remove-Item Env:SENTINELUEBA_DATABASE_PATH -ErrorAction SilentlyContinue
+          Remove-Item Env:SENTINELUEBA_HEADLESS -ErrorAction SilentlyContinue
+          Remove-Item Env:FAILURE_DB_PATH -ErrorAction SilentlyContinue
+          Remove-Item Env:FAILURE_SCHEMA_VERSION -ErrorAction SilentlyContinue
           $serviceSmoke = & "$package\SentinelUEBAService.exe" --debug-smoke
           if ($serviceSmoke -notmatch "LocalService") { throw "service smoke did not report LocalService account" }
           $principal = New-Object Security.Principal.WindowsPrincipal(

@@ -7,6 +7,8 @@ from contextlib import suppress
 
 
 def _message_box(message: str) -> None:
+    if os.environ.get("SENTINELUEBA_HEADLESS") == "1":
+        return
     with suppress(Exception):
         ctypes.windll.user32.MessageBoxW(None, message, "SentinelUEBA", 0x10)
 
@@ -25,7 +27,10 @@ def main() -> int:
     try:
         from sentinelueba.runtime.supervisor import run_host
 
-        run_host(open_browser=True, windowed=True)
+        result = run_host(open_browser=True, windowed=True)
+        if result.state == "failed":
+            _message_box("SentinelUEBA could not start safely: HostFailed")
+            return 2
         return 0
     except Exception as exc:
         _message_box(f"SentinelUEBA could not start safely: {exc.__class__.__name__}")

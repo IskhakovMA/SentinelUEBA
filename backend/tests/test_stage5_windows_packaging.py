@@ -5,16 +5,21 @@ import json
 import os
 import sqlite3
 import sys
+import time
 import types
 from contextlib import suppress
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Thread
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from typer.testing import CliRunner
 
 from sentinelueba import __version__
 from sentinelueba.api.main import app
+from sentinelueba.cli import app as cli_app
 from sentinelueba.runtime.build_info import get_build_info
 from sentinelueba.runtime.configuration import RuntimeConfig, load_config, write_config
 from sentinelueba.runtime.control import CONTROL_HEADER, status_now, write_status
@@ -34,16 +39,26 @@ from sentinelueba.runtime.installation import (
 )
 from sentinelueba.runtime.instance import InstanceAlreadyRunningError, SingleInstanceLock
 from sentinelueba.runtime.paths import reject_escape, resolve_runtime_paths
+from sentinelueba.runtime.security import RuntimeAclVerificationError, protect_runtime_secret
 from sentinelueba.runtime.service import (
     SERVICE_ACCOUNT,
     SERVICE_DISPLAY_NAME,
     SERVICE_ID,
     PyWin32ServiceAdapter,
+    ServiceStartupFailed,
     UnsupportedServiceAdapter,
+    _run_service_host_or_raise,
     install_service,
+    service_recovery_actions,
 )
 from sentinelueba.runtime.state import update_runtime_context
-from sentinelueba.runtime.supervisor import check_frontend_assets, frontend_dir, run_host
+from sentinelueba.runtime.supervisor import (
+    HostRunResult,
+    _wait_for_server_start,
+    check_frontend_assets,
+    frontend_dir,
+    run_host,
+)
 from sentinelueba.storage.sqlite import DB_SCHEMA_VERSION, SQLiteStorage
 
 
@@ -109,6 +124,52 @@ def execute_sql(database: Path, *statements: str | tuple[str, tuple[object, ...]
         conn.commit()
     finally:
         conn.close()
+
+
+def load_launcher_module() -> Any:
+    launcher_path = (
+        Path(__file__).resolve().parents[2] / "packaging" / "windows" / "launcher_entry.py"
+    )
+    spec = importlib.util.spec_from_file_location("sentinelueba_launcher_entry", launcher_path)
+    assert spec is not None and spec.loader is not None
+    launcher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(launcher)
+    return launcher
+
+
+class FakeUvicornServer:
+    def __init__(self, *, started: bool) -> None:
+        self.started = started
+
+
+class FakeServerThread:
+    def __init__(self, *, alive: bool) -> None:
+        self._alive = alive
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+
+def start_health_server(
+    *,
+    body: bytes,
+    content_type: str = "application/json",
+    status_code: int = 200,
+) -> tuple[ThreadingHTTPServer, int, Thread]:
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(status_code)
+            self.send_header("Content-Type", content_type)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return None
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, int(server.server_address[1]), thread
 
 
 def test_stage5_version_and_build_identity_are_safe(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -697,6 +758,137 @@ def test_stage5_runtime_acl_failure_fails_closed(
     assert not (paths.runtime_dir / "status.json").exists()
 
 
+@pytest.mark.parametrize(
+    "verification",
+    [
+        {"protected": False, "broad_users_read": False, "missing_expected_principals": []},
+        {"protected": True, "broad_users_read": True, "missing_expected_principals": []},
+        {"protected": True, "broad_users_read": False, "missing_expected_principals": ["SYSTEM"]},
+    ],
+)
+def test_stage5_runtime_acl_negative_verification_blocks_startup(
+    tmp_path: Path,
+    verification: dict[str, object],
+) -> None:
+    calls: list[tuple[Path, str, bool]] = []
+
+    class FakeAclAdapter:
+        def protect_path(self, path: Path, *, mode: str, directory: bool) -> None:
+            calls.append((path, mode, directory))
+
+        def verify_path(self, _path: Path, *, mode: str) -> dict[str, object]:
+            return {"mode": mode, **verification}
+
+    target = tmp_path / "runtime" / "control.token"
+    target.parent.mkdir(parents=True)
+    target.write_text("token", encoding="utf-8")
+
+    with pytest.raises(RuntimeAclVerificationError):
+        protect_runtime_secret(target, mode="desktop", adapter=FakeAclAdapter())
+
+    assert calls == [(target, "desktop", False)]
+
+
+def test_stage5_packaged_runtime_acl_negative_verification_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SENTINELUEBA_RUNTIME_MODE", "desktop")
+    monkeypatch.setenv("SENTINELUEBA_RUNTIME_ROOT", str(tmp_path / "runtime"))
+    package = tmp_path / "package"
+    create_package_fixture(package)
+    monkeypatch.setenv("SENTINELUEBA_PACKAGED", "1")
+    monkeypatch.setenv("SENTINELUEBA_PACKAGE_ROOT", str(package))
+
+    class FakeAclAdapter:
+        def protect_path(self, _path: Path, *, mode: str, directory: bool) -> None:
+            assert mode == "desktop"
+
+        def verify_path(self, _path: Path, *, mode: str) -> dict[str, object]:
+            return {
+                "mode": mode,
+                "protected": False,
+                "broad_users_read": False,
+                "missing_expected_principals": [],
+            }
+
+    monkeypatch.setattr("sentinelueba.runtime.security.acl_adapter", lambda: FakeAclAdapter())
+    monkeypatch.setattr(
+        "sentinelueba.runtime.supervisor.uvicorn.Server",
+        lambda *_args: pytest.fail("host startup continued after failed ACL verification"),
+    )
+
+    result = run_host(open_browser=False, startup_timeout_seconds=0.01)
+    paths = resolve_runtime_paths()
+
+    assert result.state == "failed"
+    assert not (paths.runtime_dir / "control.token").exists()
+    assert not (paths.runtime_dir / "status.json").exists()
+
+
+def test_stage5_packaged_runtime_acl_valid_verification_continues_startup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SENTINELUEBA_RUNTIME_MODE", "desktop")
+    monkeypatch.setenv("SENTINELUEBA_RUNTIME_ROOT", str(tmp_path / "runtime"))
+    package = tmp_path / "package"
+    create_package_fixture(package)
+    monkeypatch.setenv("SENTINELUEBA_PACKAGED", "1")
+    monkeypatch.setenv("SENTINELUEBA_PACKAGE_ROOT", str(package))
+    calls: list[tuple[Path, bool]] = []
+    reached_server = False
+
+    class FakeAclAdapter:
+        def protect_path(self, path: Path, *, mode: str, directory: bool) -> None:
+            assert mode == "desktop"
+            calls.append((path, directory))
+
+        def verify_path(self, _path: Path, *, mode: str) -> dict[str, object]:
+            return {
+                "mode": mode,
+                "protected": True,
+                "broad_users_read": False,
+                "missing_expected_principals": [],
+            }
+
+    class FakeServer:
+        def __init__(self, _config: object) -> None:
+            nonlocal reached_server
+            reached_server = True
+            self.should_exit = False
+
+        def run(self) -> None:
+            while not self.should_exit:
+                time.sleep(0.01)
+
+    monkeypatch.setattr("sentinelueba.runtime.security.acl_adapter", lambda: FakeAclAdapter())
+    monkeypatch.setattr(
+        "sentinelueba.runtime.supervisor.verify_installation",
+        lambda _paths: types.SimpleNamespace(status="unsigned_verified"),
+    )
+    monkeypatch.setattr(
+        "sentinelueba.runtime.supervisor.migrate_with_backup",
+        lambda _paths: {"status": "success"},
+    )
+    monkeypatch.setattr(
+        "sentinelueba.runtime.supervisor.check_frontend_assets",
+        lambda _paths: True,
+    )
+    monkeypatch.setattr("sentinelueba.runtime.supervisor.uvicorn.Config", lambda *a, **k: object())
+    monkeypatch.setattr("sentinelueba.runtime.supervisor.uvicorn.Server", FakeServer)
+    monkeypatch.setattr(
+        "sentinelueba.runtime.supervisor._wait_for_server_start",
+        lambda *_args: False,
+    )
+
+    result = run_host(open_browser=False, startup_timeout_seconds=0.01)
+
+    assert result.state == "failed"
+    assert reached_server is True
+    assert calls
+
+
 def test_stage5_windowed_host_disables_console_logging(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -743,18 +935,13 @@ def test_stage5_windowed_launcher_sets_stdio_before_host_import(
     calls: list[dict[str, object]] = []
     fake_supervisor = types.ModuleType("sentinelueba.runtime.supervisor")
 
-    def fake_run_host(**kwargs: object) -> None:
+    def fake_run_host(**kwargs: object) -> HostRunResult:
         calls.append(kwargs)
+        return HostRunResult("stopped", 8765, "http://127.0.0.1:8765/")
 
     fake_supervisor.run_host = fake_run_host  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "sentinelueba.runtime.supervisor", fake_supervisor)
-    launcher_path = (
-        Path(__file__).resolve().parents[2] / "packaging" / "windows" / "launcher_entry.py"
-    )
-    spec = importlib.util.spec_from_file_location("sentinelueba_launcher_entry", launcher_path)
-    assert spec is not None and spec.loader is not None
-    launcher = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(launcher)
+    launcher = load_launcher_module()
     original_stdin = sys.stdin
     original_stdout = sys.stdout
     original_stderr = sys.stderr
@@ -772,6 +959,167 @@ def test_stage5_windowed_launcher_sets_stdio_before_host_import(
         sys.stderr = original_stderr
 
     assert calls == [{"open_browser": True, "windowed": True}]
+
+
+@pytest.mark.parametrize(
+    ("result", "expected_exit", "expected_message"),
+    [
+        (HostRunResult("failed", None, None), 2, True),
+        (HostRunResult("ready", 8765, "http://127.0.0.1:8765/", already_running=True), 0, False),
+        (HostRunResult("stopped", 8765, "http://127.0.0.1:8765/"), 0, False),
+    ],
+)
+def test_stage5_windowed_launcher_propagates_host_result(
+    result: HostRunResult,
+    expected_exit: int,
+    expected_message: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_supervisor = types.ModuleType("sentinelueba.runtime.supervisor")
+    fake_supervisor.run_host = lambda **_kwargs: result  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "sentinelueba.runtime.supervisor", fake_supervisor)
+    launcher = load_launcher_module()
+    messages: list[str] = []
+    monkeypatch.setattr(launcher, "_message_box", messages.append)
+
+    exit_code = launcher.main()
+
+    assert exit_code == expected_exit
+    assert bool(messages) is expected_message
+    assert all("Traceback" not in message for message in messages)
+    assert all(str(Path.home()) not in message for message in messages)
+
+
+def test_stage5_cli_host_run_failed_result_exits_2(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "sentinelueba.cli.run_host",
+        lambda **_kwargs: HostRunResult("failed", 8765, None),
+    )
+    runner = CliRunner()
+
+    result = runner.invoke(cli_app, ["host", "run"])
+
+    assert result.exit_code == 2
+    assert '"state": "failed"' in result.output
+
+
+def test_stage5_wait_for_server_start_rejects_foreign_listener() -> None:
+    server, port, thread = start_health_server(body=b'{"data":{"ok":true}}')
+    try:
+        assert (
+            _wait_for_server_start(
+                FakeUvicornServer(started=False),  # type: ignore[arg-type]
+                FakeServerThread(alive=True),  # type: ignore[arg-type]
+                port,
+                0.2,
+            )
+            is False
+        )
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def test_stage5_wait_for_server_start_rejects_non_json_health() -> None:
+    server, port, thread = start_health_server(body=b"ok", content_type="text/plain")
+    try:
+        assert (
+            _wait_for_server_start(
+                FakeUvicornServer(started=True),  # type: ignore[arg-type]
+                FakeServerThread(alive=True),  # type: ignore[arg-type]
+                port,
+                0.2,
+            )
+            is False
+        )
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def test_stage5_wait_for_server_start_accepts_expected_health_contract() -> None:
+    server, port, thread = start_health_server(body=b'{"data":{"ok":true}}')
+    try:
+        assert (
+            _wait_for_server_start(
+                FakeUvicornServer(started=True),  # type: ignore[arg-type]
+                FakeServerThread(alive=True),  # type: ignore[arg-type]
+                port,
+                1.0,
+            )
+            is True
+        )
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def test_stage5_wait_for_server_start_rejects_exited_thread() -> None:
+    assert (
+        _wait_for_server_start(
+            FakeUvicornServer(started=True),  # type: ignore[arg-type]
+            FakeServerThread(alive=False),  # type: ignore[arg-type]
+            9,
+            0.2,
+        )
+        is False
+    )
+
+
+def test_stage5_wait_for_server_start_times_out_without_health() -> None:
+    assert (
+        _wait_for_server_start(
+            FakeUvicornServer(started=True),  # type: ignore[arg-type]
+            FakeServerThread(alive=True),  # type: ignore[arg-type]
+            9,
+            0.2,
+        )
+        is False
+    )
+
+
+def test_stage5_service_host_failed_result_reports_scm_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sentinelueba.runtime import service as service_module
+
+    events: list[tuple[str, str]] = []
+    logs: list[str] = []
+    reports: list[str] = []
+    monkeypatch.setattr(
+        service_module,
+        "run_host",
+        lambda **_kwargs: HostRunResult("failed", None, None),
+    )
+    monkeypatch.setattr(
+        service_module,
+        "_write_service_failure_log",
+        lambda event, *, error_class: events.append((event, error_class)),
+    )
+
+    with pytest.raises(ServiceStartupFailed):
+        _run_service_host_or_raise(
+            log_error=logs.append,
+            report_failure=lambda: reports.append("failed"),
+        )
+
+    assert events == [("service_host_failed", "HostFailed")]
+    assert logs == ["SentinelUEBA service host failed safely"]
+    assert reports == ["failed"]
+
+
+def test_stage5_service_host_non_failed_result_returns_cleanly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sentinelueba.runtime import service as service_module
+
+    monkeypatch.setattr(
+        service_module,
+        "run_host",
+        lambda **_kwargs: HostRunResult("stopped", 8765, "http://127.0.0.1:8765/"),
+    )
+
+    _run_service_host_or_raise(log_error=lambda _message: pytest.fail("unexpected error log"))
 
 
 def test_stage5_config_log_level_controls_runtime_file_logger(
@@ -882,6 +1230,63 @@ def test_stage5_pywin32_adapter_installs_real_scm_service(
     actions = recovery[1][2]["Actions"]
     assert actions[:3] == [(fake_win32service.SC_ACTION_RESTART, 60_000)] * 3
     assert actions[3] == (fake_win32service.SC_ACTION_NONE, 0)
+
+
+def test_stage5_service_recovery_actions_restart_three_times_then_stop() -> None:
+    fake_win32service = types.SimpleNamespace(SC_ACTION_RESTART=8, SC_ACTION_NONE=9)
+
+    actions = service_recovery_actions(fake_win32service)
+
+    assert actions == [
+        (fake_win32service.SC_ACTION_RESTART, 60_000),
+        (fake_win32service.SC_ACTION_RESTART, 60_000),
+        (fake_win32service.SC_ACTION_RESTART, 60_000),
+        (fake_win32service.SC_ACTION_NONE, 0),
+    ]
+
+
+def test_stage5_pywin32_adapter_recovery_failure_blocks_install(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, object]] = []
+
+    def fail_recovery(*_args: object) -> None:
+        calls.append(("recovery", "attempted"))
+        raise RuntimeError("recovery failed")
+
+    fake_win32service = types.SimpleNamespace(
+        SC_MANAGER_CREATE_SERVICE=1,
+        SERVICE_ALL_ACCESS=2,
+        SERVICE_WIN32_OWN_PROCESS=3,
+        SERVICE_DEMAND_START=4,
+        SERVICE_ERROR_NORMAL=5,
+        SERVICE_CHANGE_CONFIG=6,
+        SERVICE_CONFIG_FAILURE_ACTIONS=7,
+        SC_ACTION_RESTART=8,
+        SC_ACTION_NONE=9,
+        OpenSCManager=lambda *args: calls.append(("open_manager", args)) or "manager",
+        CreateService=lambda *args: calls.append(("create_service", args)) or "service",
+        CloseServiceHandle=lambda handle: calls.append(("close", handle)),
+        ChangeServiceConfig2=fail_recovery,
+    )
+    fake_service_util = types.SimpleNamespace(
+        QueryServiceStatus=lambda *_args: (_ for _ in ()).throw(RuntimeError("missing")),
+        SmartOpenService=lambda *args: calls.append(("smart_open", args)) or "recovery-service",
+        StartService=lambda *_args: None,
+        StopService=lambda *_args: None,
+        RemoveService=lambda *_args: None,
+    )
+    monkeypatch.setitem(sys.modules, "win32service", fake_win32service)
+    monkeypatch.setitem(sys.modules, "win32serviceutil", fake_service_util)
+
+    with pytest.raises(RuntimeError, match="recovery failed"):
+        PyWin32ServiceAdapter().install(tmp_path / "SentinelUEBAService.exe")
+
+    assert ("recovery", "attempted") in calls
+    assert ("close", "recovery-service") in calls
+    assert ("close", "service") in calls
+    assert ("close", "manager") in calls
 
 
 def test_stage5_service_dispatcher_and_management_paths_are_mockable(

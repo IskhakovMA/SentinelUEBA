@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
 import socket
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import webbrowser
 from contextlib import suppress
 from dataclasses import dataclass
@@ -333,7 +336,7 @@ def _shutdown_owned_managers(paths: RuntimePaths) -> None:
         database_path=paths.database_path,
         data_dir=paths.data_dir,
         model_dir=paths.model_dir,
-            )
+    )
 
 
 def _protect_runtime_surface(paths: RuntimePaths, *, mode: str) -> None:
@@ -363,20 +366,31 @@ def _wait_for_server_start(
 ) -> bool:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
-        if getattr(server, "started", False):
-            return _live_probe(port)
         if not thread.is_alive():
             return False
-        if _live_probe(port):
+        if getattr(server, "started", False) and _live_probe(port):
             return True
         time.sleep(0.1)
     return False
 
 
 def _live_probe(port: int) -> bool:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.settimeout(0.2)
-        return sock.connect_ex(("127.0.0.1", port)) == 0
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/health/live",
+        headers={"Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=0.5) as response:
+            if response.status != 200:
+                return False
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, TimeoutError, urllib.error.URLError, json.JSONDecodeError, UnicodeDecodeError):
+        return False
+    return (
+        isinstance(payload, dict)
+        and isinstance(payload.get("data"), dict)
+        and payload["data"].get("ok") is True
+    )
 
 
 def doctor_report() -> dict[str, Any]:

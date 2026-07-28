@@ -10,6 +10,10 @@ RuntimePrincipalMode = Literal["desktop", "service"]
 BROAD_WINDOWS_PRINCIPALS = {"Authenticated Users", "Everyone", "Users"}
 
 
+class RuntimeAclVerificationError(RuntimeError):
+    pass
+
+
 class RuntimeAclAdapter(Protocol):
     def protect_path(self, path: Path, *, mode: RuntimePrincipalMode, directory: bool) -> None: ...
 
@@ -112,4 +116,12 @@ def protect_runtime_secret(
     principal_mode: RuntimePrincipalMode = "service" if mode == "service" else "desktop"
     selected = adapter or acl_adapter()
     selected.protect_path(path, mode=principal_mode, directory=directory)
-    return selected.verify_path(path, mode=principal_mode)
+    result = selected.verify_path(path, mode=principal_mode)
+    if result.get("protected") is not True:
+        raise RuntimeAclVerificationError("runtime ACL verification failed")
+    if result.get("broad_users_read") is True:
+        raise RuntimeAclVerificationError("runtime ACL permits broad users")
+    missing = result.get("missing_expected_principals")
+    if isinstance(missing, list) and missing:
+        raise RuntimeAclVerificationError("runtime ACL is missing expected principals")
+    return result

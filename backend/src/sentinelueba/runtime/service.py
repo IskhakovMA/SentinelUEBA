@@ -4,10 +4,11 @@ import json
 import os
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from sentinelueba.runtime.build_info import package_root
 from sentinelueba.runtime.installation import verify_installation
@@ -18,6 +19,10 @@ from sentinelueba.runtime.supervisor import run_host
 SERVICE_ID = "SentinelUEBA"
 SERVICE_DISPLAY_NAME = "SentinelUEBA Local Host"
 SERVICE_ACCOUNT = r"NT AUTHORITY\LocalService"
+
+
+class ServiceStartupFailed(RuntimeError):
+    pass
 
 
 class ServiceAdapter(Protocol):
@@ -79,6 +84,7 @@ class PyWin32ServiceAdapter:
 
     def install(self, binary_path: Path) -> None:
         quoted = f'"{binary_path}"'
+        recovery_configured = False
         manager = self._win32service.OpenSCManager(
             None,
             None,
@@ -101,11 +107,13 @@ class PyWin32ServiceAdapter:
                 None,
             )
             try:
-                self._configure_recovery()
+                recovery_configured = self._configure_recovery()
             finally:
                 self._win32service.CloseServiceHandle(service)
         finally:
             self._win32service.CloseServiceHandle(manager)
+        if not recovery_configured:
+            raise RuntimeError("service recovery policy was not configured")
 
     def uninstall(self) -> None:
         if self.is_installed():
@@ -132,36 +140,29 @@ class PyWin32ServiceAdapter:
     def logs(self) -> list[str]:
         return ["service logs are stored in ProgramData/SentinelUEBA/logs"]
 
-    def _configure_recovery(self) -> None:
-        try:
-            import win32service
+    def _configure_recovery(self) -> bool:
+        import win32service
 
-            handle = self._win32serviceutil.SmartOpenService(
-                None,
-                SERVICE_ID,
-                win32service.SERVICE_CHANGE_CONFIG,
+        handle = self._win32serviceutil.SmartOpenService(
+            None,
+            SERVICE_ID,
+            win32service.SERVICE_CHANGE_CONFIG,
+        )
+        try:
+            actions = service_recovery_actions(win32service)
+            win32service.ChangeServiceConfig2(
+                handle,
+                win32service.SERVICE_CONFIG_FAILURE_ACTIONS,
+                {
+                    "ResetPeriod": 86400,
+                    "RebootMsg": None,
+                    "Command": None,
+                    "Actions": actions,
+                },
             )
-            try:
-                actions = [
-                    (win32service.SC_ACTION_RESTART, 60_000),
-                    (win32service.SC_ACTION_RESTART, 60_000),
-                    (win32service.SC_ACTION_RESTART, 60_000),
-                    (win32service.SC_ACTION_NONE, 0),
-                ]
-                win32service.ChangeServiceConfig2(
-                    handle,
-                    win32service.SERVICE_CONFIG_FAILURE_ACTIONS,
-                    {
-                        "ResetPeriod": 86400,
-                        "RebootMsg": None,
-                        "Command": None,
-                        "Actions": actions,
-                    },
-                )
-            finally:
-                win32service.CloseServiceHandle(handle)
-        except Exception:
-            return
+            return True
+        finally:
+            win32service.CloseServiceHandle(handle)
 
 
 def service_adapter() -> ServiceAdapter:
@@ -264,15 +265,20 @@ if os.name == "nt":  # pragma: no cover - imported only by pywin32 on Windows
             servicemanager.LogInfoMsg(f"{SERVICE_DISPLAY_NAME} starting")
             self.ReportServiceStatus(win32service.SERVICE_START_PENDING)
             self.ReportServiceStatus(win32service.SERVICE_RUNNING)
+            failed = False
             try:
-                result = run_host(service=True, open_browser=False)
-                if result.state == "failed":
-                    _write_service_failure_log(
-                        "service_host_failed",
-                        error_class="HostFailed",
-                    )
-                    servicemanager.LogErrorMsg("SentinelUEBA service host failed safely")
+                _run_service_host_or_raise(
+                    log_error=servicemanager.LogErrorMsg,
+                    report_failure=lambda: self.ReportServiceStatus(
+                        win32service.SERVICE_STOPPED,
+                        win32ExitCode=1,
+                    ),
+                )
+            except ServiceStartupFailed:
+                failed = True
+                raise
             except Exception as exc:
+                failed = True
                 _write_service_failure_log(
                     "service_host_exception",
                     error_class=exc.__class__.__name__,
@@ -283,7 +289,8 @@ if os.name == "nt":  # pragma: no cover - imported only by pywin32 on Windows
                 raise
             finally:
                 servicemanager.LogInfoMsg(f"{SERVICE_DISPLAY_NAME} stopped")
-                self.ReportServiceStatus(win32service.SERVICE_STOPPED)
+                if not failed:
+                    self.ReportServiceStatus(win32service.SERVICE_STOPPED)
 
 else:
 
@@ -329,6 +336,31 @@ def _write_service_failure_log(event: str, *, error_class: str) -> None:
     path = paths.logs_dir / "service-failure.log"
     path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
     protect_runtime_secret(path, mode="service")
+
+
+def _run_service_host_or_raise(
+    *,
+    log_error: Callable[[str], object] | None = None,
+    report_failure: Callable[[], object] | None = None,
+) -> None:
+    result = run_host(service=True, open_browser=False)
+    if result.state != "failed":
+        return
+    _write_service_failure_log("service_host_failed", error_class="HostFailed")
+    if log_error is not None:
+        log_error("SentinelUEBA service host failed safely")
+    if report_failure is not None:
+        report_failure()
+    raise ServiceStartupFailed("service host failed safely")
+
+
+def service_recovery_actions(win32service_module: Any) -> list[tuple[Any, int]]:
+    return [
+        (win32service_module.SC_ACTION_RESTART, 60_000),
+        (win32service_module.SC_ACTION_RESTART, 60_000),
+        (win32service_module.SC_ACTION_RESTART, 60_000),
+        (win32service_module.SC_ACTION_NONE, 0),
+    ]
 
 
 def wait_for_service_status(

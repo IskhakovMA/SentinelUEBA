@@ -138,6 +138,8 @@ def host_run(open_browser: bool | None = typer.Option(None, "--open-browser")) -
     """Run the local loopback host supervisor."""
     result = run_host(open_browser=open_browser)
     _print(result.safe_dict())
+    if result.state == "failed":
+        raise typer.Exit(code=2)
 
 
 @host_app.command("status")
