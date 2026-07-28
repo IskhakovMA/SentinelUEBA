@@ -172,6 +172,116 @@ def start_health_server(
     return server, int(server.server_address[1]), thread
 
 
+def install_fake_scm_modules(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    installed: bool = False,
+    binary_path: str = "",
+    account: str = SERVICE_ACCOUNT,
+    start_type: int = 4,
+    service_type: int = 3,
+    recovery_actions: list[tuple[int, int]] | None = None,
+    fail_recovery: bool = False,
+    fail_delete: bool = False,
+) -> dict[str, object]:
+    state: dict[str, object] = {
+        "installed": installed,
+        "binary_path": binary_path,
+        "account": account,
+        "start_type": start_type,
+        "service_type": service_type,
+        "recovery_actions": recovery_actions,
+        "fail_recovery": fail_recovery,
+        "fail_delete": fail_delete,
+        "deleted": False,
+        "created": 0,
+    }
+    calls: list[tuple[str, object]] = []
+    state["calls"] = calls
+
+    def query_status(_service_id: str) -> tuple[None, int]:
+        if state["installed"] is not True:
+            raise RuntimeError("missing")
+        return (None, 4)
+
+    def create_service(*args: object) -> str:
+        state["installed"] = True
+        state["created"] = int(state["created"]) + 1
+        state["service_type"] = args[4]
+        state["start_type"] = args[5]
+        state["binary_path"] = str(args[7])
+        state["account"] = str(args[11])
+        calls.append(("create_service", args))
+        return "service"
+
+    def change_service_config2(_handle: object, _kind: object, config: dict[str, object]) -> None:
+        calls.append(("recovery", config))
+        if state["fail_recovery"] is True:
+            raise RuntimeError("recovery failed")
+        state["recovery_actions"] = config["Actions"]
+
+    def delete_service(_handle: object) -> None:
+        calls.append(("delete_service", None))
+        if state["fail_delete"] is True:
+            raise RuntimeError("delete failed")
+        state["installed"] = False
+        state["deleted"] = True
+        state["recovery_actions"] = None
+
+    def query_service_config(
+        _handle: object,
+    ) -> tuple[object, int, None, str, None, None, None, str, str]:
+        return (
+            state["service_type"],
+            int(state["start_type"]),
+            None,
+            str(state["binary_path"]),
+            None,
+            None,
+            None,
+            str(state["account"]),
+            SERVICE_DISPLAY_NAME,
+        )
+
+    def query_service_config2(_handle: object, _kind: object) -> dict[str, object]:
+        actions = state["recovery_actions"]
+        if actions is None:
+            return {}
+        return {"Actions": actions}
+
+    fake_win32service = types.SimpleNamespace(
+        SC_MANAGER_CREATE_SERVICE=1,
+        SERVICE_QUERY_CONFIG=1,
+        DELETE=0x00010000,
+        SERVICE_ALL_ACCESS=2,
+        SERVICE_WIN32_OWN_PROCESS=3,
+        SERVICE_DEMAND_START=4,
+        SERVICE_ERROR_NORMAL=5,
+        SERVICE_CHANGE_CONFIG=6,
+        SERVICE_CONFIG_FAILURE_ACTIONS=7,
+        SC_ACTION_RESTART=8,
+        SC_ACTION_NONE=9,
+        OpenSCManager=lambda *args: calls.append(("open_manager", args)) or "manager",
+        CreateService=create_service,
+        CloseServiceHandle=lambda handle: calls.append(("close", handle)),
+        SmartOpenService=lambda *args: calls.append(("smart_open", args)) or "service-handle",
+        ChangeServiceConfig2=change_service_config2,
+        QueryServiceConfig=query_service_config,
+        QueryServiceConfig2=query_service_config2,
+        DeleteService=delete_service,
+    )
+    fake_service_util = types.SimpleNamespace(
+        QueryServiceStatus=query_status,
+        SmartOpenService=fake_win32service.SmartOpenService,
+        StartService=lambda *_args: None,
+        StopService=lambda *_args: None,
+        RemoveService=lambda _service_id: delete_service("remove-service"),
+    )
+    monkeypatch.setitem(sys.modules, "win32service", fake_win32service)
+    monkeypatch.setitem(sys.modules, "win32serviceutil", fake_service_util)
+    return state
+
+
 def test_stage5_version_and_build_identity_are_safe(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SENTINELUEBA_BUILD_COMMIT", "abc123")
     monkeypatch.setenv("SENTINELUEBA_BUILD_TIMESTAMP_UTC", "2026-07-28T10:00:00Z")
@@ -1249,44 +1359,138 @@ def test_stage5_pywin32_adapter_recovery_failure_blocks_install(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[tuple[str, object]] = []
+    state = install_fake_scm_modules(monkeypatch, fail_recovery=True)
+    calls = state["calls"]
 
-    def fail_recovery(*_args: object) -> None:
-        calls.append(("recovery", "attempted"))
-        raise RuntimeError("recovery failed")
-
-    fake_win32service = types.SimpleNamespace(
-        SC_MANAGER_CREATE_SERVICE=1,
-        SERVICE_ALL_ACCESS=2,
-        SERVICE_WIN32_OWN_PROCESS=3,
-        SERVICE_DEMAND_START=4,
-        SERVICE_ERROR_NORMAL=5,
-        SERVICE_CHANGE_CONFIG=6,
-        SERVICE_CONFIG_FAILURE_ACTIONS=7,
-        SC_ACTION_RESTART=8,
-        SC_ACTION_NONE=9,
-        OpenSCManager=lambda *args: calls.append(("open_manager", args)) or "manager",
-        CreateService=lambda *args: calls.append(("create_service", args)) or "service",
-        CloseServiceHandle=lambda handle: calls.append(("close", handle)),
-        ChangeServiceConfig2=fail_recovery,
-    )
-    fake_service_util = types.SimpleNamespace(
-        QueryServiceStatus=lambda *_args: (_ for _ in ()).throw(RuntimeError("missing")),
-        SmartOpenService=lambda *args: calls.append(("smart_open", args)) or "recovery-service",
-        StartService=lambda *_args: None,
-        StopService=lambda *_args: None,
-        RemoveService=lambda *_args: None,
-    )
-    monkeypatch.setitem(sys.modules, "win32service", fake_win32service)
-    monkeypatch.setitem(sys.modules, "win32serviceutil", fake_service_util)
-
-    with pytest.raises(RuntimeError, match="recovery failed"):
+    with pytest.raises(RuntimeError, match="service recovery policy was not configured"):
         PyWin32ServiceAdapter().install(tmp_path / "SentinelUEBAService.exe")
 
-    assert ("recovery", "attempted") in calls
-    assert ("close", "recovery-service") in calls
+    assert state["installed"] is False
+    assert state["deleted"] is True
+    assert any(call[0] == "delete_service" for call in calls)
+    assert any(call[0] == "recovery" for call in calls)
+    assert ("close", "service-handle") in calls
     assert ("close", "service") in calls
     assert ("close", "manager") in calls
+
+
+def test_stage5_service_recovery_failure_rollback_allows_repeat_install(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = install_fake_scm_modules(monkeypatch, fail_recovery=True)
+    adapter = PyWin32ServiceAdapter()
+    binary = tmp_path / "SentinelUEBAService.exe"
+
+    with pytest.raises(RuntimeError, match="service recovery policy was not configured"):
+        adapter.install(binary)
+
+    assert adapter.is_installed() is False
+    state["fail_recovery"] = False
+    result = adapter.install(binary)
+
+    assert result["already_installed"] is False
+    assert result["recovery_configured"] is True
+    assert adapter.is_installed() is True
+    assert state["created"] == 2
+
+
+def test_stage5_service_recovery_rollback_failure_is_explicit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = install_fake_scm_modules(monkeypatch, fail_recovery=True, fail_delete=True)
+
+    with pytest.raises(
+        RuntimeError,
+        match="service installation failed and rollback was incomplete",
+    ):
+        PyWin32ServiceAdapter().install(tmp_path / "SentinelUEBAService.exe")
+
+    assert state["installed"] is True
+    assert state["deleted"] is False
+
+
+def test_stage5_service_rollback_does_not_delete_user_data(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = install_fake_scm_modules(monkeypatch, fail_recovery=True)
+    data_file = tmp_path / "runtime" / "data" / "sentinelueba.sqlite3"
+    data_file.parent.mkdir(parents=True)
+    data_file.write_text("user data", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="service recovery policy was not configured"):
+        PyWin32ServiceAdapter().install(tmp_path / "SentinelUEBAService.exe")
+
+    assert state["installed"] is False
+    assert data_file.read_text(encoding="utf-8") == "user data"
+
+
+def test_stage5_existing_service_idempotent_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_win32service = types.SimpleNamespace(SC_ACTION_RESTART=8, SC_ACTION_NONE=9)
+    binary = tmp_path / "SentinelUEBAService.exe"
+    state = install_fake_scm_modules(
+        monkeypatch,
+        installed=True,
+        binary_path=str(binary),
+        account=SERVICE_ACCOUNT,
+        start_type=4,
+        service_type=3,
+        recovery_actions=service_recovery_actions(fake_win32service),
+    )
+
+    result = PyWin32ServiceAdapter().install(binary)
+
+    assert result == {
+        "service": SERVICE_ID,
+        "status": "4",
+        "binary": "SentinelUEBAService.exe",
+        "already_installed": True,
+        "recovery_configured": True,
+        "account": SERVICE_ACCOUNT,
+        "start_type": "manual",
+    }
+    assert state["created"] == 0
+
+
+@pytest.mark.parametrize(
+    ("override", "expected_error"),
+    [
+        ({"recovery_actions": None}, "recovery_policy"),
+        ({"binary_path": r"C:\Other\OtherService.exe"}, "binary"),
+        ({"account": r"LocalSystem"}, "account"),
+        ({"start_type": 2}, "start_type"),
+        ({"service_type": 16}, "service_type"),
+    ],
+)
+def test_stage5_existing_service_validation_rejects_unsafe_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    override: dict[str, object],
+    expected_error: str,
+) -> None:
+    fake_win32service = types.SimpleNamespace(SC_ACTION_RESTART=8, SC_ACTION_NONE=9)
+    binary = tmp_path / "SentinelUEBAService.exe"
+    config = {
+        "installed": True,
+        "binary_path": str(binary),
+        "account": SERVICE_ACCOUNT,
+        "start_type": 4,
+        "service_type": 3,
+        "recovery_actions": service_recovery_actions(fake_win32service),
+    }
+    config.update(override)
+    state = install_fake_scm_modules(monkeypatch, **config)
+
+    with pytest.raises(RuntimeError, match=expected_error):
+        PyWin32ServiceAdapter().install(binary)
+
+    assert state["created"] == 0
+    assert state["installed"] is True
 
 
 def test_stage5_service_dispatcher_and_management_paths_are_mockable(

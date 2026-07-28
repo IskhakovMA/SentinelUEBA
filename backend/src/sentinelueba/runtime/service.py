@@ -28,7 +28,7 @@ class ServiceStartupFailed(RuntimeError):
 class ServiceAdapter(Protocol):
     def is_installed(self) -> bool: ...
 
-    def install(self, binary_path: Path) -> None: ...
+    def install(self, binary_path: Path) -> dict[str, object] | None: ...
 
     def uninstall(self) -> None: ...
 
@@ -82,14 +82,19 @@ class PyWin32ServiceAdapter:
         except Exception:
             return False
 
-    def install(self, binary_path: Path) -> None:
+    def install(self, binary_path: Path) -> dict[str, object]:
+        if self.is_installed():
+            self._validate_existing_service(binary_path)
+            return self._install_result(binary_path, already_installed=True)
+
         quoted = f'"{binary_path}"'
-        recovery_configured = False
         manager = self._win32service.OpenSCManager(
             None,
             None,
             self._win32service.SC_MANAGER_CREATE_SERVICE,
         )
+        service: object | None = None
+        recovery_error: Exception | None = None
         try:
             service = self._win32service.CreateService(
                 manager,
@@ -107,13 +112,19 @@ class PyWin32ServiceAdapter:
                 None,
             )
             try:
-                recovery_configured = self._configure_recovery()
+                self._configure_recovery()
+            except Exception as exc:
+                recovery_error = exc
             finally:
                 self._win32service.CloseServiceHandle(service)
+                service = None
         finally:
+            if service is not None:
+                self._win32service.CloseServiceHandle(service)
             self._win32service.CloseServiceHandle(manager)
-        if not recovery_configured:
-            raise RuntimeError("service recovery policy was not configured")
+        if recovery_error is not None:
+            self._rollback_created_service(recovery_error)
+        return self._install_result(binary_path, already_installed=False)
 
     def uninstall(self) -> None:
         if self.is_installed():
@@ -164,11 +175,119 @@ class PyWin32ServiceAdapter:
         finally:
             win32service.CloseServiceHandle(handle)
 
+    def _rollback_created_service(self, original_error: Exception) -> None:
+        try:
+            self._delete_service()
+            self._wait_for_removed(timeout_seconds=10)
+        except Exception as rollback_error:
+            raise RuntimeError(
+                "service installation failed and rollback was incomplete"
+            ) from rollback_error
+        raise RuntimeError(
+            f"service recovery policy was not configured: {original_error.__class__.__name__}"
+        ) from original_error
+
+    def _delete_service(self) -> None:
+        try:
+            import win32service
+
+            handle = self._win32serviceutil.SmartOpenService(
+                None,
+                SERVICE_ID,
+                getattr(win32service, "DELETE", 0x00010000),
+            )
+            try:
+                win32service.DeleteService(handle)
+            finally:
+                win32service.CloseServiceHandle(handle)
+        except AttributeError:
+            self._win32serviceutil.RemoveService(SERVICE_ID)
+
+    def _wait_for_removed(self, *, timeout_seconds: float) -> None:
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            if not self.is_installed():
+                return
+            time.sleep(0.2)
+        raise RuntimeError("service rollback did not remove service")
+
+    def _validate_existing_service(self, binary_path: Path) -> None:
+        config = self._query_service_config()
+        errors: list[str] = []
+        if _normalize_service_binary(str(config["binary_path"])) != _normalize_service_binary(
+            str(binary_path)
+        ):
+            errors.append("binary")
+        if config["account"] != SERVICE_ACCOUNT:
+            errors.append("account")
+        if config["start_type"] != self._win32service.SERVICE_DEMAND_START:
+            errors.append("start_type")
+        if config["service_type"] != self._win32service.SERVICE_WIN32_OWN_PROCESS:
+            errors.append("service_type")
+        if not self._recovery_policy_matches():
+            errors.append("recovery_policy")
+        if errors:
+            raise RuntimeError(
+                "existing SentinelUEBA service configuration is not safe: "
+                + ",".join(errors)
+            )
+
+    def _query_service_config(self) -> dict[str, object]:
+        handle = self._win32serviceutil.SmartOpenService(
+            None,
+            SERVICE_ID,
+            getattr(self._win32service, "SERVICE_QUERY_CONFIG", 1),
+        )
+        try:
+            raw = self._win32service.QueryServiceConfig(handle)
+        finally:
+            self._win32service.CloseServiceHandle(handle)
+        return {
+            "service_type": raw[0],
+            "start_type": raw[1],
+            "binary_path": raw[3],
+            "account": raw[7],
+        }
+
+    def _recovery_policy_matches(self) -> bool:
+        handle = self._win32serviceutil.SmartOpenService(
+            None,
+            SERVICE_ID,
+            getattr(self._win32service, "SERVICE_QUERY_CONFIG", 1),
+        )
+        try:
+            raw = self._win32service.QueryServiceConfig2(
+                handle,
+                self._win32service.SERVICE_CONFIG_FAILURE_ACTIONS,
+            )
+        except Exception:
+            return False
+        finally:
+            self._win32service.CloseServiceHandle(handle)
+        actions = raw.get("Actions") if isinstance(raw, dict) else None
+        return actions == service_recovery_actions(self._win32service)
+
+    def _install_result(self, binary_path: Path, *, already_installed: bool) -> dict[str, object]:
+        return {
+            "service": SERVICE_ID,
+            "status": self.status(),
+            "binary": binary_path.name,
+            "already_installed": already_installed,
+            "recovery_configured": True,
+            "account": SERVICE_ACCOUNT,
+            "start_type": "manual",
+        }
+
 
 def service_adapter() -> ServiceAdapter:
     if os.name != "nt":
         return UnsupportedServiceAdapter()
     return PyWin32ServiceAdapter()
+
+
+def _normalize_service_binary(value: str) -> str:
+    stripped = value.strip().strip('"')
+    return str(Path(stripped)).casefold()
 
 
 def is_admin() -> bool:
@@ -214,9 +333,18 @@ def install_service(*, confirm: bool, adapter: ServiceAdapter | None = None) -> 
         protect_runtime_secret(directory, mode="service", directory=True)
     selected = adapter or service_adapter()
     binary = service_binary_path()
-    if not selected.is_installed():
-        selected.install(binary)
-    return {"service": SERVICE_ID, "status": selected.status(), "binary": binary.name}
+    install_result = selected.install(binary)
+    if isinstance(install_result, dict):
+        return install_result
+    return {
+        "service": SERVICE_ID,
+        "status": selected.status(),
+        "binary": binary.name,
+        "already_installed": False,
+        "recovery_configured": True,
+        "account": SERVICE_ACCOUNT,
+        "start_type": "manual",
+    }
 
 
 def uninstall_service(*, confirm: bool, adapter: ServiceAdapter | None = None) -> dict[str, object]:
