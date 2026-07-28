@@ -1,6 +1,6 @@
 # Development
 
-## Stage 5 Packaging
+## Stage 6 Dashboard and Packaging
 
 Development mode keeps the existing backend and Vite workflow:
 
@@ -8,6 +8,8 @@ Development mode keeps the existing backend and Vite workflow:
 uv run sentinelueba run-api
 pnpm --dir frontend dev
 ```
+
+The dashboard uses seven permanent pages: Overview, Telemetry, Data Pipeline, ML Lab, Detection Center, Findings, and Runtime. It should call existing same-origin API contracts, keep the control token in memory only, and use confirmation dialogs for destructive or lifecycle-changing operations.
 
 Packaged mode is Windows-only and built with:
 
@@ -39,7 +41,13 @@ Frontend:
 ```bash
 pnpm --dir frontend install
 pnpm --dir frontend dev
+pnpm --dir frontend lint
+pnpm --dir frontend typecheck
+pnpm --dir frontend test
+pnpm --dir frontend dashboard:smoke
 ```
+
+`dashboard:smoke` starts a temporary local backend and Vite frontend, then drives the full synthetic flow in a browser. Use it before changing navigation, token handling, guided flow actions, Findings lifecycle, or Runtime controls.
 
 Windows collection smoke:
 

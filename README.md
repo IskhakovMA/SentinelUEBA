@@ -1,6 +1,6 @@
 # SentinelUEBA
 
-SentinelUEBA is a local-first Windows-focused UEBA portfolio project. Stage 5 keeps the Stage 0-4 synthetic telemetry, Windows collectors, validation-first data pipeline, ML registry, and detection engine, then adds a Windows x64 PyInstaller portable bundle with embedded production React, a loopback runtime supervisor, single-instance desktop launcher, optional Windows Service, local control-token protection, release manifest verification, and package smoke CI.
+SentinelUEBA is a local-first Windows-focused UEBA portfolio project. Stage 6 keeps the Stage 0-5 telemetry, validation-first data pipeline, ML registry, detection engine, and Windows portable runtime, then turns the React interface into a unified local product for demos, manual testing, and daily triage.
 
 [Русская версия](README.ru.md)
 
@@ -25,6 +25,8 @@ SentinelUEBA is a local-first Windows-focused UEBA portfolio project. Stage 5 ke
 - Risk levels: low, medium, high, critical.
 - FastAPI endpoints and a bilingual EN/RU React dashboard.
 - Windows x64 portable Technical Preview package with `SentinelUEBA.exe`, `SentinelUEBALauncher.exe`, `SentinelUEBAService.exe`, embedded frontend assets, runtime roots outside the install directory, and SHA-256 release manifest verification.
+- Product dashboard pages for Overview, Telemetry, Data Pipeline, ML Lab, Detection Center, Findings, and Runtime.
+- Guided synthetic demo flow from data generation through findings lifecycle and suppression without using the CLI.
 
 An anomaly or finding is a triage signal. It is not proof of malicious activity.
 
@@ -45,7 +47,9 @@ pnpm --dir frontend install
 pnpm --dir frontend dev
 ```
 
-Open `http://localhost:5173`.
+Open `http://localhost:5173`, or launch `SentinelUEBALauncher.exe` from the Windows portable bundle.
+
+For a 5-10 minute UI walkthrough, see [demo flow](docs/DEMO_FLOW.md). For page responsibilities and safety rules, see [dashboard](docs/DASHBOARD.md).
 
 ## Windows Portable
 
@@ -148,9 +152,9 @@ The repository is a full-stack monorepo with a modular monolith backend:
 - `frontend`: React, TypeScript, Vite dashboard.
 - `docs`: architecture, privacy, threat model, and development notes.
 
-## Stage 5 Limits
+## Stage 6 Limits
 
-No MSI, automatic install, autostart, firewall rule, Linux collectors, ETW, kernel driver, cloud backend, SIEM integration, alerts, packet capture, keylogging, clipboard, browser history, traffic payload inspection, live blocking, automated response, arbitrary user Python/SQL/shell rules, online learning, retraining, autopromotion, supervised security labels, or production alerting are implemented. The Windows Service is optional, manual-start, loopback-only, and runs from the portable package after explicit install. Generated databases, snapshots, model bundles, identity secrets, logs, and reports are excluded from Git.
+No reports export, benchmarking, formal validation, alerts, email/Telegram/webhooks, SIEM export, cloud backend, remote access, auto-update, installer, new ML algorithms, new detection rules, automatic training, automatic response, live blocking, online learning, retraining, autopromotion, supervised security labels, or production alerting are implemented. The Windows Service is optional, manual-start, loopback-only, and runs from the portable package after explicit install. Generated databases, snapshots, model bundles, identity secrets, logs, and reports are excluded from Git.
 
 ## Development
 
@@ -161,6 +165,8 @@ uv run mypy backend/src
 uv run pytest
 pnpm --dir frontend lint
 pnpm --dir frontend typecheck
+pnpm --dir frontend test
+pnpm --dir frontend dashboard:smoke
 pnpm --dir frontend build
 ```
 
@@ -168,4 +174,4 @@ Python dependencies are managed with `uv`; frontend dependencies use `pnpm`.
 
 ## Roadmap
 
-Stage 6 can focus on post-Stage 5 productization only after the portable runtime, optional service, and package integrity checks are stable. Live alerts, SIEM export, and cloud backends remain out of scope for Stage 5.
+Stage 6 focuses on local product usability. Stage 7 has not started; live alerts, SIEM export, and cloud backends remain out of scope.

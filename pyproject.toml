@@ -1,6 +1,6 @@
 [project]
 name = "sentinelueba"
-version = "0.5.0"
+version = "0.6.0"
 description = "Local-first UEBA demo pipeline with synthetic telemetry, PyTorch autoencoder detection, FastAPI, and React."
 readme = "README.md"
 requires-python = ">=3.12,<3.14"

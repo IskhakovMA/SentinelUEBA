@@ -89,7 +89,7 @@ def create_package_fixture(
     package: Path,
     *,
     signed: bool = False,
-    version: str = "0.5.0",
+    version: str = "0.6.0",
 ) -> dict[str, object]:
     package.mkdir(parents=True, exist_ok=True)
     for name in ("SentinelUEBA.exe", "SentinelUEBALauncher.exe", "SentinelUEBAService.exe"):
@@ -288,7 +288,7 @@ def test_stage5_version_and_build_identity_are_safe(monkeypatch: pytest.MonkeyPa
 
     build = get_build_info().safe_dict()
 
-    assert __version__ == "0.5.0"
+    assert __version__ == "0.6.0"
     assert build["application_version"] == __version__
     assert build["git_commit"] == "abc123"
     assert build["build_timestamp_utc"] == "2026-07-28T10:00:00Z"
@@ -552,7 +552,7 @@ def test_stage5_single_instance_file_lock_and_stale_recovery(tmp_path: Path) -> 
     (runtime_dir / "host.lock").write_text("stale", encoding="utf-8")
     write_status(
         status_path,
-        status_now(port=8765, mode="desktop", version="0.5.0", state="ready", identity="x"),
+        status_now(port=8765, mode="desktop", version="0.6.0", state="ready", identity="x"),
     )
     status = json.loads(status_path.read_text(encoding="utf-8"))
     status["pid"] = 99999999
@@ -574,7 +574,7 @@ def test_stage5_second_launcher_preserves_owner_runtime_files(
     status = status_now(
         port=8765,
         mode="desktop",
-        version="0.5.0",
+        version="0.6.0",
         state="ready",
         identity="owner",
         started_at="2026-07-28T10:00:00Z",

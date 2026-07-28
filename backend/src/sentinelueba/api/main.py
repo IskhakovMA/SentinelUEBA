@@ -41,6 +41,7 @@ from sentinelueba.detection.worker_manager import (
 )
 from sentinelueba.runtime.build_info import get_build_info
 from sentinelueba.runtime.control import CONTROL_HEADER
+from sentinelueba.runtime.diagnostics import doctor
 from sentinelueba.runtime.installation import verify_installation
 from sentinelueba.runtime.paths import resolve_runtime_paths
 from sentinelueba.runtime.state import get_runtime_context
@@ -195,6 +196,12 @@ async def runtime_shutdown(request: ConfirmRequest) -> ApiResponse:
 @app.get("/runtime/verify-installation", response_model=ApiResponse)
 async def runtime_verify_installation() -> ApiResponse:
     return ApiResponse(data=verify_installation(resolve_runtime_paths().package_dir).safe_dict())
+
+
+@app.get("/runtime/doctor", response_model=ApiResponse)
+async def runtime_doctor() -> ApiResponse:
+    context = get_runtime_context()
+    return ApiResponse(data=doctor(resolve_runtime_paths(), port=context.port))
 
 
 @app.get("/status", response_model=ApiResponse)

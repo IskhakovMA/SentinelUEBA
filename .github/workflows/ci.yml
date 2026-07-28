@@ -360,6 +360,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
       - uses: pnpm/action-setup@v4
         with:
           version: 9
@@ -368,14 +371,22 @@ jobs:
           node-version: "22"
           cache: pnpm
           cache-dependency-path: frontend/pnpm-lock.yaml
+      - name: Install backend
+        run: uv sync --all-extras --dev
       - name: Install frontend
         run: pnpm --dir frontend install --frozen-lockfile
       - name: Lint
         run: pnpm --dir frontend lint
       - name: Typecheck
         run: pnpm --dir frontend typecheck
+      - name: Unit tests
+        run: pnpm --dir frontend test
       - name: Build
         run: pnpm --dir frontend build
+      - name: Install browser
+        run: pnpm --dir frontend exec playwright install --with-deps chromium
+      - name: Browser dashboard smoke
+        run: pnpm --dir frontend dashboard:smoke
 
   windows:
     runs-on: windows-latest
@@ -731,7 +742,7 @@ jobs:
               Write-Host "$Name failed as expected: $($_.Exception.Message)"
             }
           }
-          $zip = "dist\SentinelUEBA-0.5.0-windows-x64-portable.zip"
+          $zip = "dist\SentinelUEBA-0.6.0-windows-x64-portable.zip"
           $sidecar = Get-Content "$zip.sha256"
           $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
           if (-not $sidecar.Contains($actual)) { throw "ZIP SHA-256 sidecar mismatch" }
@@ -749,7 +760,7 @@ jobs:
           if ($manifest.git_commit -ne "${{ github.sha }}") {
             throw "release manifest git_commit does not match GitHub SHA"
           }
-          if ($manifest.application_version -ne "0.5.0") {
+          if ($manifest.application_version -ne "0.6.0") {
             throw "release manifest application_version mismatch"
           }
           if (-not (Test-Path (Join-Path $package "dependency-inventory.json"))) {
@@ -826,7 +837,19 @@ jobs:
             if ($readyResponse.data.state -ne "ready") { throw "health/ready data.state was not ready" }
             if ($readyResponse.data.frontend_ready -ne $true) { throw "health/ready frontend_ready was not true" }
             if ($readyResponse.data.database_ready -ne $true) { throw "health/ready database_ready was not true" }
-            Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$port/" | Out-Null
+            $overview = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$port/"
+            if ($overview.StatusCode -ne 200) { throw "packaged Overview did not open" }
+            if ($overview.Content -notmatch "root") { throw "packaged Overview root is missing" }
+            $assetMatch = [regex]::Match($overview.Content, 'src="([^"]+\.js)"')
+            if (-not $assetMatch.Success) { throw "packaged Overview script asset is missing" }
+            $assetUrl = "http://127.0.0.1:$port$($assetMatch.Groups[1].Value)"
+            $frontendBundle = (Invoke-WebRequest -UseBasicParsing $assetUrl).Content
+            if ($frontendBundle -notmatch "Guided First Run" -or $frontendBundle -notmatch "Generate synthetic demo") {
+              throw "guided synthetic flow is not present in packaged frontend"
+            }
+            if ($frontendBundle -match "http://127.0.0.1" -or $frontendBundle -match "localhost:") {
+              throw "frontend bundle contains non same-origin API URL"
+            }
             $build1 = Invoke-RestMethod "http://127.0.0.1:$port/runtime/build"
             $build2 = Invoke-RestMethod "http://127.0.0.1:$port/runtime/build"
             $manifestHash = (Get-FileHash -Algorithm SHA256 $manifestPath).Hash.ToLowerInvariant()
@@ -856,6 +879,13 @@ jobs:
             }
             $bootstrap = Invoke-RestMethod "http://127.0.0.1:$port/runtime/bootstrap"
             $controlToken = $bootstrap.data.control_token
+            $dom = (Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$port/").Content
+            if ($dom -like "*$controlToken*" -or $frontendBundle -like "*$controlToken*") {
+              throw "control token appeared in packaged DOM or frontend bundle"
+            }
+            if ($frontendBundle -notmatch "Build commit" -or $frontendBundle -notmatch "Verify installation") {
+              throw "Runtime page build identity controls are not present in packaged frontend"
+            }
             $headers = @{ "X-SentinelUEBA-Control-Token" = $controlToken }
             Invoke-RestMethod -Method POST -Uri "http://127.0.0.1:$port/demo/generate" -Headers $headers -Body '{"seed":42}' -ContentType "application/json" | Out-Null
             Invoke-RestMethod -Method POST -Uri "http://127.0.0.1:$port/runtime/shutdown" -Headers $headers -Body '{"confirm":true}' -ContentType "application/json" | Out-Null
@@ -1055,8 +1085,8 @@ jobs:
         with:
           name: sentinelueba-windows-portable
           path: |
-            dist/SentinelUEBA-0.5.0-windows-x64-portable.zip
-            dist/SentinelUEBA-0.5.0-windows-x64-portable.zip.sha256
+            dist/SentinelUEBA-0.6.0-windows-x64-portable.zip
+            dist/SentinelUEBA-0.6.0-windows-x64-portable.zip.sha256
             dist/SentinelUEBA/release-manifest.json
             dist/SentinelUEBA/dependency-inventory.json
           retention-days: 3
