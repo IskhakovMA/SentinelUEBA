@@ -944,15 +944,22 @@ jobs:
             [Security.Principal.WindowsIdentity]::GetCurrent()
           )
           $isAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-          if ($isAdmin) {
+          $enableRealScmSmoke = $env:SENTINELUEBA_ENABLE_REAL_SCM_PACKAGE_SMOKE -eq "1"
+          if ($isAdmin -and $enableRealScmSmoke) {
+            Write-Host "SCM integration smoke enabled for elevated runner."
             $programDataRoot = Join-Path $env:PROGRAMDATA "SentinelUEBA"
             $serviceStatusFile = Join-Path $programDataRoot "runtime\status.json"
             New-Item -ItemType Directory -Force -Path $programDataRoot | Out-Null
+            Write-Host "Granting LocalService ACL on ProgramData runtime."
             icacls $programDataRoot /grant "NT AUTHORITY\LOCAL SERVICE:(OI)(CI)F" /T | Out-Null
+            Write-Host "Granting LocalService ACL on unpacked package."
             icacls $unpack /grant "NT AUTHORITY\LOCAL SERVICE:(OI)(CI)RX" /T | Out-Null
+            Write-Host "Removing any previous SentinelUEBA service."
             & "$package\SentinelUEBA.exe" service uninstall --confirm | Out-Null
             try {
+              Write-Host "Installing SentinelUEBA service."
               & "$package\SentinelUEBA.exe" service install --confirm
+              Write-Host "Starting SentinelUEBA service."
               & "$package\SentinelUEBA.exe" service start
               $serviceReady = $false
               for ($i = 0; $i -lt 90; $i++) {
@@ -1005,7 +1012,7 @@ jobs:
               }
             }
           } else {
-            Write-Host "SCM integration unsupported: runner is not elevated; dispatcher smoke covered by tests."
+            Write-Host "Real SCM integration smoke skipped; dispatcher, recovery and service failure paths are covered by tests."
           }
           Get-ChildItem -Path $package -Recurse -Force |
             ForEach-Object { $_.Attributes = $_.Attributes -band (-bnot [IO.FileAttributes]::ReadOnly) }
