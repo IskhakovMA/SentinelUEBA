@@ -15,6 +15,8 @@ from sentinelueba.collectors.manager import (
 from sentinelueba.config import Settings
 from sentinelueba.datasets import DatasetSnapshotService
 from sentinelueba.detection.engine import summarize_scores
+from sentinelueba.detection.service import DetectionService
+from sentinelueba.detection.worker_manager import get_detection_worker_manager
 from sentinelueba.domain.events import WindowFeatures
 from sentinelueba.features.materialization import FeatureMaterializer
 from sentinelueba.features.windows import FEATURE_NAMES
@@ -42,6 +44,9 @@ class DemoPipeline:
 
     def ml(self) -> Stage3MLService:
         return Stage3MLService(self.storage, self.settings.data_dir, self.settings.model_dir)
+
+    def detection(self) -> DetectionService:
+        return DetectionService(self.storage, self.settings.data_dir, self.settings.model_dir)
 
     def materializer(self) -> FeatureMaterializer:
         return FeatureMaterializer(self.storage)
@@ -156,7 +161,7 @@ class DemoPipeline:
         ml_status = self.ml().status()
         return {
             "project": "SentinelUEBA",
-            "stage": "Stage 3",
+            "stage": "Stage 4",
             "windows_only": True,
             "storage": storage_status,
             "model": info,
@@ -170,6 +175,7 @@ class DemoPipeline:
                 },
                 "quarantine": self.storage.quarantine_summary(),
             },
+            "detection": self.detection().status(),
         }
 
     def anomalies(self) -> list[dict[str, object]]:
@@ -416,6 +422,229 @@ class DemoPipeline:
     def ml_drift(self, *, model_id: str, dataset_id: str) -> dict[str, object]:
         self.storage.initialize()
         return self.ml().drift(model_id=model_id, dataset_id=dataset_id)
+
+    def detection_status(self) -> dict[str, object]:
+        self.storage.initialize()
+        return self.detection().status()
+
+    def detection_policies(self) -> list[dict[str, object]]:
+        self.storage.initialize()
+        return self.detection().policies_list()
+
+    def detection_policy(
+        self,
+        policy_id: str,
+        policy_version: str | None = None,
+    ) -> dict[str, object]:
+        self.storage.initialize()
+        return self.detection().policy_show(policy_id, policy_version)
+
+    def detection_activate_policy(
+        self,
+        policy_id: str,
+        policy_version: str | None = None,
+        *,
+        confirm: bool = False,
+        reason: str = "manual policy activation",
+    ) -> dict[str, object]:
+        self.storage.initialize()
+        return self.detection().activate_policy(
+            policy_id,
+            policy_version,
+            confirm=confirm,
+            reason=reason,
+        )
+
+    def detection_rules(self) -> list[dict[str, object]]:
+        self.storage.initialize()
+        return self.detection().rules_list()
+
+    def detection_run_once(
+        self,
+        *,
+        dataset_kind: str = "synthetic",
+        profile: str | None = None,
+        policy_id: str | None = None,
+        policy_version: str | None = None,
+        model_id: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        batch_size: int = 256,
+        max_windows: int | None = None,
+        rules_only: bool = False,
+        dry_run: bool = False,
+    ) -> dict[str, object]:
+        self.storage.initialize()
+        return self.detection().run_once(
+            dataset_kind=dataset_kind,
+            profile=profile,
+            policy_id=policy_id,
+            policy_version=policy_version,
+            model_id=model_id,
+            start=start,
+            end=end,
+            batch_size=batch_size,
+            max_windows=max_windows,
+            rules_only=rules_only,
+            dry_run=dry_run,
+        )
+
+    def detection_backfill(
+        self,
+        *,
+        dataset_kind: str = "synthetic",
+        policy_id: str | None = None,
+        policy_version: str | None = None,
+        model_id: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        registered_dataset_id: str | None = None,
+        confirm: bool = False,
+        advance_watermark: bool = False,
+        confirm_advance_watermark: bool = False,
+    ) -> dict[str, object]:
+        self.storage.initialize()
+        return self.detection().backfill(
+            dataset_kind=dataset_kind,
+            policy_id=policy_id,
+            policy_version=policy_version,
+            model_id=model_id,
+            start=start,
+            end=end,
+            registered_dataset_id=registered_dataset_id,
+            confirm=confirm,
+            advance_watermark=advance_watermark,
+            confirm_advance_watermark=confirm_advance_watermark,
+        )
+
+    def detection_runs(self) -> list[dict[str, object]]:
+        self.storage.initialize()
+        return self.detection().runs_list()
+
+    def detection_run(self, detection_run_id: str) -> dict[str, object] | None:
+        self.storage.initialize()
+        return self.detection().run_show(detection_run_id)
+
+    def detection_findings(
+        self,
+        *,
+        status: str | None = None,
+        dataset_kind: str | None = None,
+    ) -> list[dict[str, object]]:
+        self.storage.initialize()
+        return self.detection().findings_list(status=status, dataset_kind=dataset_kind)
+
+    def detection_finding(self, finding_id: str) -> dict[str, object] | None:
+        self.storage.initialize()
+        return self.detection().finding_show(finding_id)
+
+    def detection_transition_finding(
+        self,
+        finding_id: str,
+        *,
+        to_status: str,
+        reason: str,
+        confirm: bool = False,
+    ) -> dict[str, object]:
+        self.storage.initialize()
+        return self.detection().transition_finding(
+            finding_id,
+            to_status=to_status,
+            reason=reason,
+            confirm=confirm,
+        )
+
+    def detection_suppressions(self) -> list[dict[str, object]]:
+        self.storage.initialize()
+        return self.detection().suppressions_list()
+
+    def detection_create_suppression(
+        self,
+        *,
+        scope: str,
+        reason: str,
+        ttl_minutes: int,
+        dataset_kind: str | None = None,
+        profile_key: str | None = None,
+        finding_fingerprint: str | None = None,
+        signal_id: str | None = None,
+    ) -> dict[str, object]:
+        self.storage.initialize()
+        return self.detection().create_suppression(
+            scope=scope,
+            reason=reason,
+            ttl_minutes=ttl_minutes,
+            dataset_kind=dataset_kind,
+            profile_key_value=profile_key,
+            finding_fingerprint=finding_fingerprint,
+            signal_id=signal_id,
+        )
+
+    def detection_revoke_suppression(
+        self,
+        suppression_id: str,
+        *,
+        confirm: bool = False,
+    ) -> dict[str, object]:
+        self.storage.initialize()
+        return self.detection().revoke_suppression(suppression_id, confirm=confirm)
+
+    def detection_worker_status(self, *, dataset_kind: str = "synthetic") -> dict[str, object]:
+        self.storage.initialize()
+        return get_detection_worker_manager().status(
+            database_path=self.settings.database_path,
+            data_dir=self.settings.data_dir,
+            model_dir=self.settings.model_dir,
+            dataset_kind=dataset_kind,
+        )
+
+    def detection_worker_start(
+        self,
+        *,
+        dataset_kind: str = "synthetic",
+        interval_seconds: int = 60,
+        max_windows: int | None = 256,
+    ) -> dict[str, object]:
+        self.storage.initialize()
+        return get_detection_worker_manager().start(
+            database_path=self.settings.database_path,
+            data_dir=self.settings.data_dir,
+            model_dir=self.settings.model_dir,
+            dataset_kind=dataset_kind,
+            interval_seconds=interval_seconds,
+            max_windows=max_windows,
+        )
+
+    def detection_worker_stop(
+        self,
+        *,
+        dataset_kind: str = "synthetic",
+        confirm: bool = False,
+    ) -> dict[str, object]:
+        self.storage.initialize()
+        return get_detection_worker_manager().stop(
+            database_path=self.settings.database_path,
+            data_dir=self.settings.data_dir,
+            model_dir=self.settings.model_dir,
+            dataset_kind=dataset_kind,
+            confirm=confirm,
+        )
+
+    def detection_worker_run_foreground(
+        self,
+        *,
+        dataset_kind: str = "synthetic",
+        max_windows: int | None = 256,
+        interval_seconds: int = 60,
+        single_cycle: bool = False,
+    ) -> dict[str, object]:
+        self.storage.initialize()
+        return self.detection().worker_run_foreground(
+            dataset_kind=dataset_kind,
+            max_windows=max_windows,
+            interval_seconds=interval_seconds,
+            single_cycle=single_cycle,
+        )
 
     def _create_dataset_locked(self, dataset_kind: str) -> dict[str, object]:
         self.materializer().materialize(dataset_kind)

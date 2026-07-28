@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client';
 import {
   Activity,
   Archive,
+  Bell,
   Database,
   Languages,
   Play,
@@ -40,6 +41,7 @@ type Status = {
   model: { trained?: boolean; model_version?: string };
   collection?: CollectionStatus;
   data_pipeline?: DataPipelineStatus;
+  detection?: DetectionStatus;
 };
 
 type Locale = 'en' | 'ru';
@@ -196,6 +198,111 @@ type DriftReport = {
   limitations?: string[];
 };
 
+type DetectionRun = {
+  detection_run_id?: string | null;
+  child_run_ids?: string[];
+  status: string;
+  mode: string;
+  model_id?: string | null;
+  examined_count?: number;
+  evaluated_count: number;
+  skipped_count: number;
+  finding_count: number;
+  finding_occurrences?: number;
+  new_findings?: number;
+  updated_findings?: number;
+  no_op_count: number;
+  blocked_reason?: string | null;
+  safe_error?: string | null;
+  started_at?: string;
+  completed_at?: string | null;
+};
+
+type DetectionStatus = {
+  schema_version: number;
+  active_policy: {
+    policy_id: string;
+    policy_version: string;
+    policy_hash: string;
+    mode: string;
+    finding_threshold: number;
+    fusion_method: string;
+    rules: Array<{ rule_id: string; enabled: boolean }>;
+  };
+  latest_run?: DetectionRun | null;
+  finding_counts: Record<string, number>;
+  evaluation_count: number;
+  watermarks: Array<{ last_window_start?: string | null; last_window_id?: string | null }>;
+  worker?: {
+    status?: string;
+    heartbeat_at?: string;
+    stop_requested?: number;
+    worker_key?: string | null;
+    lease_expired?: boolean;
+    expires_at?: string | null;
+  } | null;
+};
+
+type DetectionPolicySummary = {
+  policy_id: string;
+  policy_version: string;
+  policy_hash: string;
+  mode: string;
+  active: boolean;
+};
+
+type DetectionFinding = {
+  finding_id: string;
+  fingerprint: string;
+  dataset_kind: string;
+  profile_key: string;
+  status: string;
+  risk_level: Risk | 'none';
+  detection_score: number;
+  primary_signal_id: string;
+  title: string;
+  summary: string;
+  first_seen_at: string;
+  last_seen_at: string;
+  occurrence_count: number;
+};
+
+type DetectionFindingDetail = DetectionFinding & {
+  occurrences?: Array<{
+    occurrence_id: string;
+    detection_run_id: string;
+    window_id: string;
+    window_start: string;
+    status: string;
+    suppression_id?: string | null;
+    suppression_reason?: string | null;
+    suppression_expires_at?: string | null;
+    matched_signal_ids?: string[];
+    decision?: Record<string, unknown>;
+    signals?: Array<Record<string, unknown>>;
+    evidence?: Array<Record<string, unknown>>;
+  }>;
+  history?: Array<{
+    history_id: string;
+    from_status: string;
+    to_status: string;
+    reason: string;
+    created_at: string;
+  }>;
+};
+
+type DetectionSuppression = {
+  suppression_id: string;
+  scope: string;
+  dataset_kind?: string | null;
+  profile_key?: string | null;
+  finding_fingerprint?: string | null;
+  signal_id?: string | null;
+  reason: string;
+  expires_at: string;
+  revoked_at?: string | null;
+};
+
 const copy = {
   en: {
     title: 'SentinelUEBA',
@@ -239,6 +346,15 @@ const copy = {
     modelBundles: 'Model bundles',
     scoringRuns: 'Scoring runs',
     mlWarning: 'Offline model scoring only. An anomaly is not proof of malicious activity.',
+    detectionCenter: 'Detection Center',
+    runDetection: 'Run detection',
+    workerCycle: 'Worker cycle',
+    findings: 'Findings',
+    activePolicy: 'Active policy',
+    fusion: 'Fusion',
+    worker: 'Worker',
+    evaluations: 'Evaluations',
+    findingWarning: 'Findings are triage records, not proof of malicious activity.',
   },
   ru: {
     title: 'SentinelUEBA',
@@ -282,6 +398,15 @@ const copy = {
     modelBundles: 'Model bundles',
     scoringRuns: 'Scoring runs',
     mlWarning: 'Только offline scoring. Аномалия не является доказательством атаки.',
+    detectionCenter: 'Центр обнаружения',
+    runDetection: 'Запустить detection',
+    workerCycle: 'Цикл worker',
+    findings: 'Findings',
+    activePolicy: 'Активная policy',
+    fusion: 'Fusion',
+    worker: 'Worker',
+    evaluations: 'Оценки',
+    findingWarning: 'Findings являются triage-записями, а не доказательством атаки.',
   },
 };
 
@@ -317,6 +442,24 @@ export function App() {
     null,
   );
   const [driftReport, setDriftReport] = React.useState<DriftReport | null>(null);
+  const [detectionStatus, setDetectionStatus] = React.useState<DetectionStatus | null>(null);
+  const [detectionPolicies, setDetectionPolicies] = React.useState<DetectionPolicySummary[]>([]);
+  const [detectionFindings, setDetectionFindings] = React.useState<DetectionFinding[]>([]);
+  const [detectionSuppressions, setDetectionSuppressions] = React.useState<
+    DetectionSuppression[]
+  >([]);
+  const [selectedFindingDetail, setSelectedFindingDetail] =
+    React.useState<DetectionFindingDetail | null>(null);
+  const [detectionDatasetKind, setDetectionDatasetKind] = React.useState<'synthetic' | 'real'>(
+    'synthetic',
+  );
+  const [detectionPolicyHash, setDetectionPolicyHash] = React.useState<string>('');
+  const [detectionBackfillStart, setDetectionBackfillStart] = React.useState<string>('');
+  const [detectionBackfillEnd, setDetectionBackfillEnd] = React.useState<string>('');
+  const [findingStatusFilter, setFindingStatusFilter] = React.useState<string>('all');
+  const [findingRiskFilter, setFindingRiskFilter] = React.useState<string>('all');
+  const [findingSignalFilter, setFindingSignalFilter] = React.useState<string>('');
+  const [findingSinceFilter, setFindingSinceFilter] = React.useState<string>('');
   const t = copy[locale];
 
   const refresh = React.useCallback(async () => {
@@ -327,12 +470,33 @@ export function App() {
     );
     const qualityResponse = await api<{ data: DataQuality }>('/data-quality');
     const mlStatusResponse = await api<{ data: MLStatus }>('/ml/status');
+    const detectionStatusResponse = await api<{ data: DetectionStatus }>('/detection/status');
+    const detectionPolicyResponse = await api<{
+      data: { policies: DetectionPolicySummary[] };
+    }>('/detection/policies');
+    const findingQuery = new URLSearchParams({ dataset_kind: detectionDatasetKind });
+    if (findingStatusFilter !== 'all') {
+      findingQuery.set('status', findingStatusFilter);
+    }
+    const detectionFindingsResponse = await api<{ data: { findings: DetectionFinding[] } }>(
+      `/detection/findings?${findingQuery.toString()}`,
+    );
+    const suppressionResponse = await api<{ data: { suppressions: DetectionSuppression[] } }>(
+      '/detection/suppressions',
+    );
     setStatus(statusResponse.data);
     setAnomalies(anomalyResponse.anomalies);
     setCapabilities(capabilityResponse.data.collectors);
     setDataQuality(qualityResponse.data);
     setMlStatus(mlStatusResponse.data);
-  }, []);
+    setDetectionStatus(detectionStatusResponse.data);
+    setDetectionPolicies(detectionPolicyResponse.data.policies);
+    if (!detectionPolicyHash) {
+      setDetectionPolicyHash(detectionStatusResponse.data.active_policy.policy_hash);
+    }
+    setDetectionFindings(detectionFindingsResponse.data.findings);
+    setDetectionSuppressions(suppressionResponse.data.suppressions);
+  }, [detectionDatasetKind, detectionPolicyHash, findingStatusFilter]);
 
   React.useEffect(() => {
     refresh().catch(() => setMessage('Backend is not reachable'));
@@ -382,6 +546,27 @@ export function App() {
   const recommended = mlStatus?.models.find((model) => model.lifecycle_status === 'recommended');
   const latestTrainingRun = mlStatus?.training_runs[0];
   const latestScoringRun = mlStatus?.scoring_runs[0];
+  const latestDetectionRun = detectionStatus?.latest_run;
+  const latestWatermark = detectionStatus?.watermarks[0];
+  const selectedDetectionPolicy =
+    detectionPolicies.find((policy) => policy.policy_hash === detectionPolicyHash) ??
+    detectionPolicies.find((policy) => policy.active) ??
+    detectionPolicies[0];
+  const filteredDetectionFindings = detectionFindings.filter((finding) => {
+    if (findingRiskFilter !== 'all' && finding.risk_level !== findingRiskFilter) {
+      return false;
+    }
+    if (
+      findingSignalFilter &&
+      !finding.primary_signal_id.toLowerCase().includes(findingSignalFilter.toLowerCase())
+    ) {
+      return false;
+    }
+    if (findingSinceFilter && new Date(finding.last_seen_at) < new Date(findingSinceFilter)) {
+      return false;
+    }
+    return true;
+  });
   const availableDatasets = dataQuality?.dataset_snapshots[mlDatasetKind] ?? [];
   const effectiveDatasetId = selectedDatasetId || availableDatasets[0]?.dataset_id || '';
   const selectedFamilies = [
@@ -964,6 +1149,516 @@ export function App() {
             ) : (
               <p>Run drift.</p>
             )}
+          </article>
+        </div>
+      </section>
+
+      <section className="detectionPanel">
+        <div className="panelTitle">
+          <Bell size={18} />
+          <span>{t.detectionCenter}</span>
+        </div>
+        <div className="detectionControls">
+          <label>
+            Dataset
+            <select
+              value={detectionDatasetKind}
+              onChange={(event) =>
+                setDetectionDatasetKind(event.target.value as 'synthetic' | 'real')
+              }
+            >
+              <option value="synthetic">synthetic</option>
+              <option value="real">real</option>
+            </select>
+          </label>
+          <label>
+            Policy
+            <select
+              value={detectionPolicyHash}
+              onChange={(event) => setDetectionPolicyHash(event.target.value)}
+            >
+              {detectionPolicies.map((policy) => (
+                <option key={policy.policy_hash} value={policy.policy_hash}>
+                  {policy.policy_id} / {policy.mode}
+                  {policy.active ? ' / active' : ''}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Backfill start
+            <input
+              value={detectionBackfillStart}
+              onChange={(event) => setDetectionBackfillStart(event.target.value)}
+              placeholder="2026-07-27T00:00:00Z"
+            />
+          </label>
+          <label>
+            Backfill end
+            <input
+              value={detectionBackfillEnd}
+              onChange={(event) => setDetectionBackfillEnd(event.target.value)}
+              placeholder="2026-07-27T23:59:59Z"
+            />
+          </label>
+        </div>
+        <div className="pipelineActions">
+          <button
+            onClick={() =>
+              run(
+                'detection',
+                () =>
+                  api('/detection/run-once', {
+                    method: 'POST',
+                    body: JSON.stringify({
+                      dataset_kind: detectionDatasetKind,
+                      policy_id: selectedDetectionPolicy?.policy_id,
+                      policy_version: selectedDetectionPolicy?.policy_version,
+                    }),
+                  }),
+              )
+            }
+          >
+            <Play size={17} /> {t.runDetection}
+          </button>
+          <button
+            onClick={() =>
+              run(
+                'detection-dry-run',
+                () =>
+                  api('/detection/run-once', {
+                    method: 'POST',
+                    body: JSON.stringify({
+                      dataset_kind: detectionDatasetKind,
+                      policy_id: selectedDetectionPolicy?.policy_id,
+                      policy_version: selectedDetectionPolicy?.policy_version,
+                      dry_run: true,
+                    }),
+                  }),
+              )
+            }
+          >
+            <Radar size={17} /> dry-run
+          </button>
+          <button
+            disabled={!selectedDetectionPolicy}
+            onClick={() => {
+              if (window.confirm(`Activate ${selectedDetectionPolicy?.policy_id}?`)) {
+                run(
+                  'policy-activate',
+                  () =>
+                    api(`/detection/policies/${selectedDetectionPolicy?.policy_id}/activate`, {
+                      method: 'POST',
+                      body: JSON.stringify({
+                        policy_version: selectedDetectionPolicy?.policy_version,
+                        confirm: true,
+                        reason: 'Detection Center activation',
+                      }),
+                    }),
+                );
+              }
+            }}
+          >
+            <Shield size={17} /> activate
+          </button>
+          <button
+            disabled={!selectedDetectionPolicy || !detectionBackfillStart || !detectionBackfillEnd}
+            onClick={() => {
+              if (window.confirm('Run confirmed detection backfill?')) {
+                run(
+                  'detection-backfill',
+                  () =>
+                    api('/detection/backfill', {
+                      method: 'POST',
+                      body: JSON.stringify({
+                        dataset_kind: detectionDatasetKind,
+                        policy_id: selectedDetectionPolicy?.policy_id,
+                        policy_version: selectedDetectionPolicy?.policy_version,
+                        start: detectionBackfillStart,
+                        end: detectionBackfillEnd,
+                        confirm: true,
+                      }),
+                    }),
+                );
+              }
+            }}
+          >
+            <Archive size={17} /> backfill
+          </button>
+          <button
+            onClick={() =>
+              run(
+                'worker-start',
+                () =>
+                  api('/detection/worker/start', {
+                    method: 'POST',
+                    body: JSON.stringify({
+                      dataset_kind: detectionDatasetKind,
+                      interval_seconds: 60,
+                      max_windows: 256,
+                    }),
+                  }),
+              )
+            }
+          >
+            <Play size={17} /> worker start
+          </button>
+          <button
+            onClick={() =>
+              run(
+                'worker-stop',
+                () =>
+                  api('/detection/worker/stop', {
+                    method: 'POST',
+                    body: JSON.stringify({
+                      dataset_kind: detectionDatasetKind,
+                      confirm: true,
+                    }),
+                  }),
+              )
+            }
+          >
+            <Square size={17} /> worker stop
+          </button>
+          <button
+            onClick={() =>
+              run(
+                'detection-worker',
+                () =>
+                  api('/detection/worker/run-foreground', {
+                    method: 'POST',
+                    body: JSON.stringify({
+                      dataset_kind: detectionDatasetKind,
+                      max_windows: 256,
+                      single_cycle: true,
+                    }),
+                  }),
+              )
+            }
+          >
+            <RefreshCw size={17} /> {t.workerCycle}
+          </button>
+          <button onClick={() => refresh()}>
+            <RefreshCw size={17} /> refresh
+          </button>
+        </div>
+        <div className="detectionGrid">
+          <article>
+            <span>{t.activePolicy}</span>
+            <strong>{detectionStatus?.active_policy.policy_id ?? 'none'}</strong>
+          </article>
+          <article>
+            <span>Schema</span>
+            <strong>v{detectionStatus?.schema_version ?? 'n/a'}</strong>
+          </article>
+          <article>
+            <span>{t.fusion}</span>
+            <strong>{detectionStatus?.active_policy.fusion_method ?? 'none'}</strong>
+          </article>
+          <article>
+            <span>Policy hash</span>
+            <strong>{shortValue(detectionStatus?.active_policy.policy_hash)}</strong>
+          </article>
+          <article>
+            <span>Mode / threshold</span>
+            <strong>
+              {detectionStatus
+                ? `${detectionStatus.active_policy.mode} / ${detectionStatus.active_policy.finding_threshold}`
+                : 'none'}
+            </strong>
+          </article>
+          <article>
+            <span>{t.worker}</span>
+            <strong>
+              {detectionStatus?.worker?.status ?? 'stopped'}
+              {detectionStatus?.worker?.lease_expired ? ' / expired' : ''}
+            </strong>
+          </article>
+          <article>
+            <span>Worker key</span>
+            <strong>{shortValue(detectionStatus?.worker?.worker_key)}</strong>
+          </article>
+          <article>
+            <span>{t.evaluations}</span>
+            <strong>{detectionStatus?.evaluation_count ?? 0}</strong>
+          </article>
+          <article>
+            <span>{t.findings}</span>
+            <strong>{Object.values(detectionStatus?.finding_counts ?? {}).reduce((a, b) => a + b, 0)}</strong>
+          </article>
+          <article>
+            <span>Latest run</span>
+            <strong>
+              {latestDetectionRun
+                ? `${latestDetectionRun.status} ${latestDetectionRun.finding_count}/${latestDetectionRun.evaluated_count}`
+                : 'none'}
+            </strong>
+          </article>
+          <article>
+            <span>Run audit</span>
+            <strong>
+              {latestDetectionRun
+                ? `${latestDetectionRun.examined_count ?? 0} examined / ${latestDetectionRun.skipped_count} skipped`
+                : 'none'}
+            </strong>
+          </article>
+          <article>
+            <span>Occurrences</span>
+            <strong>
+              {latestDetectionRun
+                ? `${latestDetectionRun.finding_occurrences ?? 0} occ / ${latestDetectionRun.new_findings ?? 0} new`
+                : 'none'}
+            </strong>
+          </article>
+          <article>
+            <span>{t.watermark}</span>
+            <strong>{shortValue(latestWatermark?.last_window_start)}</strong>
+          </article>
+          <article>
+            <span>Watermark id</span>
+            <strong>{shortValue(latestWatermark?.last_window_id)}</strong>
+          </article>
+        </div>
+        <p className="warning">{t.findingWarning}</p>
+        <div className="detectionFilters">
+          <label>
+            Status
+            <select
+              value={findingStatusFilter}
+              onChange={(event) => setFindingStatusFilter(event.target.value)}
+            >
+              <option value="all">all</option>
+              <option value="open">open</option>
+              <option value="acknowledged">acknowledged</option>
+              <option value="investigating">investigating</option>
+              <option value="suppressed">suppressed</option>
+              <option value="resolved">resolved</option>
+              <option value="false_positive">false positive</option>
+            </select>
+          </label>
+          <label>
+            Risk
+            <select
+              value={findingRiskFilter}
+              onChange={(event) => setFindingRiskFilter(event.target.value)}
+            >
+              <option value="all">all</option>
+              <option value="low">low</option>
+              <option value="medium">medium</option>
+              <option value="high">high</option>
+              <option value="critical">critical</option>
+              <option value="none">none</option>
+            </select>
+          </label>
+          <label>
+            Signal
+            <input
+              value={findingSignalFilter}
+              onChange={(event) => setFindingSignalFilter(event.target.value)}
+              placeholder="rare-process-v1"
+            />
+          </label>
+          <label>
+            Since
+            <input
+              value={findingSinceFilter}
+              onChange={(event) => setFindingSinceFilter(event.target.value)}
+              placeholder="2026-07-27T00:00:00Z"
+            />
+          </label>
+        </div>
+        <div className="table findingTable">
+          {filteredDetectionFindings.slice(0, 12).map((finding) => (
+            <div className="row" key={finding.finding_id}>
+              <span>{shortValue(finding.finding_id)}</span>
+              <span className={`risk ${finding.risk_level}`}>{finding.risk_level}</span>
+              <span>{finding.status}</span>
+              <span>{finding.detection_score}</span>
+              <span>{finding.primary_signal_id}</span>
+              <span>{finding.occurrence_count}</span>
+              <button
+                onClick={() =>
+                  run('finding-detail', async () => {
+                    const response = await api<{ data: DetectionFindingDetail }>(
+                      `/detection/findings/${finding.finding_id}`,
+                    );
+                    setSelectedFindingDetail(response.data);
+                    return response;
+                  })
+                }
+              >
+                detail
+              </button>
+              <button
+                disabled={finding.status !== 'open'}
+                onClick={() =>
+                  run(
+                    'ack',
+                    () =>
+                      api(`/detection/findings/${finding.finding_id}/acknowledge`, {
+                        method: 'POST',
+                        body: JSON.stringify({ reason: 'Detection Center acknowledge' }),
+                      }),
+                  )
+                }
+              >
+                ack
+              </button>
+              <button
+                disabled={!['open', 'acknowledged'].includes(finding.status)}
+                onClick={() =>
+                  run(
+                    'investigate',
+                    () =>
+                      api(`/detection/findings/${finding.finding_id}/investigate`, {
+                        method: 'POST',
+                        body: JSON.stringify({ reason: 'Detection Center investigation' }),
+                      }),
+                  )
+                }
+              >
+                investigate
+              </button>
+              <button
+                disabled={!['open', 'acknowledged', 'investigating'].includes(finding.status)}
+                onClick={() => {
+                  if (window.confirm(`Resolve ${shortValue(finding.finding_id)}?`)) {
+                    run(
+                      'resolve',
+                      () =>
+                        api(`/detection/findings/${finding.finding_id}/resolve`, {
+                          method: 'POST',
+                          body: JSON.stringify({
+                            reason: 'Detection Center resolution',
+                            confirm: true,
+                          }),
+                        }),
+                    );
+                  }
+                }}
+              >
+                resolve
+              </button>
+              <button
+                disabled={!['open', 'acknowledged', 'investigating'].includes(finding.status)}
+                onClick={() => {
+                  if (window.confirm(`False positive ${shortValue(finding.finding_id)}?`)) {
+                    run(
+                      'false-positive',
+                      () =>
+                        api(`/detection/findings/${finding.finding_id}/false-positive`, {
+                          method: 'POST',
+                          body: JSON.stringify({
+                            reason: 'Detection Center false positive',
+                            confirm: true,
+                          }),
+                        }),
+                    );
+                  }
+                }}
+              >
+                false+
+              </button>
+              <button
+                onClick={() => {
+                  if (window.confirm(`Suppress ${shortValue(finding.finding_id)} for 60 min?`)) {
+                    run(
+                      'suppress',
+                      () =>
+                        api('/detection/suppressions', {
+                          method: 'POST',
+                          body: JSON.stringify({
+                            scope: 'finding_fingerprint',
+                            finding_fingerprint: finding.fingerprint,
+                            ttl_minutes: 60,
+                            reason: 'Detection Center suppression',
+                          }),
+                        }),
+                    );
+                  }
+                }}
+              >
+                suppress
+              </button>
+            </div>
+          ))}
+        </div>
+        <div className="detailGrid">
+          <article>
+            <span>Finding detail</span>
+            {selectedFindingDetail ? (
+              <div className="detailList">
+                <strong>{selectedFindingDetail.title}</strong>
+                <span>{selectedFindingDetail.summary}</span>
+                <span>Status {selectedFindingDetail.status}</span>
+                <span>Profile {shortValue(selectedFindingDetail.profile_key)}</span>
+                <span>Primary signal {selectedFindingDetail.primary_signal_id}</span>
+                <span>Occurrences {selectedFindingDetail.occurrences?.length ?? 0}</span>
+                <span>History {selectedFindingDetail.history?.length ?? 0}</span>
+              </div>
+            ) : (
+              <p>Select a finding.</p>
+            )}
+          </article>
+          <article>
+            <span>Occurrences / evidence</span>
+            <div className="detailList">
+              {(selectedFindingDetail?.occurrences ?? []).slice(0, 3).map((occurrence) => (
+                <span key={occurrence.occurrence_id}>
+                  {shortValue(occurrence.window_id)} {occurrence.status} signals{' '}
+                  {(occurrence.matched_signal_ids ?? []).join(', ') || 'none'} evidence{' '}
+                  {(occurrence.evidence ?? []).length}
+                </span>
+              ))}
+              {selectedFindingDetail?.occurrences?.[0]?.decision ? (
+                <span>
+                  Fusion{' '}
+                  {JSON.stringify(selectedFindingDetail.occurrences[0].decision).slice(0, 180)}
+                </span>
+              ) : (
+                <span>Fusion none</span>
+              )}
+            </div>
+          </article>
+          <article>
+            <span>Lifecycle history</span>
+            <div className="detailList">
+              {(selectedFindingDetail?.history ?? []).slice(-5).map((item) => (
+                <span key={item.history_id}>
+                  {item.from_status} to {item.to_status}: {item.reason}
+                </span>
+              ))}
+            </div>
+          </article>
+          <article>
+            <span>Active suppressions</span>
+            <div className="detailList">
+              {detectionSuppressions
+                .filter((item) => !item.revoked_at)
+                .slice(0, 5)
+                .map((item) => (
+                  <span key={item.suppression_id}>
+                    {item.scope} {item.signal_id ?? shortValue(item.finding_fingerprint)} until{' '}
+                    {shortValue(item.expires_at)}
+                    <button
+                      onClick={() => {
+                        if (window.confirm(`Revoke ${shortValue(item.suppression_id)}?`)) {
+                          run(
+                            'revoke-suppression',
+                            () =>
+                              api(`/detection/suppressions/${item.suppression_id}/revoke`, {
+                                method: 'POST',
+                                body: JSON.stringify({ confirm: true }),
+                              }),
+                          );
+                        }
+                      }}
+                    >
+                      revoke
+                    </button>
+                  </span>
+                ))}
+            </div>
           </article>
         </div>
       </section>

@@ -43,7 +43,7 @@ from sentinelueba.domain.events import EventType, TelemetryEvent, deterministic_
 from sentinelueba.features.windows import build_feature_windows, windows_to_matrix
 from sentinelueba.ml.autoencoder import load_model, train_autoencoder
 from sentinelueba.services.pipeline import DemoPipeline
-from sentinelueba.storage.sqlite import SQLiteStorage
+from sentinelueba.storage.sqlite import DB_SCHEMA_VERSION, SQLiteStorage
 from sentinelueba.telemetry.synthetic import generate_synthetic_events
 
 
@@ -256,7 +256,7 @@ def test_migration_v1_to_current_preserves_events(tmp_path: Path) -> None:
     conn.close()
     store = SQLiteStorage(db)
     store.initialize()
-    assert store.status()["schema_version"] == 8
+    assert store.status()["schema_version"] == DB_SCHEMA_VERSION
     assert store.status()["event_count"] == 1
     assert "collection_sessions" in {
         row[0] for row in sqlite3.connect(db).execute("SELECT name FROM sqlite_master")
@@ -278,6 +278,8 @@ def test_migration_v2_to_current_adds_heartbeat(tmp_path: Path) -> None:
     conn.execute("DELETE FROM schema_version WHERE version = 6")
     conn.execute("DELETE FROM schema_version WHERE version = 7")
     conn.execute("DELETE FROM schema_version WHERE version = 8")
+    conn.execute("DELETE FROM schema_version WHERE version = 9")
+    conn.execute("DELETE FROM schema_version WHERE version = 10")
     columns = [row[1] for row in conn.execute("PRAGMA table_info(collection_sessions)")]
     if "last_heartbeat_at" in columns:
         conn.execute("ALTER TABLE collection_sessions RENAME TO collection_sessions_old")
@@ -299,7 +301,7 @@ def test_migration_v2_to_current_adds_heartbeat(tmp_path: Path) -> None:
         row[1] for row in sqlite3.connect(db).execute("PRAGMA table_info(collection_sessions)")
     }
     assert "last_heartbeat_at" in columns
-    assert store.status()["schema_version"] == 8
+    assert store.status()["schema_version"] == DB_SCHEMA_VERSION
 
 
 def test_downtime_after_heartbeat_is_not_counted(tmp_path: Path) -> None:

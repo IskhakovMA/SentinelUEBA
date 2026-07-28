@@ -19,3 +19,16 @@ promotion/rollback, and safe `skops` loading for Isolation Forest artifacts. Rem
 risks include false positives, false negatives, synthetic-demo overfitting, unlabeled real
 data, and explanations being mistaken for proof. The UI, API, CLI, docs, and model cards
 state that an anomaly is not proof of malicious activity.
+
+## Stage 4 Detection Risks
+
+Stage 4 mitigates detection-engine risks with immutable policies, Pydantic-validated
+contracts, built-in allowlisted rules, deterministic model-strength normalization,
+deterministic fusion, idempotent evaluations, exact suppressions with TTL and revocation,
+and SQLite lifecycle history. Rules cannot execute arbitrary Python, SQL, shell commands,
+regular expressions, or user-provided code.
+
+Remaining risks include false positives, false negatives, overfitting to synthetic
+scenarios, suppressions hiding useful triage records until expiry, stale workers, and
+analysts misunderstanding a finding as confirmed compromise. The CLI, API, frontend, and
+docs state that findings are triage records only.

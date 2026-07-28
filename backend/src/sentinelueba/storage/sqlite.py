@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from collections.abc import Iterator
@@ -9,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from sentinelueba.domain.events import AnomalyRecord, EventType, TelemetryEvent
+from sentinelueba.features.windows import FEATURE_NAMES
 from sentinelueba.validation import (
     EVENT_SCHEMA_VERSION,
     ValidationFailure,
@@ -16,7 +18,7 @@ from sentinelueba.validation import (
     validate_event,
 )
 
-DB_SCHEMA_VERSION = 8
+DB_SCHEMA_VERSION = 10
 
 
 class SchemaIntegrityError(RuntimeError):
@@ -81,6 +83,12 @@ class SQLiteStorage:
                 version = 7
             if version < 8:
                 self._apply_v8(conn)
+                version = 8
+            if version < 9:
+                self._apply_v9(conn)
+                version = 9
+            if version < 10:
+                self._apply_v10(conn)
             self._assert_schema_integrity(conn)
 
     def _record_migration(self, conn: sqlite3.Connection, version: int) -> None:
@@ -366,6 +374,16 @@ class SQLiteStorage:
             "model_promotions",
             "scoring_runs",
             "scored_windows",
+            "detection_policies",
+            "detection_runs",
+            "detection_evaluations",
+            "findings",
+            "finding_occurrences",
+            "finding_state_history",
+            "detection_suppressions",
+            "detection_watermarks",
+            "detection_worker_leases",
+            "detection_policy_activations",
         }
         existing_tables = {
             row["name"]
@@ -400,6 +418,7 @@ class SQLiteStorage:
                 "last_observation_id",
                 "last_successful_run_at",
             },
+            "feature_windows": {"profile_key", "feature_input_hash"},
             "collector_observations": {
                 "collector_id",
                 "observed_at",
@@ -419,6 +438,55 @@ class SQLiteStorage:
             },
             "scoring_runs": {"scoring_run_id", "model_id", "dataset_id", "status"},
             "scored_windows": {"scoring_run_id", "window_id", "anomaly_score"},
+            "detection_policies": {"policy_id", "policy_version", "policy_hash", "active"},
+            "detection_runs": {
+                "detection_run_id",
+                "policy_hash",
+                "status",
+                "mode",
+                "run_mode",
+                "policy_mode",
+                "examined_windows",
+                "evaluated_windows",
+                "blocked_reason",
+            },
+            "detection_evaluations": {
+                "evaluation_id",
+                "window_id",
+                "feature_input_hash",
+                "policy_hash",
+                "model_id",
+                "decision_json",
+                "suppression_id",
+            },
+            "findings": {
+                "finding_id",
+                "fingerprint",
+                "status",
+                "risk_level",
+                "related_previous_finding_id",
+            },
+            "finding_occurrences": {"occurrence_id", "finding_id", "evaluation_id", "window_id"},
+            "finding_state_history": {"history_id", "finding_id", "from_status", "to_status"},
+            "detection_suppressions": {"suppression_id", "scope", "active"},
+            "detection_watermarks": {"watermark_key", "last_window_start", "last_window_id"},
+            "detection_worker_leases": {
+                "worker_id",
+                "worker_key",
+                "owner_id",
+                "dataset_kind",
+                "policy_hash",
+                "status",
+                "heartbeat_at",
+                "expires_at",
+            },
+            "detection_policy_activations": {
+                "activation_id",
+                "previous_policy_hash",
+                "new_policy_hash",
+                "reason",
+                "created_at",
+            },
         }
         for table, columns in required_columns.items():
             missing_columns = sorted(columns - self._columns(conn, table))
@@ -680,6 +748,337 @@ class SQLiteStorage:
             "ON model_promotions(dataset_kind, profile_key, created_at)"
         )
         self._record_migration(conn, 8)
+
+    def _apply_v9(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS detection_policies (
+                policy_id TEXT NOT NULL,
+                policy_version TEXT NOT NULL,
+                policy_hash TEXT PRIMARY KEY,
+                mode TEXT NOT NULL,
+                policy_json TEXT NOT NULL,
+                active INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                source_commit TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_detection_policy_identity
+            ON detection_policies(policy_id, policy_version)
+            """
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_detection_policy
+            ON detection_policies(active)
+            WHERE active = 1
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS detection_runs (
+                detection_run_id TEXT PRIMARY KEY,
+                dataset_kind TEXT NOT NULL,
+                profile_key TEXT,
+                policy_id TEXT NOT NULL,
+                policy_version TEXT NOT NULL,
+                policy_hash TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                model_id TEXT,
+                model_version TEXT,
+                model_hash TEXT,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                window_count INTEGER NOT NULL,
+                evaluated_count INTEGER NOT NULL,
+                skipped_count INTEGER NOT NULL,
+                finding_count INTEGER NOT NULL,
+                no_op_count INTEGER NOT NULL,
+                dry_run INTEGER NOT NULL,
+                safe_error TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS detection_evaluations (
+                evaluation_id TEXT PRIMARY KEY,
+                detection_run_id TEXT NOT NULL,
+                window_id TEXT NOT NULL,
+                dataset_kind TEXT NOT NULL,
+                profile_key TEXT NOT NULL,
+                window_start TEXT NOT NULL,
+                window_end TEXT NOT NULL,
+                feature_schema_version TEXT NOT NULL,
+                feature_input_hash TEXT NOT NULL,
+                policy_id TEXT NOT NULL,
+                policy_version TEXT NOT NULL,
+                policy_hash TEXT NOT NULL,
+                model_id TEXT,
+                model_version TEXT,
+                model_hash TEXT,
+                mode TEXT NOT NULL,
+                status TEXT NOT NULL,
+                detection_score REAL NOT NULL,
+                risk_level TEXT NOT NULL,
+                matched_signal_ids_json TEXT NOT NULL,
+                decision_json TEXT NOT NULL,
+                finding_id TEXT,
+                created_at TEXT NOT NULL,
+                skipped_reason TEXT,
+                UNIQUE(window_id, feature_input_hash, policy_hash, model_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS findings (
+                finding_id TEXT PRIMARY KEY,
+                fingerprint TEXT NOT NULL,
+                dataset_kind TEXT NOT NULL,
+                profile_key TEXT NOT NULL,
+                policy_id TEXT NOT NULL,
+                policy_version TEXT NOT NULL,
+                policy_hash TEXT NOT NULL,
+                model_id TEXT,
+                model_version TEXT,
+                model_hash TEXT,
+                status TEXT NOT NULL,
+                risk_level TEXT NOT NULL,
+                detection_score REAL NOT NULL,
+                primary_signal_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                occurrence_count INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS finding_occurrences (
+                occurrence_id TEXT PRIMARY KEY,
+                finding_id TEXT NOT NULL,
+                evaluation_id TEXT NOT NULL,
+                window_id TEXT NOT NULL,
+                window_start TEXT NOT NULL,
+                window_end TEXT NOT NULL,
+                detection_score REAL NOT NULL,
+                risk_level TEXT NOT NULL,
+                signals_json TEXT NOT NULL,
+                evidence_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(finding_id, evaluation_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS finding_state_history (
+                history_id TEXT PRIMARY KEY,
+                finding_id TEXT NOT NULL,
+                from_status TEXT,
+                to_status TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS detection_suppressions (
+                suppression_id TEXT PRIMARY KEY,
+                scope TEXT NOT NULL,
+                dataset_kind TEXT,
+                profile_key TEXT,
+                finding_fingerprint TEXT,
+                signal_id TEXT,
+                reason TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                active INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                revoked_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS detection_watermarks (
+                watermark_key TEXT PRIMARY KEY,
+                dataset_kind TEXT NOT NULL,
+                profile_key TEXT,
+                policy_hash TEXT NOT NULL,
+                model_id TEXT,
+                last_window_start TEXT,
+                last_window_id TEXT,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS detection_worker_leases (
+                worker_id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                heartbeat_at TEXT NOT NULL,
+                stop_requested INTEGER NOT NULL,
+                config_json TEXT NOT NULL,
+                safe_error TEXT
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_detection_runs_started "
+            "ON detection_runs(started_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_detection_evaluations_window "
+            "ON detection_evaluations(dataset_kind, profile_key, window_start, window_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_findings_status "
+            "ON findings(status, last_seen_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_findings_fingerprint "
+            "ON findings(fingerprint, status, last_seen_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_suppressions_scope "
+            "ON detection_suppressions(scope, active, expires_at)"
+        )
+        self._record_migration(conn, 9)
+
+    def _apply_v10(self, conn: sqlite3.Connection) -> None:
+        feature_columns = self._columns(conn, "feature_windows")
+        if "profile_key" not in feature_columns:
+            conn.execute("ALTER TABLE feature_windows ADD COLUMN profile_key TEXT")
+        if "feature_input_hash" not in feature_columns:
+            conn.execute("ALTER TABLE feature_windows ADD COLUMN feature_input_hash TEXT")
+        rows = conn.execute("SELECT * FROM feature_windows").fetchall()
+        for row in rows:
+            payload = self._feature_window_row(row)
+            conn.execute(
+                """
+                UPDATE feature_windows
+                SET profile_key = ?, feature_input_hash = ?
+                WHERE window_id = ?
+                """,
+                (
+                    self._feature_profile_key(payload),
+                    self._feature_input_hash(payload),
+                    payload["window_id"],
+                ),
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_windows_detection_pending "
+            "ON feature_windows(dataset_kind, profile_key, window_start, window_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_windows_feature_hash "
+            "ON feature_windows(window_id, feature_input_hash)"
+        )
+        run_columns = self._columns(conn, "detection_runs")
+        run_additions = {
+            "run_mode": "TEXT NOT NULL DEFAULT 'manual'",
+            "policy_mode": "TEXT NOT NULL DEFAULT 'hybrid'",
+            "range_start": "TEXT",
+            "range_end": "TEXT",
+            "examined_windows": "INTEGER NOT NULL DEFAULT 0",
+            "evaluated_windows": "INTEGER NOT NULL DEFAULT 0",
+            "skipped_windows": "INTEGER NOT NULL DEFAULT 0",
+            "no_op_windows": "INTEGER NOT NULL DEFAULT 0",
+            "finding_occurrences": "INTEGER NOT NULL DEFAULT 0",
+            "new_findings": "INTEGER NOT NULL DEFAULT 0",
+            "updated_findings": "INTEGER NOT NULL DEFAULT 0",
+            "blocked_reason": "TEXT",
+            "error_class": "TEXT",
+            "safe_error_message": "TEXT",
+            "parent_run_id": "TEXT",
+        }
+        for column, column_type in run_additions.items():
+            if column not in run_columns:
+                conn.execute(f"ALTER TABLE detection_runs ADD COLUMN {column} {column_type}")
+        conn.execute("UPDATE detection_runs SET policy_mode = COALESCE(policy_mode, mode)")
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_running_detection_namespace
+            ON detection_runs(dataset_kind, profile_key, policy_hash, model_id)
+            WHERE status = 'running'
+            """
+        )
+        eval_columns = self._columns(conn, "detection_evaluations")
+        eval_additions = {
+            "suppression_id": "TEXT",
+            "suppression_reason": "TEXT",
+            "suppression_expires_at": "TEXT",
+        }
+        for column, column_type in eval_additions.items():
+            if column not in eval_columns:
+                conn.execute(
+                    f"ALTER TABLE detection_evaluations ADD COLUMN {column} {column_type}"
+                )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_detection_eval_identity
+            ON detection_evaluations(window_id, feature_input_hash, policy_hash, model_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_occurrence_evaluation
+            ON finding_occurrences(evaluation_id)
+            """
+        )
+        finding_columns = self._columns(conn, "findings")
+        if "related_previous_finding_id" not in finding_columns:
+            conn.execute("ALTER TABLE findings ADD COLUMN related_previous_finding_id TEXT")
+        worker_columns = self._columns(conn, "detection_worker_leases")
+        worker_additions = {
+            "worker_key": "TEXT",
+            "dataset_kind": "TEXT",
+            "profile_key": "TEXT",
+            "policy_hash": "TEXT",
+            "acquired_at": "TEXT",
+            "expires_at": "TEXT",
+        }
+        for column, column_type in worker_additions.items():
+            if column not in worker_columns:
+                conn.execute(
+                    f"ALTER TABLE detection_worker_leases ADD COLUMN {column} {column_type}"
+                )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_key
+            ON detection_worker_leases(worker_key)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS detection_policy_activations (
+                activation_id TEXT PRIMARY KEY,
+                previous_policy_hash TEXT,
+                new_policy_hash TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_policy_activations_created
+            ON detection_policy_activations(created_at)
+            """
+        )
+        self._record_migration(conn, 10)
 
     def insert_events(self, events: list[TelemetryEvent]) -> int:
         inserted, _ = self.insert_events_detailed(events)
@@ -1201,8 +1600,9 @@ class SQLiteStorage:
                     feature_schema_version, window_size_minutes, features_json,
                     event_count, event_counts_json, collector_coverage_json,
                     quality_status, quality_reasons_json, gap_duration_seconds,
-                    finalized, source_event_hash, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    finalized, source_event_hash, profile_key, feature_input_hash,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(window_id) DO UPDATE SET
                     features_json = excluded.features_json,
                     event_count = excluded.event_count,
@@ -1213,6 +1613,8 @@ class SQLiteStorage:
                     gap_duration_seconds = excluded.gap_duration_seconds,
                     finalized = excluded.finalized,
                     source_event_hash = excluded.source_event_hash,
+                    profile_key = excluded.profile_key,
+                    feature_input_hash = excluded.feature_input_hash,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -1233,6 +1635,8 @@ class SQLiteStorage:
                     window["gap_duration_seconds"],
                     int(window["finalized"]),
                     window["source_event_hash"],
+                    self._feature_profile_key(window),
+                    self._feature_input_hash(window),
                     created_at,
                     now,
                 ),
@@ -1315,6 +1719,11 @@ class SQLiteStorage:
         *,
         dataset_kind: str | None = None,
         quality_status: set[str] | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        after_window_start: str | None = None,
+        after_window_id: str | None = None,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         clauses: list[str] = []
         params: list[object] = []
@@ -1325,10 +1734,111 @@ class SQLiteStorage:
             placeholders = ", ".join("?" for _ in quality_status)
             clauses.append(f"quality_status IN ({placeholders})")
             params.extend(sorted(quality_status))
+        if start is not None:
+            clauses.append("window_start >= ?")
+            params.append(start.isoformat())
+        if end is not None:
+            clauses.append("window_start < ?")
+            params.append(end.isoformat())
+        if after_window_start is not None:
+            if after_window_id is None:
+                clauses.append("window_start > ?")
+                params.append(after_window_start)
+            else:
+                clauses.append("(window_start > ? OR (window_start = ? AND window_id > ?))")
+                params.extend([after_window_start, after_window_start, after_window_id])
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        limit_sql = ""
+        if limit is not None:
+            limit_sql = " LIMIT ?"
+            params.append(limit)
         with self.connect() as conn:
             rows = conn.execute(
-                f"SELECT * FROM feature_windows {where} ORDER BY window_start ASC, window_id ASC",
+                f"SELECT * FROM feature_windows {where} "
+                f"ORDER BY window_start ASC, window_id ASC{limit_sql}",
+                params,
+            ).fetchall()
+        return [self._feature_window_row(row) for row in rows]
+
+    def list_detection_profiles(
+        self,
+        *,
+        dataset_kind: str,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> list[str]:
+        clauses = ["dataset_kind = ?"]
+        params: list[object] = [dataset_kind]
+        if start is not None:
+            clauses.append("window_start >= ?")
+            params.append(start.isoformat())
+        if end is not None:
+            clauses.append("window_start < ?")
+            params.append(end.isoformat())
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT DISTINCT profile_key
+                FROM feature_windows
+                WHERE {' AND '.join(clauses)}
+                ORDER BY profile_key ASC
+                """,
+                params,
+            ).fetchall()
+        return [str(row["profile_key"]) for row in rows if row["profile_key"]]
+
+    def list_pending_detection_windows(
+        self,
+        *,
+        dataset_kind: str,
+        profile_key: str,
+        policy_hash: str,
+        model_identity: str,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        window_ids: list[str] | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = [
+            "w.dataset_kind = ?",
+            "w.profile_key = ?",
+            """
+            NOT EXISTS (
+                SELECT 1
+                FROM detection_evaluations e
+                WHERE e.window_id = w.window_id
+                    AND e.feature_input_hash = w.feature_input_hash
+                    AND e.policy_hash = ?
+                    AND e.model_id = ?
+            )
+            """,
+        ]
+        params: list[object] = [dataset_kind, profile_key, policy_hash, model_identity]
+        if start is not None:
+            clauses.append("w.window_start >= ?")
+            params.append(start.isoformat())
+        if end is not None:
+            clauses.append("w.window_start < ?")
+            params.append(end.isoformat())
+        if window_ids is not None:
+            if not window_ids:
+                return []
+            placeholders = ", ".join("?" for _ in window_ids)
+            clauses.append(f"w.window_id IN ({placeholders})")
+            params.extend(window_ids)
+        limit_sql = ""
+        if limit is not None:
+            limit_sql = " LIMIT ?"
+            params.append(limit)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT w.*
+                FROM feature_windows w
+                WHERE {' AND '.join(clauses)}
+                ORDER BY w.window_start ASC, w.window_id ASC
+                {limit_sql}
+                """,
                 params,
             ).fetchall()
         return [self._feature_window_row(row) for row in rows]
@@ -2164,6 +2674,251 @@ class SQLiteStorage:
         payload["windows"] = [self._scored_window_row(row) for row in rows]
         return payload
 
+    def persist_detection_evaluation_atomic(
+        self,
+        *,
+        evaluation: dict[str, Any],
+        decision_json: str,
+        matched_signal_ids_json: str,
+        signals_json: str,
+        finding: dict[str, Any] | None,
+        occurrence: dict[str, Any] | None,
+        correlation_from: str | None,
+        correlation_to: str | None,
+    ) -> dict[str, Any]:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO detection_evaluations (
+                    evaluation_id, detection_run_id, window_id, dataset_kind, profile_key,
+                    window_start, window_end, feature_schema_version, feature_input_hash,
+                    policy_id, policy_version, policy_hash, model_id, model_version,
+                    model_hash, mode, status, detection_score, risk_level,
+                    matched_signal_ids_json, decision_json, finding_id, created_at,
+                    skipped_reason, suppression_id, suppression_reason, suppression_expires_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    NULL, ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    evaluation["evaluation_id"],
+                    evaluation["detection_run_id"],
+                    evaluation["window_id"],
+                    evaluation["dataset_kind"],
+                    evaluation["profile_key"],
+                    evaluation["window_start"],
+                    evaluation["window_end"],
+                    evaluation["feature_schema_version"],
+                    evaluation["feature_input_hash"],
+                    evaluation["policy_id"],
+                    evaluation["policy_version"],
+                    evaluation["policy_hash"],
+                    evaluation["model_id"],
+                    evaluation.get("model_version"),
+                    evaluation.get("model_hash"),
+                    evaluation["mode"],
+                    evaluation["status"],
+                    evaluation["detection_score"],
+                    evaluation["risk_level"],
+                    matched_signal_ids_json,
+                    decision_json,
+                    evaluation["created_at"],
+                    evaluation.get("skipped_reason"),
+                    evaluation.get("suppression_id"),
+                    evaluation.get("suppression_reason"),
+                    evaluation.get("suppression_expires_at"),
+                ),
+            )
+            if cursor.rowcount == 0:
+                return {
+                    "inserted": False,
+                    "finding_id": None,
+                    "new_finding": False,
+                    "updated_finding": False,
+                    "occurrence_inserted": False,
+                }
+            finding_id = None
+            new_finding = False
+            updated_finding = False
+            occurrence_inserted = False
+            related_previous = None
+            if finding is not None and occurrence is not None:
+                row = conn.execute(
+                    """
+                    SELECT * FROM findings
+                    WHERE fingerprint = ?
+                        AND status IN ('open', 'acknowledged', 'investigating', 'suppressed')
+                        AND first_seen_at <= ?
+                        AND last_seen_at >= ?
+                    ORDER BY last_seen_at DESC
+                    LIMIT 1
+                    """,
+                    (finding["fingerprint"], correlation_to, correlation_from),
+                ).fetchone()
+                if row is None:
+                    previous = conn.execute(
+                        """
+                        SELECT finding_id FROM findings
+                        WHERE fingerprint = ?
+                            AND status IN ('resolved', 'false_positive')
+                        ORDER BY last_seen_at DESC
+                        LIMIT 1
+                        """,
+                        (finding["fingerprint"],),
+                    ).fetchone()
+                    related_previous = previous["finding_id"] if previous is not None else None
+                    finding_id = finding["finding_id"]
+                    conn.execute(
+                        """
+                        INSERT INTO findings (
+                            finding_id, fingerprint, dataset_kind, profile_key, policy_id,
+                            policy_version, policy_hash, model_id, model_version, model_hash,
+                            status, risk_level, detection_score, primary_signal_id, title,
+                            summary, first_seen_at, last_seen_at, occurrence_count, created_at,
+                            updated_at, related_previous_finding_id
+                        ) VALUES (
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?,
+                            0, ?, ?, ?
+                        )
+                        """,
+                        (
+                            finding_id,
+                            finding["fingerprint"],
+                            finding["dataset_kind"],
+                            finding["profile_key"],
+                            finding["policy_id"],
+                            finding["policy_version"],
+                            finding["policy_hash"],
+                            finding.get("model_id"),
+                            finding.get("model_version"),
+                            finding.get("model_hash"),
+                            finding["risk_level"],
+                            finding["detection_score"],
+                            finding["primary_signal_id"],
+                            finding["title"],
+                            finding["summary"],
+                            finding["first_seen_at"],
+                            finding["last_seen_at"],
+                            finding["created_at"],
+                            finding["updated_at"],
+                            related_previous,
+                        ),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO finding_state_history (
+                            history_id, finding_id, from_status, to_status, reason, created_at
+                        ) VALUES (?, ?, NULL, 'open', ?, ?)
+                        """,
+                        (
+                            finding["history_id"],
+                            finding_id,
+                            "created by detection engine",
+                            finding["created_at"],
+                        ),
+                    )
+                    new_finding = True
+                else:
+                    finding_id = str(row["finding_id"])
+                    conn.execute(
+                        """
+                        UPDATE findings
+                        SET last_seen_at = CASE WHEN last_seen_at < ? THEN ? ELSE last_seen_at END,
+                            first_seen_at = CASE
+                                WHEN first_seen_at > ? THEN ? ELSE first_seen_at
+                            END,
+                            risk_level = CASE WHEN detection_score < ? THEN ? ELSE risk_level END,
+                            detection_score = MAX(detection_score, ?),
+                            updated_at = ?
+                        WHERE finding_id = ?
+                        """,
+                        (
+                            finding["last_seen_at"],
+                            finding["last_seen_at"],
+                            finding["first_seen_at"],
+                            finding["first_seen_at"],
+                            finding["detection_score"],
+                            finding["risk_level"],
+                            finding["detection_score"],
+                            finding["updated_at"],
+                            finding_id,
+                        ),
+                    )
+                    updated_finding = True
+                conn.execute(
+                    "UPDATE detection_evaluations SET finding_id = ? WHERE evaluation_id = ?",
+                    (finding_id, evaluation["evaluation_id"]),
+                )
+                occ_cursor = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO finding_occurrences (
+                        occurrence_id, finding_id, evaluation_id, window_id, window_start,
+                        window_end, detection_score, risk_level, signals_json, evidence_json,
+                        created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        occurrence["occurrence_id"],
+                        finding_id,
+                        evaluation["evaluation_id"],
+                        occurrence["window_id"],
+                        occurrence["window_start"],
+                        occurrence["window_end"],
+                        occurrence["detection_score"],
+                        occurrence["risk_level"],
+                        matched_signal_ids_json,
+                        signals_json,
+                        occurrence["created_at"],
+                    ),
+                )
+                occurrence_inserted = occ_cursor.rowcount == 1
+                if occurrence_inserted:
+                    conn.execute(
+                        """
+                        UPDATE findings
+                        SET occurrence_count = occurrence_count + 1
+                        WHERE finding_id = ?
+                        """,
+                        (finding_id,),
+                    )
+            conn.execute(
+                """
+                UPDATE detection_runs
+                SET examined_windows = examined_windows + 1,
+                    evaluated_windows = evaluated_windows + ?,
+                    skipped_windows = skipped_windows + ?,
+                    finding_occurrences = finding_occurrences + ?,
+                    new_findings = new_findings + ?,
+                    updated_findings = updated_findings + ?,
+                    window_count = window_count + 1,
+                    evaluated_count = evaluated_count + ?,
+                    skipped_count = skipped_count + ?,
+                    finding_count = finding_count + ?
+                WHERE detection_run_id = ?
+                """,
+                (
+                    1 if evaluation["status"] in {"finding", "no_finding", "suppressed"} else 0,
+                    1 if evaluation["status"] == "skipped" else 0,
+                    1 if occurrence_inserted else 0,
+                    1 if new_finding else 0,
+                    1 if updated_finding else 0,
+                    1 if evaluation["status"] in {"finding", "no_finding", "suppressed"} else 0,
+                    1 if evaluation["status"] == "skipped" else 0,
+                    1 if evaluation["status"] == "finding" else 0,
+                    evaluation["detection_run_id"],
+                ),
+            )
+            return {
+                "inserted": True,
+                "finding_id": finding_id,
+                "new_finding": new_finding,
+                "updated_finding": updated_finding,
+                "occurrence_inserted": occurrence_inserted,
+                "related_previous_finding_id": related_previous,
+            }
+
     def replace_anomalies(self, anomalies: list[AnomalyRecord]) -> None:
         with self.connect() as conn:
             conn.execute("DELETE FROM anomalies")
@@ -2327,6 +3082,10 @@ class SQLiteStorage:
             ).fetchone()[0]
             model_count = conn.execute("SELECT COUNT(*) FROM model_versions").fetchone()[0]
             scoring_run_count = conn.execute("SELECT COUNT(*) FROM scoring_runs").fetchone()[0]
+            detection_run_count = conn.execute(
+                "SELECT COUNT(*) FROM detection_runs"
+            ).fetchone()[0]
+            finding_count = conn.execute("SELECT COUNT(*) FROM findings").fetchone()[0]
             schema = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
         return {
             "database_path": str(self.database_path),
@@ -2339,6 +3098,8 @@ class SQLiteStorage:
             "dataset_snapshot_count": dataset_snapshot_count,
             "model_count": model_count,
             "scoring_run_count": scoring_run_count,
+            "detection_run_count": detection_run_count,
+            "finding_count": finding_count,
         }
 
     def upsert_collector_state(
@@ -2566,7 +3327,7 @@ class SQLiteStorage:
         }
 
     def _feature_window_row(self, row: sqlite3.Row) -> dict[str, Any]:
-        return {
+        payload = {
             "window_id": row["window_id"],
             "dataset_kind": row["dataset_kind"],
             "user_id": row["user_id"],
@@ -2587,6 +3348,44 @@ class SQLiteStorage:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
+        columns = set(row.keys())
+        payload["profile_key"] = (
+            row["profile_key"]
+            if "profile_key" in columns and row["profile_key"]
+            else self._feature_profile_key(payload)
+        )
+        payload["feature_input_hash"] = (
+            row["feature_input_hash"]
+            if "feature_input_hash" in columns and row["feature_input_hash"]
+            else self._feature_input_hash(payload)
+        )
+        return payload
+
+    def _feature_profile_key(self, window: dict[str, Any]) -> str:
+        payload = json.dumps(
+            {"user_id": str(window["user_id"]), "host_id": str(window["host_id"])},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+    def _feature_input_hash(self, window: dict[str, Any]) -> str:
+        features = window["features"]
+        payload = {
+            "window_id": window["window_id"],
+            "dataset_kind": window["dataset_kind"],
+            "profile_key": self._feature_profile_key(window),
+            "window_start": window["window_start"],
+            "window_end": window["window_end"],
+            "feature_schema_version": window["feature_schema_version"],
+            "feature_names": FEATURE_NAMES,
+            "feature_values": [float(features[name]) for name in FEATURE_NAMES],
+            "quality": window["quality_status"],
+            "source_event_hash": window["source_event_hash"],
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
 
     def _model_version_row(self, row: sqlite3.Row) -> dict[str, Any]:
         return {

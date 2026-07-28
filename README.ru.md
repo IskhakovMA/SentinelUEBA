@@ -1,6 +1,6 @@
 # SentinelUEBA
 
-SentinelUEBA — local-first Windows-focused UEBA портфолио-проект. Stage 3 сохраняет synthetic demo, opt-in Windows telemetry, validation-first ingestion, SQLite feature store, data quality, retention и immutable Parquet snapshots из предыдущих стадий, затем добавляет воспроизводимый локальный ML pipeline с model registry, evaluation, promotion, rollback, offline scoring, FastAPI, CLI и React ML Lab.
+SentinelUEBA — local-first Windows-focused UEBA портфолио-проект. Stage 4 сохраняет synthetic demo, opt-in Windows telemetry, validation-first ingestion, SQLite feature store, immutable snapshots и Stage 3 ML registry, затем добавляет privacy-safe detection engine с immutable policies, встроенными rules по feature windows, verified champion model signals, deterministic fusion, findings, suppressions, CLI/API controls, local worker lease и React Detection Center.
 
 [English version](README.md)
 
@@ -8,7 +8,7 @@ SentinelUEBA — local-first Windows-focused UEBA портфолио-проек�
 
 - Безопасная synthetic demo telemetry за 24-hour-equivalent период.
 - Opt-in Windows collectors для процессов, сети, системных метрик и optional Security Event Log authentication metadata.
-- SQLite с последовательными миграциями, индексами, защитой от дублей, collection sessions, collector observations, dataset snapshots и model registry v8.
+- SQLite с последовательными миграциями, индексами, защитой от дублей, collection sessions, collector observations, dataset snapshots, model registry v8 и detection schema v10.
 - Payload validation, quarantine и ingestion metadata до canonical normalization.
 - Persistent 15-минутные UTC feature windows для пары user + host.
 - Immutable Parquet dataset snapshots с manifest и SHA-256 verification.
@@ -20,10 +20,12 @@ SentinelUEBA — local-first Windows-focused UEBA портфолио-проек�
 - Offline snapshot scoring, scored-window audit rows, compatibility checks и drift reports.
 - Объяснения на основе per-feature reconstruction residual и context deviation.
 - Post-inference validation для всех пяти canonical synthetic demo-сценариев.
+- Stage 4 hybrid detection policy `hybrid-policy-v1` поверх feature windows и verified champion models.
+- Immutable findings, occurrences, lifecycle history, exact TTL suppressions, idempotent SQL anti-join evaluations, exact profile/model isolation и worker watermarks.
 - Уровни риска: low, medium, high, critical.
 - FastAPI endpoints и двуязычная EN/RU панель на React.
 
-Аномалия означает статистическое отклонение от профиля. Это не доказательство атаки.
+Аномалия или finding является triage-сигналом. Это не доказательство атаки.
 
 ## Быстрый запуск
 
@@ -35,6 +37,8 @@ uv run sentinelueba datasets create --kind synthetic
 uv run sentinelueba train --seed 42
 uv run sentinelueba detect
 uv run sentinelueba ml status
+uv run sentinelueba detection run-once --dataset synthetic
+uv run sentinelueba detection findings list
 uv run sentinelueba run-api
 pnpm --dir frontend install
 pnpm --dir frontend dev
@@ -91,9 +95,28 @@ Public model operations требуют finalized training runs и verified regis
 
 Подробнее: [ML pipeline](docs/ML_PIPELINE.md), [model registry](docs/MODEL_REGISTRY.md), [model evaluation](docs/MODEL_EVALUATION.md), [model cards](docs/MODEL_CARDS.md).
 
-## Ограничения Stage 3
+## Detection Engine
 
-Не реализованы Windows Service, Linux collectors, ETW, kernel driver, cloud backend, SIEM, alerts, packet capture, keylogging, clipboard, browser history, traffic payload inspection, live blocking, automated response, online learning, supervised security labels и production alerting.
+```bash
+uv run sentinelueba detection status
+uv run sentinelueba detection policies list
+uv run sentinelueba detection rules list
+uv run sentinelueba detection run-once --dataset synthetic
+uv run sentinelueba detection run-once --dataset synthetic --dry-run
+uv run sentinelueba detection backfill --dataset synthetic --policy-id <policy-id> --start <iso> --end <iso> --confirm
+uv run sentinelueba detection backfill --policy-id <policy-id> --dataset-id <registered-dataset-id> --confirm
+uv run sentinelueba detection findings list
+uv run sentinelueba detection worker run-foreground --dataset synthetic --max-windows 256
+uv run sentinelueba detection worker run-foreground --dataset synthetic --max-windows 256 --single-cycle
+```
+
+Stage 4 DetectionInput содержит только window id, dataset kind, pseudonymous profile key, границы окна, feature schema version, ordered feature values, quality и feature input hash. Raw payloads, raw users, hosts, executable paths, remote addresses и synthetic scenario labels не попадают в rule engine. Запуск без profile создаёт exact per-profile child runs; verified model signals считаются только для dataset/profile namespace модели. Dry-run выполняет тот же decision path без записи detection rows, findings, watermarks, suppressions или worker leases. Registered-snapshot backfill сначала проверяет snapshot и доказывает совпадение current feature-window identity со snapshot rows, затем обрабатывает ровно эти window ids.
+
+Подробнее: [detection engine](docs/DETECTION_ENGINE.md), [rules](docs/DETECTION_RULES.md), [policies](docs/DETECTION_POLICIES.md), [finding lifecycle](docs/FINDING_LIFECYCLE.md), [continuous detection](docs/CONTINUOUS_DETECTION.md).
+
+## Ограничения Stage 4
+
+Не реализованы Windows Service, MSI, autostart, Linux collectors, ETW, kernel driver, cloud backend, SIEM, alerts, packet capture, keylogging, clipboard, browser history, traffic payload inspection, live blocking, automated response, arbitrary user Python/SQL/shell rules, online learning, retraining, autopromotion, supervised security labels и production alerting.
 
 ## Разработка
 

@@ -24,6 +24,7 @@ jobs:
         run: uv run pytest
       - name: Dataset and ML pipeline smoke
         run: |
+          rm -rf data artifacts
           uv run sentinelueba generate-demo
           uv run sentinelueba features materialize
           uv run sentinelueba datasets create --kind synthetic
@@ -120,6 +121,229 @@ jobs:
           drift = json.loads(os.environ["DRIFT_JSON"])
           assert drift["status"] == "ok", drift
           PY
+          DRY_RUN_JSON="$(uv run sentinelueba detection run-once --dataset synthetic --dry-run)"
+          DRY_RUN_JSON="$DRY_RUN_JSON" uv run python - <<'PY'
+          import json
+          import os
+          from sentinelueba.config import get_settings
+          from sentinelueba.storage.sqlite import SQLiteStorage
+
+          dry = json.loads(os.environ["DRY_RUN_JSON"])
+          assert dry["status"] == "dry_run", dry
+          assert dry["evaluated_count"] == 96, dry
+          storage = SQLiteStorage(get_settings().database_path)
+          with storage.connect() as conn:
+              assert conn.execute("SELECT COUNT(*) FROM detection_runs").fetchone()[0] == 0
+              assert conn.execute("SELECT COUNT(*) FROM detection_evaluations").fetchone()[0] == 0
+              assert conn.execute("SELECT COUNT(*) FROM findings").fetchone()[0] == 0
+          PY
+          DETECTION_JSON="$(uv run sentinelueba detection run-once --dataset synthetic)"
+          DETECTION_JSON="$DETECTION_JSON" uv run python - <<'PY'
+          import json
+          import os
+          detection = json.loads(os.environ["DETECTION_JSON"])
+          assert detection["evaluated_count"] == 96, detection
+          assert detection["finding_count"] >= 5, detection
+          PY
+          TRAIN_JSON="$TRAIN_JSON" uv run python - <<'PY'
+          import json
+          import os
+          from datetime import datetime
+
+          from sentinelueba.config import get_settings
+          from sentinelueba.services.pipeline import DemoPipeline
+          from sentinelueba.storage.sqlite import SQLiteStorage
+
+          settings = get_settings()
+          pipe = DemoPipeline(settings)
+          storage = SQLiteStorage(settings.database_path)
+          train = json.loads(os.environ["TRAIN_JSON"])
+          scenario_ids = set(train["split"]["scenario_window_ids"])
+          assert len(scenario_ids) == 5, scenario_ids
+          with storage.connect() as conn:
+              rows = conn.execute(
+                  """
+                  SELECT * FROM detection_evaluations
+                  WHERE window_id IN ({})
+                  ORDER BY created_at
+                  """.format(",".join("?" for _ in scenario_ids)),
+                  tuple(sorted(scenario_ids)),
+              ).fetchall()
+          by_window = {row["window_id"]: dict(row) for row in rows}
+          assert set(by_window) == scenario_ids, by_window
+          assert {row["status"] for row in by_window.values()} == {"finding"}, by_window
+          raw_forbidden = (
+              "demo-user",
+              "demo-host",
+              "payload",
+              "process_path",
+              "remote_address",
+              "scenario",
+          )
+          for row in by_window.values():
+              blob = json.dumps(
+                  {
+                      "decision": json.loads(row["decision_json"]),
+                      "signals": json.loads(row["matched_signal_ids_json"]),
+                  },
+                  sort_keys=True,
+              ).lower()
+              assert not any(item in blob for item in raw_forbidden), blob
+
+          finding_id = next(
+              row["finding_id"] for row in by_window.values() if row["finding_id"] is not None
+          )
+          pipe.detection_transition_finding(
+              finding_id,
+              to_status="acknowledged",
+              reason="ci-smoke acknowledge",
+          )
+          pipe.detection_transition_finding(
+              finding_id,
+              to_status="investigating",
+              reason="ci-smoke investigate",
+          )
+          resolved = pipe.detection_transition_finding(
+              finding_id,
+              to_status="resolved",
+              reason="ci-smoke resolve",
+              confirm=True,
+          )
+          assert resolved["status"] == "resolved", resolved
+          assert [item["to_status"] for item in resolved["history"]][-3:] == [
+              "acknowledged",
+              "investigating",
+              "resolved",
+          ]
+
+          suppression = pipe.detection_create_suppression(
+              scope="signal_for_dataset_kind",
+              dataset_kind="synthetic",
+              signal_id="rare-process-v1",
+              ttl_minutes=30,
+              reason="ci-smoke-active",
+          )
+          rare_window_id = next(
+              row["window_id"]
+              for row in by_window.values()
+              if "rare-process-v1" in row["matched_signal_ids_json"]
+          )
+          rare_window = next(
+              window
+              for window in storage.list_feature_windows(dataset_kind="synthetic")
+              if window["window_id"] == rare_window_id
+          )
+          old_hash = str(rare_window["feature_input_hash"])
+          revised = dict(rare_window)
+          revised["source_event_hash"] = f"{rare_window['source_event_hash']}-ci-revised"
+          storage.upsert_feature_windows([revised])
+          suppressed = pipe.detection_run_once(
+              dataset_kind="synthetic",
+              start=datetime.fromisoformat(str(revised["window_start"])),
+              end=datetime.fromisoformat(str(revised["window_end"])),
+              max_windows=8,
+          )
+          assert suppressed["evaluated_count"] == 1, suppressed
+          with storage.connect() as conn:
+              row = conn.execute(
+                  """
+                  SELECT * FROM detection_evaluations
+                  WHERE window_id = ? AND feature_input_hash <> ?
+                  ORDER BY created_at DESC
+                  LIMIT 1
+                  """,
+                  (rare_window_id, old_hash),
+              ).fetchone()
+          assert row is not None
+          assert row["status"] == "suppressed", dict(row)
+          assert row["suppression_id"] == suppression["suppression_id"], dict(row)
+          assert row["suppression_reason"] == "ci-smoke-active", dict(row)
+          assert row["suppression_expires_at"], dict(row)
+          assert "rare-process-v1" in row["matched_signal_ids_json"], dict(row)
+          decision = json.loads(row["decision_json"])
+          assert decision, dict(row)
+          pipe.detection_revoke_suppression(str(suppression["suppression_id"]), confirm=True)
+          repeat = pipe.detection_run_once(dataset_kind="synthetic")
+          assert repeat["examined_count"] == 0, repeat
+          assert repeat["evaluated_count"] == 0, repeat
+          assert repeat["finding_occurrences"] == 0, repeat
+          assert repeat["new_findings"] == 0, repeat
+          PY
+          NOOP_DETECTION_JSON="$(uv run sentinelueba detection run-once --dataset synthetic)"
+          NOOP_DETECTION_JSON="$NOOP_DETECTION_JSON" uv run python - <<'PY'
+          import json
+          import os
+          noop = json.loads(os.environ["NOOP_DETECTION_JSON"])
+          assert noop["evaluated_count"] == 0, noop
+          assert noop["examined_count"] == 0, noop
+          PY
+          BACKFILL_JSON="$(uv run sentinelueba detection backfill --policy-id hybrid-policy-v1 --dataset-id "$DATASET_ID" --confirm)"
+          BACKFILL_JSON="$BACKFILL_JSON" uv run python - <<'PY'
+          import json
+          import os
+          backfill = json.loads(os.environ["BACKFILL_JSON"])
+          assert backfill["status"] == "success", backfill
+          assert backfill["evaluated_count"] == 0, backfill
+          PY
+          SUPPRESSION_JSON="$(
+            uv run sentinelueba detection suppressions create \
+              --scope signal_for_dataset_kind \
+              --dataset synthetic \
+              --signal-id rare-process-v1 \
+              --ttl-minutes 30 \
+              --reason ci-smoke
+          )"
+          SUPPRESSION_ID="$(
+            SUPPRESSION_JSON="$SUPPRESSION_JSON" uv run python -c 'import json, os; print(json.loads(os.environ["SUPPRESSION_JSON"])["suppression_id"])'
+          )"
+          uv run sentinelueba detection suppressions revoke "$SUPPRESSION_ID" --confirm
+          uv run sentinelueba detection worker run-foreground --dataset synthetic --max-windows 16 --single-cycle
+          WORKER_STATUS_JSON="$(uv run sentinelueba detection worker status --dataset synthetic)"
+          WORKER_STATUS_JSON="$WORKER_STATUS_JSON" uv run python - <<'PY'
+          import json
+          import os
+          status = json.loads(os.environ["WORKER_STATUS_JSON"])
+          assert status["worker_key"] == "stage4|synthetic|*", status
+          assert status["status"] in {"stopped", "failed"}, status
+          PY
+          uv run python - <<'PY'
+          from sentinelueba.config import get_settings
+          from sentinelueba.detection.worker_manager import get_detection_worker_manager
+
+          manager = get_detection_worker_manager()
+          settings = get_settings()
+          started = manager.start(
+              database_path=settings.database_path,
+              data_dir=settings.data_dir,
+              model_dir=settings.model_dir,
+              dataset_kind="synthetic",
+              interval_seconds=5,
+              max_windows=1,
+          )
+          assert started["worker_key"] == "stage4|synthetic|*", started
+          assert started["status"] in {"running", "idle"}, started
+          status = manager.status(
+              database_path=settings.database_path,
+              data_dir=settings.data_dir,
+              model_dir=settings.model_dir,
+              dataset_kind="synthetic",
+          )
+          assert status["worker_key"] == "stage4|synthetic|*", status
+          stopped = manager.stop(
+              database_path=settings.database_path,
+              data_dir=settings.data_dir,
+              model_dir=settings.model_dir,
+              dataset_kind="synthetic",
+              confirm=True,
+              timeout_seconds=20,
+          )
+          assert stopped["status"] in {"stopped", "failed"}, stopped
+          manager.shutdown_process(
+              database_path=settings.database_path,
+              data_dir=settings.data_dir,
+              model_dir=settings.model_dir,
+          )
+          PY
           NOOP_JSON="$(uv run sentinelueba features materialize)"
           NOOP_JSON="$NOOP_JSON" uv run python - <<'PY'
           import json
@@ -167,6 +391,7 @@ jobs:
       - name: Dataset and ML pipeline smoke
         shell: pwsh
         run: |
+          Remove-Item -Recurse -Force data, artifacts -ErrorAction SilentlyContinue
           uv run sentinelueba generate-demo
           uv run sentinelueba features materialize
           uv run sentinelueba datasets create --kind synthetic
@@ -204,6 +429,191 @@ jobs:
           $score = uv run sentinelueba ml score --dataset $dataset.Name --model $modelId | ConvertFrom-Json
           if ($score.window_count -ne 96) { throw "unexpected scoring count" }
           uv run sentinelueba ml drift --dataset $dataset.Name --model $modelId
+          $dryRun = uv run sentinelueba detection run-once --dataset synthetic --dry-run | ConvertFrom-Json
+          if ($dryRun.status -ne "dry_run" -or $dryRun.evaluated_count -ne 96) { throw "unexpected dry-run result" }
+          @'
+          from sentinelueba.config import get_settings
+          from sentinelueba.storage.sqlite import SQLiteStorage
+
+          storage = SQLiteStorage(get_settings().database_path)
+          with storage.connect() as conn:
+              assert conn.execute("SELECT COUNT(*) FROM detection_runs").fetchone()[0] == 0
+              assert conn.execute("SELECT COUNT(*) FROM detection_evaluations").fetchone()[0] == 0
+              assert conn.execute("SELECT COUNT(*) FROM findings").fetchone()[0] == 0
+          '@ | uv run python -
+          $detection = uv run sentinelueba detection run-once --dataset synthetic | ConvertFrom-Json
+          if ($detection.evaluated_count -ne 96 -or $detection.finding_count -lt 5) { throw "unexpected detection result" }
+          $env:TRAIN_JSON = $train | ConvertTo-Json -Depth 20 -Compress
+          @'
+          import json
+          import os
+          from datetime import datetime
+
+          from sentinelueba.config import get_settings
+          from sentinelueba.services.pipeline import DemoPipeline
+          from sentinelueba.storage.sqlite import SQLiteStorage
+
+          settings = get_settings()
+          pipe = DemoPipeline(settings)
+          storage = SQLiteStorage(settings.database_path)
+          train = json.loads(os.environ["TRAIN_JSON"])
+          scenario_ids = set(train["split"]["scenario_window_ids"])
+          assert len(scenario_ids) == 5, scenario_ids
+          with storage.connect() as conn:
+              rows = conn.execute(
+                  """
+                  SELECT * FROM detection_evaluations
+                  WHERE window_id IN ({})
+                  ORDER BY created_at
+                  """.format(",".join("?" for _ in scenario_ids)),
+                  tuple(sorted(scenario_ids)),
+              ).fetchall()
+          by_window = {row["window_id"]: dict(row) for row in rows}
+          assert set(by_window) == scenario_ids, by_window
+          assert {row["status"] for row in by_window.values()} == {"finding"}, by_window
+          raw_forbidden = (
+              "demo-user",
+              "demo-host",
+              "payload",
+              "process_path",
+              "remote_address",
+              "scenario",
+          )
+          for row in by_window.values():
+              blob = json.dumps(
+                  {
+                      "decision": json.loads(row["decision_json"]),
+                      "signals": json.loads(row["matched_signal_ids_json"]),
+                  },
+                  sort_keys=True,
+              ).lower()
+              assert not any(item in blob for item in raw_forbidden), blob
+
+          finding_id = next(
+              row["finding_id"] for row in by_window.values() if row["finding_id"] is not None
+          )
+          pipe.detection_transition_finding(
+              finding_id,
+              to_status="acknowledged",
+              reason="ci-smoke acknowledge",
+          )
+          pipe.detection_transition_finding(
+              finding_id,
+              to_status="investigating",
+              reason="ci-smoke investigate",
+          )
+          resolved = pipe.detection_transition_finding(
+              finding_id,
+              to_status="resolved",
+              reason="ci-smoke resolve",
+              confirm=True,
+          )
+          assert resolved["status"] == "resolved", resolved
+          assert [item["to_status"] for item in resolved["history"]][-3:] == [
+              "acknowledged",
+              "investigating",
+              "resolved",
+          ]
+
+          suppression = pipe.detection_create_suppression(
+              scope="signal_for_dataset_kind",
+              dataset_kind="synthetic",
+              signal_id="rare-process-v1",
+              ttl_minutes=30,
+              reason="ci-smoke-active",
+          )
+          rare_window_id = next(
+              row["window_id"]
+              for row in by_window.values()
+              if "rare-process-v1" in row["matched_signal_ids_json"]
+          )
+          rare_window = next(
+              window
+              for window in storage.list_feature_windows(dataset_kind="synthetic")
+              if window["window_id"] == rare_window_id
+          )
+          old_hash = str(rare_window["feature_input_hash"])
+          revised = dict(rare_window)
+          revised["source_event_hash"] = f"{rare_window['source_event_hash']}-ci-revised"
+          storage.upsert_feature_windows([revised])
+          suppressed = pipe.detection_run_once(
+              dataset_kind="synthetic",
+              start=datetime.fromisoformat(str(revised["window_start"])),
+              end=datetime.fromisoformat(str(revised["window_end"])),
+              max_windows=8,
+          )
+          assert suppressed["evaluated_count"] == 1, suppressed
+          with storage.connect() as conn:
+              row = conn.execute(
+                  """
+                  SELECT * FROM detection_evaluations
+                  WHERE window_id = ? AND feature_input_hash <> ?
+                  ORDER BY created_at DESC
+                  LIMIT 1
+                  """,
+                  (rare_window_id, old_hash),
+              ).fetchone()
+          assert row is not None
+          assert row["status"] == "suppressed", dict(row)
+          assert row["suppression_id"] == suppression["suppression_id"], dict(row)
+          assert row["suppression_reason"] == "ci-smoke-active", dict(row)
+          assert row["suppression_expires_at"], dict(row)
+          assert "rare-process-v1" in row["matched_signal_ids_json"], dict(row)
+          decision = json.loads(row["decision_json"])
+          assert decision, dict(row)
+          pipe.detection_revoke_suppression(str(suppression["suppression_id"]), confirm=True)
+          repeat = pipe.detection_run_once(dataset_kind="synthetic")
+          assert repeat["examined_count"] == 0, repeat
+          assert repeat["evaluated_count"] == 0, repeat
+          assert repeat["finding_occurrences"] == 0, repeat
+          assert repeat["new_findings"] == 0, repeat
+          '@ | uv run python -
+          $noopDetection = uv run sentinelueba detection run-once --dataset synthetic | ConvertFrom-Json
+          if ($noopDetection.evaluated_count -ne 0 -or $noopDetection.examined_count -ne 0) { throw "unexpected detection no-op" }
+          $backfill = uv run sentinelueba detection backfill --policy-id hybrid-policy-v1 --dataset-id $dataset.Name --confirm | ConvertFrom-Json
+          if ($backfill.status -ne "success" -or $backfill.evaluated_count -ne 0) { throw "unexpected snapshot backfill" }
+          $suppression = uv run sentinelueba detection suppressions create --scope signal_for_dataset_kind --dataset synthetic --signal-id rare-process-v1 --ttl-minutes 30 --reason ci-smoke | ConvertFrom-Json
+          uv run sentinelueba detection suppressions revoke $suppression.suppression_id --confirm
+          uv run sentinelueba detection worker run-foreground --dataset synthetic --max-windows 16 --single-cycle
+          $workerStatus = uv run sentinelueba detection worker status --dataset synthetic | ConvertFrom-Json
+          if ($workerStatus.worker_key -ne "stage4|synthetic|*") { throw "unexpected worker status" }
+          @'
+          from sentinelueba.config import get_settings
+          from sentinelueba.detection.worker_manager import get_detection_worker_manager
+
+          manager = get_detection_worker_manager()
+          settings = get_settings()
+          started = manager.start(
+              database_path=settings.database_path,
+              data_dir=settings.data_dir,
+              model_dir=settings.model_dir,
+              dataset_kind="synthetic",
+              interval_seconds=5,
+              max_windows=1,
+          )
+          assert started["worker_key"] == "stage4|synthetic|*", started
+          status = manager.status(
+              database_path=settings.database_path,
+              data_dir=settings.data_dir,
+              model_dir=settings.model_dir,
+              dataset_kind="synthetic",
+          )
+          assert status["worker_key"] == "stage4|synthetic|*", status
+          stopped = manager.stop(
+              database_path=settings.database_path,
+              data_dir=settings.data_dir,
+              model_dir=settings.model_dir,
+              dataset_kind="synthetic",
+              confirm=True,
+              timeout_seconds=20,
+          )
+          assert stopped["status"] in {"stopped", "failed"}, stopped
+          manager.shutdown_process(
+              database_path=settings.database_path,
+              data_dir=settings.data_dir,
+              model_dir=settings.model_dir,
+          )
+          '@ | uv run python -
           $noop = uv run sentinelueba features materialize | ConvertFrom-Json
           if ($noop.processed_events -ne 0 -or $noop.processed_observations -ne 0 -or $noop.upserted_windows -ne 0 -or $noop.deleted_windows -ne 0) { throw "unexpected no-op materialization" }
       - name: PowerShell syntax

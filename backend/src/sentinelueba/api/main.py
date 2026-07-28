@@ -12,7 +12,15 @@ from sentinelueba.api.schemas import (
     AnomalyListResponse,
     ApiResponse,
     CollectionStartRequest,
+    ConfirmRequest,
     DatasetKindRequest,
+    DetectionBackfillRequest,
+    DetectionPolicyActivateRequest,
+    DetectionRunRequest,
+    DetectionWorkerRunRequest,
+    DetectionWorkerStartRequest,
+    DetectionWorkerStopRequest,
+    FindingTransitionRequest,
     MLCompareRequest,
     MLConfirmRequest,
     MLDriftRequest,
@@ -21,10 +29,23 @@ from sentinelueba.api.schemas import (
     MLTrainRequest,
     RetentionApplyRequest,
     SeedRequest,
+    SuppressionCreateRequest,
     TrainingEligibilityRequest,
 )
 from sentinelueba.config import get_settings
+from sentinelueba.detection.worker_manager import (
+    DetectionWorkerAlreadyRunningError,
+    get_detection_worker_manager,
+)
 from sentinelueba.services.pipeline import DemoPipeline
+
+
+def parse_api_datetime(value: str | None) -> Any:
+    if value is None:
+        return None
+    from datetime import datetime
+
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 app = FastAPI(title="SentinelUEBA API", version="0.1.0")
 app.add_middleware(
@@ -37,6 +58,16 @@ app.add_middleware(
 
 def pipeline() -> DemoPipeline:
     return DemoPipeline(get_settings())
+
+
+@app.on_event("shutdown")
+def shutdown_workers() -> None:
+    settings = get_settings()
+    get_detection_worker_manager().shutdown_process(
+        database_path=settings.database_path,
+        data_dir=settings.data_dir,
+        model_dir=settings.model_dir,
+    )
 
 
 async def run_blocking(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -256,6 +287,277 @@ async def ml_drift(request: MLDriftRequest) -> ApiResponse:
                 pipeline().ml_drift,
                 model_id=request.model_id,
                 dataset_id=request.dataset_id,
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/detection/status", response_model=ApiResponse)
+async def detection_status() -> ApiResponse:
+    return ApiResponse(data=pipeline().detection_status())
+
+
+@app.get("/detection/policies", response_model=ApiResponse)
+async def detection_policies() -> ApiResponse:
+    return ApiResponse(data={"policies": pipeline().detection_policies()})
+
+
+@app.get("/detection/policies/{policy_id}", response_model=ApiResponse)
+async def detection_policy(policy_id: str, policy_version: str | None = None) -> ApiResponse:
+    try:
+        return ApiResponse(data=pipeline().detection_policy(policy_id, policy_version))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/detection/policies/{policy_id}/activate", response_model=ApiResponse)
+async def detection_policy_activate(
+    policy_id: str,
+    request: DetectionPolicyActivateRequest,
+) -> ApiResponse:
+    try:
+        return ApiResponse(
+            data=await run_blocking(
+                pipeline().detection_activate_policy,
+                policy_id,
+                request.policy_version,
+                confirm=request.confirm,
+                reason=request.reason,
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/detection/rules", response_model=ApiResponse)
+async def detection_rules() -> ApiResponse:
+    return ApiResponse(data={"rules": pipeline().detection_rules()})
+
+
+@app.post("/detection/run-once", response_model=ApiResponse)
+async def detection_run_once(request: DetectionRunRequest) -> ApiResponse:
+    try:
+        return ApiResponse(
+            data=await run_blocking(
+                pipeline().detection_run_once,
+                dataset_kind=request.dataset_kind,
+                profile=request.profile,
+                policy_id=request.policy_id,
+                policy_version=request.policy_version,
+                model_id=request.model_id,
+                start=parse_api_datetime(request.start),
+                end=parse_api_datetime(request.end),
+                batch_size=request.batch_size,
+                max_windows=request.max_windows,
+                rules_only=request.rules_only,
+                dry_run=request.dry_run,
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/detection/backfill", response_model=ApiResponse)
+async def detection_backfill(request: DetectionBackfillRequest) -> ApiResponse:
+    try:
+        return ApiResponse(
+            data=await run_blocking(
+                pipeline().detection_backfill,
+                dataset_kind=request.dataset_kind,
+                policy_id=request.policy_id,
+                policy_version=request.policy_version,
+                model_id=request.model_id,
+                start=parse_api_datetime(request.start),
+                end=parse_api_datetime(request.end),
+                registered_dataset_id=request.dataset_id,
+                confirm=request.confirm,
+                advance_watermark=request.advance_watermark,
+                confirm_advance_watermark=request.confirm_advance_watermark,
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/detection/runs", response_model=ApiResponse)
+async def detection_runs() -> ApiResponse:
+    return ApiResponse(data={"detection_runs": pipeline().detection_runs()})
+
+
+@app.get("/detection/runs/{detection_run_id}", response_model=ApiResponse)
+async def detection_run(detection_run_id: str) -> ApiResponse:
+    run = pipeline().detection_run(detection_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="detection run not found")
+    return ApiResponse(data=run)
+
+
+@app.get("/detection/findings", response_model=ApiResponse)
+async def detection_findings(
+    status: str | None = None,
+    dataset_kind: str | None = None,
+) -> ApiResponse:
+    return ApiResponse(
+        data={"findings": pipeline().detection_findings(status=status, dataset_kind=dataset_kind)}
+    )
+
+
+@app.get("/detection/findings/{finding_id}", response_model=ApiResponse)
+async def detection_finding(finding_id: str) -> ApiResponse:
+    finding = pipeline().detection_finding(finding_id)
+    if finding is None:
+        raise HTTPException(status_code=404, detail="finding not found")
+    return ApiResponse(data=finding)
+
+
+async def transition_finding_api(
+    finding_id: str,
+    to_status: str,
+    request: FindingTransitionRequest,
+) -> ApiResponse:
+    try:
+        return ApiResponse(
+            data=await run_blocking(
+                pipeline().detection_transition_finding,
+                finding_id,
+                to_status=to_status,
+                reason=request.reason,
+                confirm=request.confirm,
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/detection/findings/{finding_id}/acknowledge", response_model=ApiResponse)
+async def detection_finding_acknowledge(
+    finding_id: str,
+    request: FindingTransitionRequest,
+) -> ApiResponse:
+    return await transition_finding_api(finding_id, "acknowledged", request)
+
+
+@app.post("/detection/findings/{finding_id}/investigate", response_model=ApiResponse)
+async def detection_finding_investigate(
+    finding_id: str,
+    request: FindingTransitionRequest,
+) -> ApiResponse:
+    return await transition_finding_api(finding_id, "investigating", request)
+
+
+@app.post("/detection/findings/{finding_id}/resolve", response_model=ApiResponse)
+async def detection_finding_resolve(
+    finding_id: str,
+    request: FindingTransitionRequest,
+) -> ApiResponse:
+    return await transition_finding_api(finding_id, "resolved", request)
+
+
+@app.post("/detection/findings/{finding_id}/false-positive", response_model=ApiResponse)
+async def detection_finding_false_positive(
+    finding_id: str,
+    request: FindingTransitionRequest,
+) -> ApiResponse:
+    return await transition_finding_api(finding_id, "false_positive", request)
+
+
+@app.get("/detection/suppressions", response_model=ApiResponse)
+async def detection_suppressions() -> ApiResponse:
+    return ApiResponse(data={"suppressions": pipeline().detection_suppressions()})
+
+
+@app.post("/detection/suppressions", response_model=ApiResponse)
+async def detection_suppression_create(request: SuppressionCreateRequest) -> ApiResponse:
+    try:
+        return ApiResponse(
+            data=await run_blocking(
+                pipeline().detection_create_suppression,
+                scope=request.scope,
+                reason=request.reason,
+                ttl_minutes=request.ttl_minutes,
+                dataset_kind=request.dataset_kind,
+                profile_key=request.profile_key,
+                finding_fingerprint=request.finding_fingerprint,
+                signal_id=request.signal_id,
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/detection/suppressions/{suppression_id}/revoke", response_model=ApiResponse)
+async def detection_suppression_revoke(
+    suppression_id: str,
+    request: ConfirmRequest | None = None,
+) -> ApiResponse:
+    try:
+        return ApiResponse(
+            data=await run_blocking(
+                pipeline().detection_revoke_suppression,
+                suppression_id,
+                confirm=request.confirm if request is not None else False,
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/detection/worker/status", response_model=ApiResponse)
+async def detection_worker_status(dataset_kind: str = "synthetic") -> ApiResponse:
+    if dataset_kind not in {"synthetic", "real"}:
+        raise HTTPException(status_code=400, detail="dataset_kind must be synthetic or real")
+    return ApiResponse(data=pipeline().detection_worker_status(dataset_kind=dataset_kind))
+
+
+@app.post("/detection/worker/start", response_model=ApiResponse)
+async def detection_worker_start(request: DetectionWorkerStartRequest) -> ApiResponse:
+    try:
+        return ApiResponse(
+            data=await run_blocking(
+                pipeline().detection_worker_start,
+                dataset_kind=request.dataset_kind,
+                interval_seconds=request.interval_seconds,
+                max_windows=request.max_windows,
+            )
+        )
+    except DetectionWorkerAlreadyRunningError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = 409 if "active detection worker lease" in detail else 400
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+
+
+@app.post("/detection/worker/stop", response_model=ApiResponse)
+async def detection_worker_stop(request: DetectionWorkerStopRequest | None = None) -> ApiResponse:
+    request = request or DetectionWorkerStopRequest()
+    try:
+        return ApiResponse(
+            data=await run_blocking(
+                pipeline().detection_worker_stop,
+                dataset_kind=request.dataset_kind,
+                confirm=request.confirm,
+            )
+        )
+    except TimeoutError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = 400 if "confirm=true" in detail else 409
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+
+
+@app.post("/detection/worker/run-foreground", response_model=ApiResponse)
+async def detection_worker_run_foreground(request: DetectionWorkerRunRequest) -> ApiResponse:
+    try:
+        return ApiResponse(
+            data=await run_blocking(
+                pipeline().detection_worker_run_foreground,
+                dataset_kind=request.dataset_kind,
+                max_windows=request.max_windows,
+                interval_seconds=request.interval_seconds,
+                single_cycle=request.single_cycle,
             )
         )
     except ValueError as exc:

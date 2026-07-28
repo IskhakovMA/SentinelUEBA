@@ -1,6 +1,6 @@
 # SentinelUEBA
 
-SentinelUEBA is a local-first Windows-focused UEBA portfolio project. Stage 3 keeps the synthetic demo, opt-in Windows telemetry, validation-first ingestion, SQLite feature store, data quality, retention, and immutable Parquet snapshots from earlier stages, then adds a reproducible local ML pipeline with model registry, evaluation, promotion, rollback, offline scoring, FastAPI, CLI, and a React ML Lab.
+SentinelUEBA is a local-first Windows-focused UEBA portfolio project. Stage 4 keeps the synthetic demo, opt-in Windows telemetry, validation-first ingestion, SQLite feature store, immutable snapshots, and Stage 3 ML registry, then adds a privacy-safe detection engine with immutable policies, built-in feature-window rules, verified champion model signals, deterministic fusion, findings, suppressions, CLI/API controls, a local worker lease, and a React Detection Center.
 
 [Русская версия](README.ru.md)
 
@@ -8,7 +8,7 @@ SentinelUEBA is a local-first Windows-focused UEBA portfolio project. Stage 3 ke
 
 - Safe synthetic 24-hour-equivalent demo telemetry.
 - Opt-in Windows collectors for process, network, system metrics, and optional Security Event Log authentication metadata.
-- SQLite storage with sequential migrations, indexes, duplicate protection, collection sessions, collector observations, dataset snapshots, and model registry v8.
+- SQLite storage with sequential migrations, indexes, duplicate protection, collection sessions, collector observations, dataset snapshots, model registry v8, and detection schema v10.
 - Payload validation, quarantine, and ingestion metadata before canonical normalization.
 - Persistent 15-minute UTC feature windows for user + host behavior.
 - Immutable Parquet dataset snapshots with manifests and SHA-256 verification.
@@ -20,10 +20,12 @@ SentinelUEBA is a local-first Windows-focused UEBA portfolio project. Stage 3 ke
 - Offline snapshot scoring, scored-window audit rows, compatibility checks, and drift reports.
 - Per-feature reconstruction residual and context-deviation explanations.
 - Post-inference validation for all five canonical synthetic demo scenarios.
+- Stage 4 hybrid detection policy `hybrid-policy-v1` over feature windows and verified champion models.
+- Immutable findings, occurrences, lifecycle history, exact TTL suppressions, idempotent SQL anti-join evaluations, exact profile/model isolation, and worker watermarks.
 - Risk levels: low, medium, high, critical.
 - FastAPI endpoints and a bilingual EN/RU React dashboard.
 
-An anomaly is a statistical deviation from the learned profile. It is not proof of malicious activity.
+An anomaly or finding is a triage signal. It is not proof of malicious activity.
 
 ## Quick Start
 
@@ -35,6 +37,8 @@ uv run sentinelueba datasets create --kind synthetic
 uv run sentinelueba train --seed 42
 uv run sentinelueba detect
 uv run sentinelueba ml status
+uv run sentinelueba detection run-once --dataset synthetic
+uv run sentinelueba detection findings list
 uv run sentinelueba run-api
 pnpm --dir frontend install
 pnpm --dir frontend dev
@@ -91,6 +95,26 @@ Model public operations require finalized training runs and verified registered 
 
 See [ML pipeline](docs/ML_PIPELINE.md), [model registry](docs/MODEL_REGISTRY.md), [model evaluation](docs/MODEL_EVALUATION.md), and [model cards](docs/MODEL_CARDS.md).
 
+## Detection Engine
+
+```bash
+uv run sentinelueba detection status
+uv run sentinelueba detection policies list
+uv run sentinelueba detection rules list
+uv run sentinelueba detection run-once --dataset synthetic
+uv run sentinelueba detection run-once --dataset synthetic --dry-run
+uv run sentinelueba detection backfill --dataset synthetic --policy-id <policy-id> --start <iso> --end <iso> --confirm
+uv run sentinelueba detection backfill --policy-id <policy-id> --dataset-id <registered-dataset-id> --confirm
+uv run sentinelueba detection findings list
+uv run sentinelueba detection suppressions create --scope signal_for_profile --profile <profile-key> --signal-id <signal-id> --ttl-minutes 60 --reason "maintenance"
+uv run sentinelueba detection worker run-foreground --dataset synthetic --max-windows 256
+uv run sentinelueba detection worker run-foreground --dataset synthetic --max-windows 256 --single-cycle
+```
+
+Stage 4 detection inputs contain only window id, dataset kind, pseudonymous profile key, window bounds, feature schema version, ordered feature values, quality, and feature input hash. Raw payloads, raw users, hosts, executable paths, remote addresses, and synthetic scenario labels do not enter the rule engine. No-profile runs create exact per-profile child runs; verified model signals are scored only for the model's dataset/profile namespace. Dry-run executes the same decision path without writing detection rows, findings, watermarks, suppressions, or worker leases. Registered-snapshot backfill verifies the snapshot and proves current feature-window identity matches the snapshot rows before processing exactly those window ids.
+
+See [detection engine](docs/DETECTION_ENGINE.md), [rules](docs/DETECTION_RULES.md), [policies](docs/DETECTION_POLICIES.md), [finding lifecycle](docs/FINDING_LIFECYCLE.md), and [continuous detection](docs/CONTINUOUS_DETECTION.md).
+
 ## Architecture
 
 The repository is a full-stack monorepo with a modular monolith backend:
@@ -104,14 +128,14 @@ The repository is a full-stack monorepo with a modular monolith backend:
 - `backend/src/sentinelueba/datasets`: immutable Parquet snapshots.
 - `backend/src/sentinelueba/validation`: event payload validation and quarantine support.
 - `backend/src/sentinelueba/ml`: Stage 3 splitting, preprocessing, Autoencoder v2, Isolation Forest, calibration, registry-backed model bundles, evaluation, scoring, and drift.
-- `backend/src/sentinelueba/detection`: risk classification and legacy anomaly summaries.
+- `backend/src/sentinelueba/detection`: legacy anomaly summaries plus Stage 4 contracts, policies, rules, fusion, findings, suppressions, and process-managed worker lease logic.
 - `backend/src/sentinelueba/api`: FastAPI app.
 - `frontend`: React, TypeScript, Vite dashboard.
 - `docs`: architecture, privacy, threat model, and development notes.
 
-## Stage 3 Limits
+## Stage 4 Limits
 
-No Windows Service, Linux collectors, ETW, kernel driver, cloud backend, SIEM integration, alerts, packet capture, keylogging, clipboard, browser history, traffic payload inspection, live blocking, automated response, online learning, supervised security labels, or production alerting are implemented. Generated databases, snapshots, model bundles, identity secrets, logs, and reports are excluded from Git.
+No Windows Service, MSI, autostart, Linux collectors, ETW, kernel driver, cloud backend, SIEM integration, alerts, packet capture, keylogging, clipboard, browser history, traffic payload inspection, live blocking, automated response, arbitrary user Python/SQL/shell rules, online learning, retraining, autopromotion, supervised security labels, or production alerting are implemented. Generated databases, snapshots, model bundles, identity secrets, logs, and reports are excluded from Git.
 
 ## Development
 
@@ -129,4 +153,4 @@ Python dependencies are managed with `uv`; frontend dependencies use `pnpm`.
 
 ## Roadmap
 
-Stage 4 can focus on packaging and operational hardening. Live alerts, Windows Service packaging, SIEM export, and cloud backends remain out of scope for Stage 3.
+Stage 5 can focus on packaging and operational hardening. Live alerts, Windows Service packaging, SIEM export, and cloud backends remain out of scope for Stage 4.

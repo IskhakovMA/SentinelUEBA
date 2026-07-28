@@ -1,6 +1,6 @@
 # Architecture
 
-SentinelUEBA Stage 3 is a local modular monolith. The backend owns telemetry generation, opt-in Windows collectors, validation, canonical normalization, storage, feature materialization, dataset snapshots, model training, calibration, registry-backed promotion, offline scoring, drift reports, and collection accounting. The frontend calls FastAPI endpoints and renders pipeline, collector, anomaly, and ML Lab results.
+SentinelUEBA Stage 4 is a local modular monolith. The backend owns telemetry generation, opt-in Windows collectors, validation, canonical normalization, storage, feature materialization, dataset snapshots, model training, calibration, registry-backed promotion, offline scoring, drift reports, collection accounting, and the Stage 4 detection engine. The frontend calls FastAPI endpoints and renders pipeline, collector, anomaly, ML Lab, and Detection Center results.
 
 The primary identity boundary is `user_id + host_id`. Synthetic events use safe demo identifiers. Real Windows events use pseudonymous local identifiers by default; raw identity mode is explicit configuration only.
 
@@ -22,7 +22,15 @@ flowchart LR
   N --> O["Atomic training finalize + verified_at"]
   O --> P["Promotion / rollback lifecycle"]
   P --> R["Controlled offline scoring"]
+  P --> S["Verified champion model signal"]
+  F --> T["DetectionInput (safe feature-window contract)"]
+  T --> U["Built-in rule signals"]
+  S --> V["hybrid-fusion-v1"]
+  U --> V
+  V --> W["Detection evaluation"]
+  W --> X["Finding / occurrence / lifecycle / suppression audit"]
   R --> H["FastAPI / CLI / React ML Lab"]
+  X --> Y["FastAPI / CLI / React Detection Center"]
   I["Collector state, cursors, observations, heartbeats"] --> F
   I --> H
 ```
@@ -48,3 +56,32 @@ Bundle creation uses internal temp-bundle verification before atomic rename and 
 Offline scoring requires a verified registered model bundle and a verified registered dataset snapshot. The compatibility service checks dataset kind, profile key, feature schema, feature order, manifest hashes, artifact hashes, and threshold metadata before writing `scoring_runs` and `scored_windows`. A scoring run is inserted as `running` before model loading; success inserts rows atomically, and failure records a sanitized error without partial scored rows.
 
 The React ML Lab renders synthetic/real dataset controls, model family/config controls, training runs, model details, scoring-run details, drift details, candidate/recommended/champion lifecycle actions, verification state, and legacy Stage 2 artifact detection. Lifecycle actions require a browser confirmation before the API receives `confirm=true`. The UI shows pseudonymous profile labels and shortened hashes rather than raw users, hosts, local artifact paths, executable paths, network addresses, or payloads.
+
+## Stage 4 Detection Engine
+
+SQLite schema v10 stores Stage 4 tables: `detection_policies`, `detection_policy_activations`, `detection_runs`, `detection_evaluations`, `findings`, `finding_occurrences`, `finding_state_history`, `detection_suppressions`, `detection_watermarks`, and `detection_worker_leases`. Fresh databases and historical databases migrate sequentially to v10; a database that claims v10 but lacks required tables or columns fails schema integrity checks.
+
+Detection is validation- and feature-window-backed. `DetectionInput` contains only the window id, dataset kind, pseudonymous profile key, window bounds, feature schema version, ordered `FEATURE_NAMES`, numeric feature values, data quality, and feature input hash. It never includes raw telemetry payloads, raw user or host values, executable paths, remote addresses, authentication identities, or synthetic scenario labels.
+
+```mermaid
+flowchart LR
+  A["Collectors / synthetic generator"] --> B["raw TelemetryEvent"]
+  B --> C["original-key and payload validation"]
+  C -->|accepted| D["canonical normalization + SQLite telemetry_events"]
+  C -->|rejected| E["safe quarantined_events"]
+  D --> F["feature materialization"]
+  F --> G["verified registered Parquet snapshot"]
+  G --> H["training / snapshot-backed detection"]
+  F --> I["Stage 4 DetectionInput"]
+  I --> J["built-in rule signals"]
+  H --> K["verified champion model signal"]
+  J --> L["hybrid-fusion-v1"]
+  K --> L
+  L --> M["atomic evaluation, finding, occurrence, suppression audit"]
+```
+
+The built-in policy is `hybrid-policy-v1`, mode `hybrid`. Its rules are `rare-process-v1`, `new-remote-spike-v1`, `unusual-hour-activity-v1`, `resource-pressure-v1`, and `authentication-failure-burst-v1`. The fusion method is deterministic and explainable; corroboration increases the score, weak single signals do not become critical, and the output is a triage finding rather than proof of compromise.
+
+Model signals are loaded only through the public Stage 3 verifier and SQLite registry. A user cannot provide an artifact path. Direct persisted feature-window scoring is used only for Stage 4 detection, not for training, calibration, evaluation, promotion, or drift. Scoring is exact by dataset/profile/model namespace; no-profile requests fan out into per-profile child runs instead of mixing profiles in one run.
+
+The local worker is a controlled foreground/API worker lease, not an installed Windows Service or autostart mechanism. API start uses a process-level manager keyed by database path and worker key so start/stop/status share thread state across requests; public status returns an allowlist and never exposes owner ids, hostnames, thread ids, config JSON, or local paths. Watermarks are keyed by dataset kind, profile, policy hash, and model identity so policy or champion changes trigger fresh evaluations without silently rescoring history. Pending detection windows are selected by SQL anti-join; watermarks are only an audit/optimization aid and not a replacement for idempotency. Registered-snapshot backfill verifies the public snapshot and proves current feature windows still match the snapshot rows before processing exactly those window ids.

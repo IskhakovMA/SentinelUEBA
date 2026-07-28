@@ -96,6 +96,76 @@ class MLDriftRequest(BaseModel):
     dataset_id: str
 
 
+class DetectionRunRequest(BaseModel):
+    dataset_kind: str = Field(default="synthetic", pattern="^(synthetic|real)$")
+    profile: str | None = None
+    policy_id: str | None = None
+    policy_version: str | None = None
+    model_id: str | None = None
+    start: str | None = None
+    end: str | None = None
+    batch_size: int = Field(default=256, ge=1, le=4096)
+    max_windows: int | None = Field(default=None, ge=1)
+    rules_only: bool = False
+    dry_run: bool = False
+
+
+class DetectionBackfillRequest(BaseModel):
+    dataset_kind: str = Field(default="synthetic", pattern="^(synthetic|real)$")
+    policy_id: str | None = None
+    policy_version: str | None = None
+    model_id: str | None = None
+    start: str | None = None
+    end: str | None = None
+    dataset_id: str | None = None
+    confirm: bool = False
+    advance_watermark: bool = False
+    confirm_advance_watermark: bool = False
+
+
+class DetectionPolicyActivateRequest(BaseModel):
+    policy_version: str | None = None
+    confirm: bool = False
+    reason: str = "manual policy activation"
+
+
+class FindingTransitionRequest(BaseModel):
+    reason: str = "manual update"
+    confirm: bool = False
+
+
+class SuppressionCreateRequest(BaseModel):
+    scope: str = Field(pattern="^(finding_fingerprint|signal_for_profile|signal_for_dataset_kind)$")
+    reason: str = Field(min_length=1, max_length=500)
+    ttl_minutes: int = Field(ge=1, le=525_600)
+    dataset_kind: str | None = Field(default=None, pattern="^(synthetic|real)$")
+    profile_key: str | None = None
+    finding_fingerprint: str | None = None
+    signal_id: str | None = None
+
+
+class DetectionWorkerStartRequest(BaseModel):
+    dataset_kind: str = Field(default="synthetic", pattern="^(synthetic|real)$")
+    interval_seconds: int = Field(default=60, ge=5, le=3600)
+    max_windows: int | None = Field(default=256, ge=1, le=10_000)
+
+
+class DetectionWorkerRunRequest(BaseModel):
+    dataset_kind: str = Field(default="synthetic", pattern="^(synthetic|real)$")
+    max_windows: int | None = Field(default=256, ge=1, le=10_000)
+    interval_seconds: int = Field(default=60, ge=5, le=3600)
+    single_cycle: bool = False
+
+
+class ConfirmRequest(BaseModel):
+    confirm: bool = False
+
+
+class DetectionWorkerStopRequest(BaseModel):
+    dataset_kind: str = Field(default="synthetic", pattern="^(synthetic|real)$")
+    confirm: bool = False
+
+
 class ApiResponse(BaseModel):
     data: dict[str, Any]
 

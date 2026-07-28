@@ -27,9 +27,17 @@ Synthetic local demo pipeline, PyTorch autoencoder, FastAPI, React, tests, CI, a
 - Model evaluation, model cards, promotion, rollback, scoring runs, and drift reports.
 - ML CLI/API and React ML Lab.
 
-## Recommended Stage 4
+## Stage 4
+
+- Immutable `hybrid-policy-v1` detection policy with deterministic policy hash.
+- Built-in safe feature-window rules and verified champion model signals.
+- Deterministic `hybrid-fusion-v1` scoring, risk levels, findings, occurrences, lifecycle history, and exact TTL suppressions.
+- SQLite schema v10 detection tables, SQL anti-join idempotent evaluations, composite worker watermarks, and local worker lease.
+- Detection CLI/API and React Detection Center.
+
+## Recommended Stage 5
 
 - Package the local app for easier Windows operation.
 - Harden long-running process supervision.
 - Consider signed local artifact metadata.
-- Keep live alerts, SIEM export, and cloud backends out of scope until explicitly planned.
+- Keep live alerts, SIEM export, cloud backends, response actions, and online learning out of scope until explicitly planned.
