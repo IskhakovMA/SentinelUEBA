@@ -102,13 +102,16 @@ uv run sentinelueba detection status
 uv run sentinelueba detection policies list
 uv run sentinelueba detection rules list
 uv run sentinelueba detection run-once --dataset synthetic
+uv run sentinelueba detection run-once --dataset synthetic --dry-run
 uv run sentinelueba detection backfill --dataset synthetic --policy-id <policy-id> --start <iso> --end <iso> --confirm
+uv run sentinelueba detection backfill --policy-id <policy-id> --dataset-id <registered-dataset-id> --confirm
 uv run sentinelueba detection findings list
 uv run sentinelueba detection suppressions create --scope signal_for_profile --profile <profile-key> --signal-id <signal-id> --ttl-minutes 60 --reason "maintenance"
 uv run sentinelueba detection worker run-foreground --dataset synthetic --max-windows 256
+uv run sentinelueba detection worker run-foreground --dataset synthetic --max-windows 256 --single-cycle
 ```
 
-Stage 4 detection inputs contain only window id, dataset kind, pseudonymous profile key, window bounds, feature schema version, ordered feature values, quality, and feature input hash. Raw payloads, raw users, hosts, executable paths, remote addresses, and synthetic scenario labels do not enter the rule engine. No-profile runs create exact per-profile child runs; verified model signals are scored only for the model's dataset/profile namespace.
+Stage 4 detection inputs contain only window id, dataset kind, pseudonymous profile key, window bounds, feature schema version, ordered feature values, quality, and feature input hash. Raw payloads, raw users, hosts, executable paths, remote addresses, and synthetic scenario labels do not enter the rule engine. No-profile runs create exact per-profile child runs; verified model signals are scored only for the model's dataset/profile namespace. Dry-run executes the same decision path without writing detection rows, findings, watermarks, suppressions, or worker leases. Registered-snapshot backfill verifies the snapshot and proves current feature-window identity matches the snapshot rows before processing exactly those window ids.
 
 See [detection engine](docs/DETECTION_ENGINE.md), [rules](docs/DETECTION_RULES.md), [policies](docs/DETECTION_POLICIES.md), [finding lifecycle](docs/FINDING_LIFECYCLE.md), and [continuous detection](docs/CONTINUOUS_DETECTION.md).
 
@@ -125,7 +128,7 @@ The repository is a full-stack monorepo with a modular monolith backend:
 - `backend/src/sentinelueba/datasets`: immutable Parquet snapshots.
 - `backend/src/sentinelueba/validation`: event payload validation and quarantine support.
 - `backend/src/sentinelueba/ml`: Stage 3 splitting, preprocessing, Autoencoder v2, Isolation Forest, calibration, registry-backed model bundles, evaluation, scoring, and drift.
-- `backend/src/sentinelueba/detection`: legacy anomaly summaries plus Stage 4 contracts, policies, rules, fusion, findings, suppressions, and worker lease logic.
+- `backend/src/sentinelueba/detection`: legacy anomaly summaries plus Stage 4 contracts, policies, rules, fusion, findings, suppressions, and process-managed worker lease logic.
 - `backend/src/sentinelueba/api`: FastAPI app.
 - `frontend`: React, TypeScript, Vite dashboard.
 - `docs`: architecture, privacy, threat model, and development notes.

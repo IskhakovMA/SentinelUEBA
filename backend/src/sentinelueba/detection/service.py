@@ -4,7 +4,7 @@ import hashlib
 import json
 import math
 import sqlite3
-import time
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -79,9 +79,6 @@ class DetectionService:
             watermarks = conn.execute(
                 "SELECT * FROM detection_watermarks ORDER BY updated_at DESC"
             ).fetchall()
-            worker = conn.execute(
-                "SELECT * FROM detection_worker_leases ORDER BY heartbeat_at DESC LIMIT 1"
-            ).fetchone()
         return {
             "schema_version": self.storage.status()["schema_version"],
             "active_policy": policy.model_dump(mode="json"),
@@ -90,7 +87,7 @@ class DetectionService:
             "finding_counts": {row["status"]: row["count"] for row in findings},
             "evaluation_count": evaluations,
             "watermarks": [dict(row) for row in watermarks],
-            "worker": dict(worker) if worker is not None else None,
+            "worker": self.worker_status(),
         }
 
     def ensure_default_policy(self) -> DetectionPolicy:
@@ -221,6 +218,7 @@ class DetectionService:
         advance_watermark: bool = True,
         run_mode: str = "manual",
         parent_run_id: str | None = None,
+        snapshot_window_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         self.storage.initialize()
         base_policy = (
@@ -252,6 +250,7 @@ class DetectionService:
                     advance_watermark=advance_watermark,
                     run_mode=run_mode,
                     parent_run_id=parent_run_id,
+                    snapshot_window_ids=snapshot_window_ids,
                 )
                 for profile_key_value in profiles
             ]
@@ -276,6 +275,7 @@ class DetectionService:
             advance_watermark=advance_watermark,
             run_mode=run_mode,
             parent_run_id=parent_run_id,
+            snapshot_window_ids=snapshot_window_ids,
         )
 
     def _run_profile_once(
@@ -293,6 +293,7 @@ class DetectionService:
         advance_watermark: bool,
         run_mode: str,
         parent_run_id: str | None,
+        snapshot_window_ids: list[str] | None,
     ) -> dict[str, Any]:
         run_id = f"detect-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}-{uuid4().hex[:8]}"
         hint = self._model_hint(base_policy, dataset_kind, profile, explicit_model_id)
@@ -329,6 +330,7 @@ class DetectionService:
         model_identity = str(model_record["model_id"]) if model_record else MODEL_ID_SENTINEL
         processed = 0
         had_error = False
+        dry_summary = self._empty_dry_run_summary(policy, dataset_kind, model_record)
         while max_windows is None or processed < max_windows:
             limit = max(1, batch_size)
             if max_windows is not None:
@@ -342,6 +344,7 @@ class DetectionService:
                 model_identity=model_identity,
                 start=start,
                 end=end,
+                window_ids=snapshot_window_ids,
                 limit=limit,
             )
             if not windows:
@@ -351,6 +354,25 @@ class DetectionService:
                 processed += 1
                 last_window = window
                 if dry_run:
+                    try:
+                        _detection_input, decision, signals, status = self._decide_window(
+                            window,
+                            policy,
+                            model_record,
+                            model_context,
+                        )
+                        self._update_dry_run_summary(
+                            dry_summary,
+                            decision=decision,
+                            status=status,
+                            signals=signals,
+                            window=window,
+                            model_record=model_record,
+                        )
+                    except Exception as exc:
+                        had_error = True
+                        safe_error = self._safe_error(exc)
+                        error_class = exc.__class__.__name__
                     continue
                 try:
                     self._evaluate_window_atomic(
@@ -377,6 +399,11 @@ class DetectionService:
                 safe_error=safe_error,
                 error_class=error_class,
             )
+        else:
+            dry_summary["status"] = "partial" if had_error else "dry_run"
+            dry_summary["safe_error"] = safe_error
+            dry_summary["error_class"] = error_class
+            return dry_summary
         return self._run_result(run_id, policy, dataset_kind, model_record, dry_run)
 
     def _registered_policy(self, policy: DetectionPolicy) -> DetectionPolicy:
@@ -418,7 +445,7 @@ class DetectionService:
         children: list[dict[str, Any]],
         dry_run: bool,
     ) -> dict[str, Any]:
-        status = "success"
+        status = "dry_run" if dry_run else "success"
         if any(child["status"] == "failed" for child in children):
             status = "failed"
         elif any(child["status"] in {"partial", "blocked"} for child in children):
@@ -450,7 +477,27 @@ class DetectionService:
             no_op_count=sum(int(child["no_op_count"]) for child in children),
             dry_run=dry_run,
         )
-        return result.model_dump(mode="json")
+        payload = result.model_dump(mode="json")
+        if dry_run:
+            risk_counts = {"none": 0, "low": 0, "medium": 0, "high": 0, "critical": 0}
+            samples: list[dict[str, Any]] = []
+            for child in children:
+                child_risks = child.get("risk_counts", {})
+                if isinstance(child_risks, dict):
+                    for risk in risk_counts:
+                        risk_counts[risk] += int(child_risks.get(risk, 0))
+                child_samples = child.get("sample_decisions", [])
+                if isinstance(child_samples, list):
+                    samples.extend(cast(list[dict[str, Any]], child_samples))
+            payload["would_create_findings"] = sum(
+                int(child.get("would_create_findings", 0)) for child in children
+            )
+            payload["would_be_suppressed"] = sum(
+                int(child.get("would_be_suppressed", 0)) for child in children
+            )
+            payload["risk_counts"] = risk_counts
+            payload["sample_decisions"] = samples[:5]
+        return payload
 
     def _evaluate_window_atomic(
         self,
@@ -461,52 +508,12 @@ class DetectionService:
         model_record: dict[str, Any] | None,
         model_context: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        detection_input = self._window_input(window)
-        signals: list[DetectionSignal] = []
-        if detection_input.quality not in set(policy.quality_gate):
-            decision = self._skipped_decision(detection_input, policy, model_record)
-            status = "skipped"
-        else:
-            if policy.mode in {"hybrid", "rules_only"}:
-                signals.extend(evaluate_rules(detection_input, policy.rules))
-            if policy.mode in {"hybrid", "model_only"} and model_context is not None:
-                signals.append(self._model_signal(detection_input, model_record, model_context))
-            signal_suppression = self._suppression_for(detection_input, signals)
-            decision = fuse_signals(
-                detection_input,
-                policy,
-                signals,
-                model_id=str(model_record["model_id"]) if model_record else None,
-                model_version=str(model_record["model_version"]) if model_record else None,
-                model_hash=str(model_record["model_artifact_sha256"]) if model_record else None,
-                suppressed=signal_suppression is not None,
-            )
-            fingerprint_suppression = (
-                self._suppression_for(
-                    detection_input,
-                    signals,
-                    decision=decision,
-                    model_record=model_record,
-                )
-                if decision.finding
-                else None
-            )
-            suppression = signal_suppression or fingerprint_suppression
-            if suppression is not None:
-                decision = decision.model_copy(
-                    update={
-                        "suppressed": True,
-                        "finding": False,
-                        "suppression": {
-                            "suppression_id": suppression["suppression_id"],
-                            "reason": suppression["reason"],
-                            "expires_at": suppression["expires_at"],
-                        },
-                    }
-                )
-            status = "suppressed" if suppression is not None and decision.matched_signal_ids else (
-                "finding" if decision.finding else "no_finding"
-            )
+        detection_input, decision, signals, status = self._decide_window(
+            window,
+            policy,
+            model_record,
+            model_context,
+        )
         now = datetime.now(UTC).isoformat()
         model_identity = str(model_record["model_id"]) if model_record else MODEL_ID_SENTINEL
         decision_payload = {
@@ -588,6 +595,149 @@ class DetectionService:
             correlation_to=(detection_input.window_start + timedelta(minutes=60)).isoformat(),
         )
 
+    def _decide_window(
+        self,
+        window: dict[str, Any],
+        policy: DetectionPolicy,
+        model_record: dict[str, Any] | None,
+        model_context: dict[str, Any] | None,
+    ) -> tuple[DetectionInput, DetectionDecision, list[DetectionSignal], str]:
+        detection_input = self._window_input(window)
+        signals: list[DetectionSignal] = []
+        if detection_input.quality not in set(policy.quality_gate):
+            return (
+                detection_input,
+                self._skipped_decision(detection_input, policy, model_record),
+                signals,
+                "skipped",
+            )
+        if policy.mode in {"hybrid", "rules_only"}:
+            signals.extend(evaluate_rules(detection_input, policy.rules))
+        if policy.mode in {"hybrid", "model_only"} and model_context is not None:
+            signals.append(self._model_signal(detection_input, model_record, model_context))
+        signal_suppression = self._suppression_for(detection_input, signals)
+        decision = fuse_signals(
+            detection_input,
+            policy,
+            signals,
+            model_id=str(model_record["model_id"]) if model_record else None,
+            model_version=str(model_record["model_version"]) if model_record else None,
+            model_hash=str(model_record["model_artifact_sha256"]) if model_record else None,
+            suppressed=signal_suppression is not None,
+        )
+        fingerprint_suppression = (
+            self._suppression_for(
+                detection_input,
+                signals,
+                decision=decision,
+                model_record=model_record,
+            )
+            if decision.finding
+            else None
+        )
+        suppression = signal_suppression or fingerprint_suppression
+        if suppression is not None:
+            decision = decision.model_copy(
+                update={
+                    "suppressed": True,
+                    "finding": False,
+                    "suppression": {
+                        "suppression_id": suppression["suppression_id"],
+                        "reason": suppression["reason"],
+                        "expires_at": suppression["expires_at"],
+                    },
+                }
+            )
+        status = (
+            "suppressed"
+            if suppression is not None and decision.matched_signal_ids
+            else ("finding" if decision.finding else "no_finding")
+        )
+        return detection_input, decision, signals, status
+
+    def _empty_dry_run_summary(
+        self,
+        policy: DetectionPolicy,
+        dataset_kind: str,
+        model_record: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        return {
+            "detection_run_id": None,
+            "child_run_ids": [],
+            "status": "dry_run",
+            "dataset_kind": dataset_kind,
+            "policy_id": policy.policy_id,
+            "policy_version": policy.policy_version,
+            "policy_hash": policy.policy_hash,
+            "mode": policy.mode,
+            "model_id": str(model_record["model_id"]) if model_record else None,
+            "model_identity": str(model_record["model_id"]) if model_record else MODEL_ID_SENTINEL,
+            "window_count": 0,
+            "examined_count": 0,
+            "evaluated_count": 0,
+            "skipped_count": 0,
+            "finding_count": 0,
+            "new_findings": 0,
+            "updated_findings": 0,
+            "finding_occurrences": 0,
+            "no_op_count": 0,
+            "would_create_findings": 0,
+            "would_be_suppressed": 0,
+            "risk_counts": {"none": 0, "low": 0, "medium": 0, "high": 0, "critical": 0},
+            "sample_decisions": [],
+            "dry_run": True,
+        }
+
+    def _update_dry_run_summary(
+        self,
+        summary: dict[str, Any],
+        *,
+        decision: DetectionDecision,
+        status: str,
+        signals: list[DetectionSignal],
+        window: dict[str, Any],
+        model_record: dict[str, Any] | None,
+    ) -> None:
+        summary["window_count"] = int(summary["window_count"]) + 1
+        summary["examined_count"] = int(summary["examined_count"]) + 1
+        if status == "skipped":
+            summary["skipped_count"] = int(summary["skipped_count"]) + 1
+        else:
+            summary["evaluated_count"] = int(summary["evaluated_count"]) + 1
+        if status == "no_finding":
+            summary["no_op_count"] = int(summary["no_op_count"]) + 1
+        if status == "finding":
+            summary["finding_count"] = int(summary["finding_count"]) + 1
+            summary["would_create_findings"] = int(summary["would_create_findings"]) + 1
+        if status == "suppressed":
+            summary["would_be_suppressed"] = int(summary["would_be_suppressed"]) + 1
+        risk_counts = summary["risk_counts"]
+        risk_counts[decision.risk_level] = int(risk_counts.get(decision.risk_level, 0)) + 1
+        samples = summary["sample_decisions"]
+        if isinstance(samples, list) and len(samples) < 5:
+            samples.append(
+                {
+                    "window_id": window["window_id"],
+                    "window_start": window["window_start"],
+                    "status": status,
+                    "risk_level": decision.risk_level,
+                    "detection_score": decision.detection_score,
+                    "matched_signal_ids": list(decision.matched_signal_ids),
+                    "primary_signal_id": decision.primary_signal_id,
+                    "suppressed": decision.suppressed,
+                    "signal_count": len(signals),
+                    "finding_fingerprint": (
+                        self._fingerprint(
+                            self._window_input(window),
+                            decision,
+                            model_record,
+                        )
+                        if decision.finding
+                        else None
+                    ),
+                }
+            )
+
     def backfill(
         self,
         *,
@@ -610,18 +760,35 @@ class DetectionService:
             )
         if policy_id is None:
             raise DetectionEngineError("backfill requires an explicit registered policy id")
+        snapshot_window_ids: list[str] | None = None
+        snapshot_profile: str | None = None
+        policy = self._policy_from_public(self.policy_show(policy_id, policy_version))
         if registered_dataset_id is not None:
-            snapshot = self.storage.get_dataset_snapshot(registered_dataset_id)
-            if snapshot is None:
-                raise DetectionEngineError("registered dataset snapshot not found")
-            self._verify_registered_snapshot(registered_dataset_id)
-            dataset_kind = str(snapshot["dataset_kind"])
-            start = datetime.fromisoformat(str(snapshot["start"]))
-            end = datetime.fromisoformat(str(snapshot["end"]))
+            try:
+                snapshot_backfill = self._verified_snapshot_backfill(registered_dataset_id)
+            except Exception as exc:
+                self._audit_blocked_backfill(
+                    policy=policy,
+                    dataset_kind=dataset_kind,
+                    profile=None,
+                    start=start,
+                    end=end,
+                    reason=self._safe_error(exc),
+                    error_class=exc.__class__.__name__,
+                )
+                if isinstance(exc, DetectionEngineError):
+                    raise
+                raise DetectionEngineError(self._safe_error(exc)) from exc
+            dataset_kind = snapshot_backfill["dataset_kind"]
+            start = snapshot_backfill["start"]
+            end = snapshot_backfill["end"]
+            snapshot_window_ids = snapshot_backfill["window_ids"]
+            snapshot_profile = snapshot_backfill["profile_key"]
         if start is None or end is None:
             raise DetectionEngineError("backfill requires an explicit range or dataset id")
         return self.run_once(
             dataset_kind=dataset_kind,
+            profile=snapshot_profile,
             policy_id=policy_id,
             policy_version=policy_version,
             model_id=model_id,
@@ -630,6 +797,7 @@ class DetectionService:
             max_windows=None,
             advance_watermark=advance_watermark,
             run_mode="backfill",
+            snapshot_window_ids=snapshot_window_ids,
         )
 
     def runs_list(self) -> list[dict[str, Any]]:
@@ -883,12 +1051,7 @@ class DetectionService:
             ).fetchone()
         if row is None:
             return {"status": "stopped"}
-        payload = dict(row)
-        payload["lease_expired"] = (
-            payload.get("expires_at") is not None
-            and str(payload["expires_at"]) <= datetime.now(UTC).isoformat()
-        )
-        return payload
+        return self._public_worker_row(dict(row))
 
     def worker_start(
         self,
@@ -898,10 +1061,27 @@ class DetectionService:
         profile: str | None = None,
         lease_seconds: int = 120,
     ) -> dict[str, Any]:
+        self._acquire_worker_lease(
+            dataset_kind=dataset_kind,
+            interval_seconds=interval_seconds,
+            profile=profile,
+            lease_seconds=lease_seconds,
+        )
+        return self.worker_status()
+
+    def _acquire_worker_lease(
+        self,
+        *,
+        dataset_kind: str,
+        interval_seconds: int,
+        profile: str | None,
+        lease_seconds: int,
+        owner_id: str | None = None,
+    ) -> dict[str, Any]:
         if interval_seconds < 5:
             raise DetectionEngineError("worker interval_seconds must be at least 5")
         worker_key = self._worker_key(dataset_kind, profile)
-        owner_id = f"owner-{uuid4().hex}"
+        owner_id = owner_id or f"owner-{uuid4().hex}"
         now_dt = datetime.now(UTC)
         now = now_dt.isoformat()
         expires_at = (now_dt + timedelta(seconds=max(lease_seconds, interval_seconds))).isoformat()
@@ -970,7 +1150,11 @@ class DetectionService:
                     expires_at,
                 ),
             )
-        return self.worker_status()
+            row = conn.execute(
+                "SELECT * FROM detection_worker_leases WHERE worker_key = ?",
+                (worker_key,),
+            ).fetchone()
+        return dict(row)
 
     def worker_stop(self, *, confirm: bool = False) -> dict[str, Any]:
         if not confirm:
@@ -980,10 +1164,10 @@ class DetectionService:
                 """
                 UPDATE detection_worker_leases
                 SET status = 'stopping', stop_requested = 1, heartbeat_at = ?,
-                    expires_at = ?
+                    safe_error = NULL
                 WHERE status IN ('running', 'idle')
                 """,
-                (datetime.now(UTC).isoformat(), datetime.now(UTC).isoformat()),
+                (datetime.now(UTC).isoformat(),),
             )
         return self.worker_status()
 
@@ -993,64 +1177,146 @@ class DetectionService:
         dataset_kind: str = "synthetic",
         max_windows: int | None = 256,
         interval_seconds: int = 60,
-        max_cycles: int = 1,
+        single_cycle: bool = False,
+        stop_event: threading.Event | None = None,
+        owner_id: str | None = None,
     ) -> dict[str, Any]:
-        lease = self.worker_start(
+        stop_event = stop_event or threading.Event()
+        lease = self._acquire_worker_lease(
             dataset_kind=dataset_kind,
             interval_seconds=interval_seconds,
+            profile=None,
             lease_seconds=max(interval_seconds * 2, 30),
+            owner_id=owner_id,
         )
         worker_id = str(lease["worker_id"])
+        owner_id = str(lease["owner_id"])
         runs = []
         result: dict[str, Any] = {}
-        cycles = 0
         safe_error: str | None = None
-        while cycles < max_cycles:
-            cycles += 1
-            result = self.run_once(
-                dataset_kind=dataset_kind,
-                max_windows=max_windows,
-                run_mode="worker",
-            )
-            runs.append(result)
-            now_dt = datetime.now(UTC)
-            with self.storage.connect() as conn:
-                conn.execute(
-                    """
-                    UPDATE detection_worker_leases
-                    SET heartbeat_at = ?, status = 'idle', expires_at = ?
-                    WHERE worker_id = ?
-                    """,
-                    (
-                        now_dt.isoformat(),
-                        (now_dt + timedelta(seconds=max(interval_seconds * 2, 30))).isoformat(),
-                        worker_id,
-                    ),
+        failed = False
+        backoff_seconds = 1.0
+        try:
+            while not stop_event.is_set():
+                try:
+                    result = self.run_once(
+                        dataset_kind=dataset_kind,
+                        max_windows=max_windows,
+                        run_mode="worker",
+                    )
+                    runs.append(result)
+                    safe_error = None
+                    failed = False
+                    backoff_seconds = 1.0
+                except Exception as exc:  # noqa: BLE001
+                    safe_error = self._safe_error(exc)
+                    failed = True
+                self._worker_heartbeat(
+                    worker_id=worker_id,
+                    owner_id=owner_id,
+                    interval_seconds=interval_seconds,
+                    status="idle",
+                    safe_error=safe_error,
                 )
-                stop = conn.execute(
-                    "SELECT stop_requested FROM detection_worker_leases WHERE worker_id = ?",
-                    (worker_id,),
-                ).fetchone()
-            if stop is not None and int(stop["stop_requested"]):
-                break
-            if max_cycles <= 1:
-                break
-            time.sleep(interval_seconds)
+                if self._worker_stop_requested(worker_id, owner_id) or single_cycle:
+                    break
+                wait_seconds = (
+                    min(backoff_seconds, float(interval_seconds))
+                    if failed
+                    else float(interval_seconds)
+                )
+                if stop_event.wait(wait_seconds):
+                    break
+                if failed:
+                    backoff_seconds = min(backoff_seconds * 2.0, float(interval_seconds))
+        finally:
+            self._release_worker_lease(
+                worker_id=worker_id,
+                owner_id=owner_id,
+                status="failed" if safe_error is not None else "stopped",
+                safe_error=safe_error,
+            )
+        return {"worker": self.worker_status(), "run": result, "runs": runs}
+
+    def _worker_heartbeat(
+        self,
+        *,
+        worker_id: str,
+        owner_id: str,
+        interval_seconds: int,
+        status: str,
+        safe_error: str | None,
+    ) -> None:
+        now_dt = datetime.now(UTC)
         with self.storage.connect() as conn:
             conn.execute(
                 """
                 UPDATE detection_worker_leases
-                SET heartbeat_at = ?, status = ?, safe_error = ?
-                WHERE worker_id = ?
+                SET heartbeat_at = ?, status = ?, expires_at = ?, safe_error = ?
+                WHERE worker_id = ? AND owner_id = ?
                 """,
                 (
-                    datetime.now(UTC).isoformat(),
-                    "failed" if safe_error is not None else "idle",
+                    now_dt.isoformat(),
+                    status,
+                    (now_dt + timedelta(seconds=max(interval_seconds * 2, 30))).isoformat(),
                     safe_error,
                     worker_id,
+                    owner_id,
                 ),
             )
-        return {"worker": self.worker_status(), "run": result, "runs": runs}
+
+    def _worker_stop_requested(self, worker_id: str, owner_id: str) -> bool:
+        with self.storage.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT stop_requested
+                FROM detection_worker_leases
+                WHERE worker_id = ? AND owner_id = ?
+                """,
+                (worker_id, owner_id),
+            ).fetchone()
+        return row is not None and int(row["stop_requested"]) == 1
+
+    def _release_worker_lease(
+        self,
+        *,
+        worker_id: str,
+        owner_id: str,
+        status: str,
+        safe_error: str | None,
+    ) -> None:
+        now = datetime.now(UTC).isoformat()
+        with self.storage.connect() as conn:
+            conn.execute(
+                """
+                UPDATE detection_worker_leases
+                SET heartbeat_at = ?, status = ?, stop_requested = 0,
+                    expires_at = ?, safe_error = ?
+                WHERE worker_id = ? AND owner_id = ?
+                """,
+                (now, status, now, safe_error, worker_id, owner_id),
+            )
+
+    def _public_worker_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        expires_at = row.get("expires_at")
+        policy_hash = row.get("policy_hash")
+        profile = row.get("profile_key")
+        return {
+            "worker_key": row.get("worker_key"),
+            "dataset_kind": row.get("dataset_kind"),
+            "profile_label": f"profile-{str(profile)[:8]}" if profile else None,
+            "policy_hash": policy_hash,
+            "policy_hash_short": str(policy_hash)[:12] if policy_hash else None,
+            "status": row.get("status"),
+            "acquired_at": row.get("acquired_at"),
+            "heartbeat_at": row.get("heartbeat_at"),
+            "expires_at": expires_at,
+            "lease_expired": (
+                expires_at is not None and str(expires_at) <= datetime.now(UTC).isoformat()
+            ),
+            "stop_requested": bool(row.get("stop_requested")),
+            "safe_error": row.get("safe_error"),
+        }
 
     def _worker_key(self, dataset_kind: str, profile: str | None) -> str:
         return "|".join(["stage4", dataset_kind, profile or "*"])
@@ -1831,6 +2097,119 @@ class DetectionService:
         verification = DatasetSnapshotService(self.storage, self.data_dir).verify(dataset_id)
         if not verification.get("verified"):
             raise DetectionEngineError("registered dataset snapshot failed verification")
+
+    def _verified_snapshot_backfill(self, dataset_id: str) -> dict[str, Any]:
+        snapshot_service = DatasetSnapshotService(self.storage, self.data_dir)
+        _matrix, manifest, rows = snapshot_service.load_matrix(dataset_id)
+        registry = self.storage.get_dataset_snapshot(dataset_id)
+        if registry is None:
+            raise DetectionEngineError("registered dataset snapshot not found")
+        dataset_kind = str(manifest["dataset_kind"])
+        profile_payload = manifest["profile"]
+        snapshot_profile = profile_key(
+            {
+                "user_id": str(profile_payload["user_id"]),
+                "host_id": str(profile_payload["host_id"]),
+            }
+        )
+        start = datetime.fromisoformat(str(manifest["start"]))
+        end = datetime.fromisoformat(str(manifest["end"]))
+        current = {
+            str(window["window_id"]): window
+            for window in self.storage.list_feature_windows(
+                dataset_kind=dataset_kind,
+                start=start,
+                end=end,
+                limit=None,
+            )
+        }
+        window_ids: list[str] = []
+        for row in rows:
+            window_id = str(row["window_id"])
+            current_window = current.get(window_id)
+            if current_window is None:
+                raise DetectionEngineError(
+                    f"snapshot backfill window {window_id} is missing from feature store"
+                )
+            if str(current_window["profile_key"]) != snapshot_profile:
+                raise DetectionEngineError(
+                    f"snapshot backfill window {window_id} profile mismatch"
+                )
+            if str(current_window["feature_schema_version"]) != str(
+                manifest["feature_schema_version"]
+            ):
+                raise DetectionEngineError(
+                    f"snapshot backfill window {window_id} feature schema mismatch"
+                )
+            if (
+                str(current_window["window_start"]) != str(row["window_start"])
+                or str(current_window["window_end"]) != str(row["window_end"])
+            ):
+                raise DetectionEngineError(
+                    f"snapshot backfill window {window_id} range mismatch"
+                )
+            if (
+                str(current_window["user_id"]) != str(row["user_id"])
+                or str(current_window["host_id"]) != str(row["host_id"])
+            ):
+                raise DetectionEngineError(
+                    f"snapshot backfill window {window_id} profile identity mismatch"
+                )
+            if str(current_window["quality_status"]) != str(row["quality_status"]):
+                raise DetectionEngineError(
+                    f"snapshot backfill window {window_id} quality revision mismatch"
+                )
+            for name in FEATURE_NAMES:
+                if not math.isclose(
+                    float(current_window["features"][name]),
+                    float(row[name]),
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                ):
+                    raise DetectionEngineError(
+                        f"snapshot backfill window {window_id} feature revision mismatch"
+                    )
+            window_ids.append(window_id)
+        return {
+            "dataset_id": dataset_id,
+            "dataset_manifest_sha256": registry["manifest_sha256"],
+            "dataset_kind": dataset_kind,
+            "profile_key": snapshot_profile,
+            "feature_schema_version": manifest["feature_schema_version"],
+            "feature_names": list(FEATURE_NAMES),
+            "window_ids": window_ids,
+            "start": start,
+            "end": end,
+        }
+
+    def _audit_blocked_backfill(
+        self,
+        *,
+        policy: DetectionPolicy,
+        dataset_kind: str,
+        profile: str | None,
+        start: datetime | None,
+        end: datetime | None,
+        reason: str,
+        error_class: str,
+    ) -> None:
+        run_id = f"detect-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}-{uuid4().hex[:8]}"
+        try:
+            self._insert_run_start(
+                run_id,
+                policy,
+                dataset_kind,
+                profile,
+                None,
+                datetime.now(UTC).isoformat(),
+                run_mode="backfill",
+                range_start=start,
+                range_end=end,
+                parent_run_id=None,
+            )
+            self._block_run(run_id, reason=reason, error_class=error_class)
+        except Exception:
+            return
 
     def _policy_row(self, row: Any) -> dict[str, Any]:
         verified = load_policy(dict(row))

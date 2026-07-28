@@ -149,7 +149,7 @@ jobs:
             SUPPRESSION_JSON="$SUPPRESSION_JSON" uv run python -c 'import json, os; print(json.loads(os.environ["SUPPRESSION_JSON"])["suppression_id"])'
           )"
           uv run sentinelueba detection suppressions revoke "$SUPPRESSION_ID" --confirm
-          uv run sentinelueba detection worker run-foreground --dataset synthetic --max-windows 16
+          uv run sentinelueba detection worker run-foreground --dataset synthetic --max-windows 16 --single-cycle
           NOOP_JSON="$(uv run sentinelueba features materialize)"
           NOOP_JSON="$NOOP_JSON" uv run python - <<'PY'
           import json
@@ -241,7 +241,7 @@ jobs:
           if ($noopDetection.evaluated_count -ne 0 -or $noopDetection.examined_count -ne 0) { throw "unexpected detection no-op" }
           $suppression = uv run sentinelueba detection suppressions create --scope signal_for_dataset_kind --dataset synthetic --signal-id rare-process-v1 --ttl-minutes 30 --reason ci-smoke | ConvertFrom-Json
           uv run sentinelueba detection suppressions revoke $suppression.suppression_id --confirm
-          uv run sentinelueba detection worker run-foreground --dataset synthetic --max-windows 16
+          uv run sentinelueba detection worker run-foreground --dataset synthetic --max-windows 16 --single-cycle
           $noop = uv run sentinelueba features materialize | ConvertFrom-Json
           if ($noop.processed_events -ne 0 -or $noop.processed_observations -ne 0 -or $noop.upserted_windows -ne 0 -or $noop.deleted_windows -ne 0) { throw "unexpected no-op materialization" }
       - name: PowerShell syntax

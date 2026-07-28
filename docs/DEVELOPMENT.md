@@ -47,11 +47,12 @@ uv run sentinelueba detection rules list
 uv run sentinelueba detection run-once --dataset synthetic
 uv run sentinelueba detection runs list
 uv run sentinelueba detection findings list
-uv run sentinelueba detection worker run-foreground --dataset synthetic --max-windows 256
+uv run sentinelueba detection worker run-foreground --dataset synthetic --max-windows 256 --single-cycle
 ```
 
-The worker commands manage a local SQLite lease only. They do not install an OS service,
-autostart task, or background daemon.
+The worker commands do not install an OS service, autostart task, or daemon supervisor.
+`worker start` is a foreground alias; API start uses an in-process manager with a stop
+event. Use `--single-cycle` for bounded local smoke tests.
 
 Generated SQLite databases, Parquet snapshots, manifests, checksums, model bundles, logs,
 and local identity secrets must remain outside Git.

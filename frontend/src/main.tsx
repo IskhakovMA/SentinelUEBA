@@ -1086,7 +1086,11 @@ export function App() {
                 () =>
                   api('/detection/worker/run-foreground', {
                     method: 'POST',
-                    body: JSON.stringify({ dataset_kind: 'synthetic', max_windows: 256 }),
+                    body: JSON.stringify({
+                      dataset_kind: 'synthetic',
+                      max_windows: 256,
+                      single_cycle: true,
+                    }),
                   }),
               )
             }

@@ -16,6 +16,7 @@ from sentinelueba.config import Settings
 from sentinelueba.datasets import DatasetSnapshotService
 from sentinelueba.detection.engine import summarize_scores
 from sentinelueba.detection.service import DetectionService
+from sentinelueba.detection.worker_manager import get_detection_worker_manager
 from sentinelueba.domain.events import WindowFeatures
 from sentinelueba.features.materialization import FeatureMaterializer
 from sentinelueba.features.windows import FEATURE_NAMES
@@ -590,7 +591,11 @@ class DemoPipeline:
 
     def detection_worker_status(self) -> dict[str, object]:
         self.storage.initialize()
-        return self.detection().worker_status()
+        return get_detection_worker_manager().status(
+            database_path=self.settings.database_path,
+            data_dir=self.settings.data_dir,
+            model_dir=self.settings.model_dir,
+        )
 
     def detection_worker_start(
         self,
@@ -599,14 +604,23 @@ class DemoPipeline:
         interval_seconds: int = 60,
     ) -> dict[str, object]:
         self.storage.initialize()
-        return self.detection().worker_start(
+        return get_detection_worker_manager().start(
+            database_path=self.settings.database_path,
+            data_dir=self.settings.data_dir,
+            model_dir=self.settings.model_dir,
             dataset_kind=dataset_kind,
             interval_seconds=interval_seconds,
         )
 
     def detection_worker_stop(self, *, confirm: bool = False) -> dict[str, object]:
         self.storage.initialize()
-        return self.detection().worker_stop(confirm=confirm)
+        return get_detection_worker_manager().stop(
+            database_path=self.settings.database_path,
+            data_dir=self.settings.data_dir,
+            model_dir=self.settings.model_dir,
+            dataset_kind=None,
+            confirm=confirm,
+        )
 
     def detection_worker_run_foreground(
         self,
@@ -614,12 +628,14 @@ class DemoPipeline:
         dataset_kind: str = "synthetic",
         max_windows: int | None = 256,
         interval_seconds: int = 60,
+        single_cycle: bool = False,
     ) -> dict[str, object]:
         self.storage.initialize()
         return self.detection().worker_run_foreground(
             dataset_kind=dataset_kind,
             max_windows=max_windows,
             interval_seconds=interval_seconds,
+            single_cycle=single_cycle,
         )
 
     def _create_dataset_locked(self, dataset_kind: str) -> dict[str, object]:

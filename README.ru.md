@@ -102,12 +102,15 @@ uv run sentinelueba detection status
 uv run sentinelueba detection policies list
 uv run sentinelueba detection rules list
 uv run sentinelueba detection run-once --dataset synthetic
+uv run sentinelueba detection run-once --dataset synthetic --dry-run
 uv run sentinelueba detection backfill --dataset synthetic --policy-id <policy-id> --start <iso> --end <iso> --confirm
+uv run sentinelueba detection backfill --policy-id <policy-id> --dataset-id <registered-dataset-id> --confirm
 uv run sentinelueba detection findings list
 uv run sentinelueba detection worker run-foreground --dataset synthetic --max-windows 256
+uv run sentinelueba detection worker run-foreground --dataset synthetic --max-windows 256 --single-cycle
 ```
 
-Stage 4 DetectionInput содержит только window id, dataset kind, pseudonymous profile key, границы окна, feature schema version, ordered feature values, quality и feature input hash. Raw payloads, raw users, hosts, executable paths, remote addresses и synthetic scenario labels не попадают в rule engine. Запуск без profile создаёт exact per-profile child runs; verified model signals считаются только для dataset/profile namespace модели.
+Stage 4 DetectionInput содержит только window id, dataset kind, pseudonymous profile key, границы окна, feature schema version, ordered feature values, quality и feature input hash. Raw payloads, raw users, hosts, executable paths, remote addresses и synthetic scenario labels не попадают в rule engine. Запуск без profile создаёт exact per-profile child runs; verified model signals считаются только для dataset/profile namespace модели. Dry-run выполняет тот же decision path без записи detection rows, findings, watermarks, suppressions или worker leases. Registered-snapshot backfill сначала проверяет snapshot и доказывает совпадение current feature-window identity со snapshot rows, затем обрабатывает ровно эти window ids.
 
 Подробнее: [detection engine](docs/DETECTION_ENGINE.md), [rules](docs/DETECTION_RULES.md), [policies](docs/DETECTION_POLICIES.md), [finding lifecycle](docs/FINDING_LIFECYCLE.md), [continuous detection](docs/CONTINUOUS_DETECTION.md).
 

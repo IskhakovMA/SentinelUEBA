@@ -775,14 +775,20 @@ def detection_worker_status() -> None:
 def detection_worker_start(
     dataset: str = typer.Option("synthetic", "--dataset"),
     interval_seconds: int = typer.Option(60, "--interval-seconds", min=5),
+    max_windows: int | None = typer.Option(256, "--max-windows", min=1),
 ) -> None:
-    """Start the local worker lease without installing an OS service."""
-    _print(
-        _pipeline().detection_worker_start(
-            dataset_kind=dataset,
-            interval_seconds=interval_seconds,
+    """Run the local worker in the foreground without installing an OS service."""
+    try:
+        _print(
+            _pipeline().detection_worker_run_foreground(
+                dataset_kind=dataset,
+                max_windows=max_windows,
+                interval_seconds=interval_seconds,
+                single_cycle=False,
+            )
         )
-    )
+    except KeyboardInterrupt:
+        _print(_pipeline().detection_worker_stop(confirm=True))
 
 
 @detection_worker_app.command("stop")
@@ -796,16 +802,20 @@ def detection_worker_run_foreground(
     dataset: str = typer.Option("synthetic", "--dataset"),
     max_windows: int | None = typer.Option(256, "--max-windows", min=1),
     interval_seconds: int = typer.Option(60, "--interval-seconds", min=5),
+    single_cycle: bool = typer.Option(False, "--single-cycle"),
 ) -> None:
-    """Run one bounded local worker cycle in the foreground."""
+    """Run the local worker loop in the foreground."""
     try:
         _print(
             _pipeline().detection_worker_run_foreground(
                 dataset_kind=dataset,
                 max_windows=max_windows,
                 interval_seconds=interval_seconds,
+                single_cycle=single_cycle,
             )
         )
+    except KeyboardInterrupt:
+        _print(_pipeline().detection_worker_stop(confirm=True))
     except ValueError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=2) from exc

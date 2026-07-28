@@ -1796,6 +1796,7 @@ class SQLiteStorage:
         model_identity: str,
         start: datetime | None = None,
         end: datetime | None = None,
+        window_ids: list[str] | None = None,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
         clauses = [
@@ -1819,6 +1820,12 @@ class SQLiteStorage:
         if end is not None:
             clauses.append("w.window_start < ?")
             params.append(end.isoformat())
+        if window_ids is not None:
+            if not window_ids:
+                return []
+            placeholders = ", ".join("?" for _ in window_ids)
+            clauses.append(f"w.window_id IN ({placeholders})")
+            params.extend(window_ids)
         limit_sql = ""
         if limit is not None:
             limit_sql = " LIMIT ?"

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -52,6 +53,26 @@ def scenario_evaluations(
         evaluations.update({item["window_start"]: item for item in run["evaluations"]})
     manifest = pipe.generate_demo_data(seed=42)["scenario_manifest"]
     return {item["name"]: evaluations[item["window_start"]] for item in manifest}
+
+
+DETECTION_TABLES = (
+    "detection_runs",
+    "detection_evaluations",
+    "findings",
+    "finding_occurrences",
+    "finding_state_history",
+    "detection_suppressions",
+    "detection_watermarks",
+    "detection_worker_leases",
+)
+
+
+def detection_table_counts(storage: SQLiteStorage) -> dict[str, int]:
+    with storage.connect() as conn:
+        return {
+            table: int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            for table in DETECTION_TABLES
+        }
 
 def run_id(result: dict[str, object]) -> str:
     if result.get("detection_run_id") is not None:
@@ -271,10 +292,225 @@ def test_stage4_v10_exact_profile_policy_and_worker_contracts(tmp_path: Path) ->
     )
     assert revoked["revoked"] is True
 
-    worker = pipe.detection_worker_run_foreground(dataset_kind="synthetic", max_windows=1)
+    worker = pipe.detection_worker_run_foreground(
+        dataset_kind="synthetic",
+        max_windows=1,
+        single_cycle=True,
+    )
     assert worker["worker"]["worker_key"] == "stage4|synthetic|*"
-    assert not str(worker["worker"].get("owner_id", "")).startswith("demo-host")
+    assert "owner_id" not in worker["worker"]
+    assert "config_json" not in worker["worker"]
     assert worker["runs"]
+
+
+def test_stage4_dry_run_evaluates_without_db_writes(tmp_path: Path) -> None:
+    pipe = prepared_pipe(tmp_path)
+    before = detection_table_counts(pipe.storage)
+
+    dry = pipe.detection_run_once(dataset_kind="synthetic", rules_only=True, dry_run=True)
+
+    assert dry["status"] == "dry_run"
+    assert dry["detection_run_id"] is None
+    assert dry["examined_count"] == 96
+    assert dry["evaluated_count"] == 96
+    assert dry["would_create_findings"] >= 5
+    assert sum(dry["risk_counts"].values()) == 96
+    assert dry["sample_decisions"]
+    assert detection_table_counts(pipe.storage) == before
+
+    normal = pipe.detection_run_once(dataset_kind="synthetic", rules_only=True)
+    assert normal["evaluated_count"] == dry["evaluated_count"]
+    assert normal["finding_count"] == dry["would_create_findings"]
+
+
+def test_stage4_worker_manager_api_lifecycle_and_public_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SENTINELUEBA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("SENTINELUEBA_DATABASE_PATH", str(tmp_path / "data" / "api-worker.sqlite3"))
+    monkeypatch.setenv("SENTINELUEBA_MODEL_DIR", str(tmp_path / "model"))
+    client = TestClient(app)
+
+    assert client.post("/demo/generate", json={"seed": 42}).status_code == 200
+    materialized = client.post(
+        "/features/materialize",
+        json={"dataset_kind": "synthetic"},
+    )
+    assert materialized.status_code == 200
+    started = client.post(
+        "/detection/worker/start",
+        json={"dataset_kind": "synthetic", "interval_seconds": 5},
+    )
+    assert started.status_code == 200
+
+    storage = SQLiteStorage(tmp_path / "data" / "api-worker.sqlite3")
+    for _ in range(80):
+        with storage.connect() as conn:
+            count = int(conn.execute("SELECT COUNT(*) FROM detection_evaluations").fetchone()[0])
+        if count == 96:
+            break
+        time.sleep(0.1)
+    assert count == 96
+
+    status = client.get("/detection/worker/status").json()["data"]
+    assert status["process_running"] is True
+    assert status["worker_key"] == "stage4|synthetic|*"
+    assert "owner_id" not in status
+    assert "hostname" not in status
+    assert "config_json" not in status
+    assert "thread" not in status
+
+    stopped = client.post("/detection/worker/stop", json={"confirm": True})
+    assert stopped.status_code == 200
+    final = client.get("/detection/worker/status").json()["data"]
+    assert final["process_running"] is False
+    assert final["status"] in {"stopped", "stopping"}
+
+
+def test_stage4_worker_owner_rules_and_repeated_single_cycle(tmp_path: Path) -> None:
+    pipe = prepared_pipe(tmp_path)
+    service = pipe.detection()
+    lease = service._acquire_worker_lease(
+        dataset_kind="synthetic",
+        interval_seconds=5,
+        profile=None,
+        lease_seconds=30,
+        owner_id="owner-a",
+    )
+    with pytest.raises(DetectionEngineError, match="active detection worker lease"):
+        service._acquire_worker_lease(
+            dataset_kind="synthetic",
+            interval_seconds=5,
+            profile=None,
+            lease_seconds=30,
+            owner_id="owner-b",
+        )
+    service._worker_heartbeat(
+        worker_id=str(lease["worker_id"]),
+        owner_id="owner-b",
+        interval_seconds=5,
+        status="idle",
+        safe_error=None,
+    )
+    with pipe.storage.connect() as conn:
+        row = conn.execute(
+            "SELECT owner_id, status FROM detection_worker_leases WHERE worker_key = ?",
+            ("stage4|synthetic|*",),
+        ).fetchone()
+    assert row["owner_id"] == "owner-a"
+    service._release_worker_lease(
+        worker_id=str(lease["worker_id"]),
+        owner_id="owner-a",
+        status="stopped",
+        safe_error=None,
+    )
+
+    first = pipe.detection_worker_run_foreground(
+        dataset_kind="synthetic",
+        max_windows=1,
+        interval_seconds=5,
+        single_cycle=True,
+    )
+    second = pipe.detection_worker_run_foreground(
+        dataset_kind="synthetic",
+        max_windows=1,
+        interval_seconds=5,
+        single_cycle=True,
+    )
+    assert first["worker"]["status"] == "stopped"
+    assert second["worker"]["status"] == "stopped"
+
+
+def test_stage4_registered_snapshot_backfill_exact_and_idempotent(tmp_path: Path) -> None:
+    pipe = prepared_pipe(tmp_path)
+    dataset = pipe.create_dataset("synthetic")
+    dataset_id = str(dataset["dataset_id"])
+
+    result = pipe.detection_backfill(
+        policy_id=RULES_ONLY_POLICY_ID,
+        registered_dataset_id=dataset_id,
+        confirm=True,
+    )
+    assert result["evaluated_count"] == 96
+    assert result["finding_count"] >= 5
+    assert detection_table_counts(pipe.storage)["detection_watermarks"] == 0
+
+    repeat = pipe.detection_backfill(
+        policy_id=RULES_ONLY_POLICY_ID,
+        registered_dataset_id=dataset_id,
+        confirm=True,
+    )
+    assert repeat["examined_count"] == 0
+    assert repeat["evaluated_count"] == 0
+
+
+def test_stage4_registered_snapshot_backfill_ignores_extra_current_window(
+    tmp_path: Path,
+) -> None:
+    pipe = prepared_pipe(tmp_path)
+    dataset = pipe.create_dataset("synthetic")
+    dataset_id = str(dataset["dataset_id"])
+    extra = dict(pipe.storage.list_feature_windows(dataset_kind="synthetic")[0])
+    extra["window_id"] = "extra-current-window"
+    extra["window_start"] = (
+        datetime.fromisoformat(str(extra["window_start"])) + timedelta(minutes=1)
+    ).isoformat()
+    extra["window_end"] = (
+        datetime.fromisoformat(str(extra["window_end"])) + timedelta(minutes=1)
+    ).isoformat()
+    extra["source_event_hash"] = "extra-current-source"
+    pipe.storage.upsert_feature_windows([extra])
+
+    result = pipe.detection_backfill(
+        policy_id=RULES_ONLY_POLICY_ID,
+        registered_dataset_id=dataset_id,
+        confirm=True,
+    )
+
+    assert result["examined_count"] == 96
+    assert result["evaluated_count"] == 96
+    with pipe.storage.connect() as conn:
+        extra_eval = conn.execute(
+            "SELECT COUNT(*) FROM detection_evaluations WHERE window_id = ?",
+            ("extra-current-window",),
+        ).fetchone()[0]
+    assert extra_eval == 0
+
+
+def test_stage4_registered_snapshot_backfill_rejects_current_revision(
+    tmp_path: Path,
+) -> None:
+    pipe = prepared_pipe(tmp_path)
+    dataset = pipe.create_dataset("synthetic")
+    dataset_id = str(dataset["dataset_id"])
+    window = pipe.storage.list_feature_windows(dataset_kind="synthetic")[0]
+    features = dict(window["features"])
+    features["process_count"] = float(features["process_count"]) + 1.0
+    with pipe.storage.connect() as conn:
+        conn.execute(
+            "UPDATE feature_windows SET features_json = ? WHERE window_id = ?",
+            (json.dumps(features, sort_keys=True), window["window_id"]),
+        )
+
+    with pytest.raises(DetectionEngineError, match="feature revision mismatch"):
+        pipe.detection_backfill(
+            policy_id=RULES_ONLY_POLICY_ID,
+            registered_dataset_id=dataset_id,
+            confirm=True,
+        )
+    with pipe.storage.connect() as conn:
+        blocked = conn.execute(
+            """
+            SELECT status, run_mode, blocked_reason
+            FROM detection_runs
+            ORDER BY started_at DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    assert blocked["status"] == "blocked"
+    assert blocked["run_mode"] == "backfill"
+    assert "feature revision mismatch" in blocked["blocked_reason"]
 
 
 def test_stage4_model_strength_handles_threshold_edges() -> None:

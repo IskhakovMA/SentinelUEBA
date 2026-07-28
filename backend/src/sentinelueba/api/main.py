@@ -32,6 +32,7 @@ from sentinelueba.api.schemas import (
     TrainingEligibilityRequest,
 )
 from sentinelueba.config import get_settings
+from sentinelueba.detection.worker_manager import get_detection_worker_manager
 from sentinelueba.services.pipeline import DemoPipeline
 
 
@@ -53,6 +54,16 @@ app.add_middleware(
 
 def pipeline() -> DemoPipeline:
     return DemoPipeline(get_settings())
+
+
+@app.on_event("shutdown")
+def shutdown_workers() -> None:
+    settings = get_settings()
+    get_detection_worker_manager().shutdown_process(
+        database_path=settings.database_path,
+        data_dir=settings.data_dir,
+        model_dir=settings.model_dir,
+    )
 
 
 async def run_blocking(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -523,6 +534,7 @@ async def detection_worker_run_foreground(request: DetectionWorkerRunRequest) ->
                 dataset_kind=request.dataset_kind,
                 max_windows=request.max_windows,
                 interval_seconds=request.interval_seconds,
+                single_cycle=request.single_cycle,
             )
         )
     except ValueError as exc:
