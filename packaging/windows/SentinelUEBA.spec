@@ -7,6 +7,15 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 ROOT = Path.cwd()
 FRONTEND_DIST = ROOT / "frontend" / "dist"
 
+
+def without_test_data(files):
+    return [
+        item
+        for item in files
+        if "tests" not in Path(item[0]).parts and "test" not in Path(item[0]).parts
+    ]
+
+
 datas = [
     (str(ROOT / "LICENSE"), "."),
     (str(ROOT / "README.md"), "."),
@@ -17,8 +26,8 @@ datas = [
 if FRONTEND_DIST.exists():
     datas.append((str(FRONTEND_DIST), "frontend"))
 
-datas += collect_data_files("skops")
-datas += collect_data_files("pyarrow")
+datas += without_test_data(collect_data_files("skops"))
+datas += without_test_data(collect_data_files("pyarrow"))
 
 hiddenimports = (
     collect_submodules("uvicorn")
