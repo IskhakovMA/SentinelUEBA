@@ -24,7 +24,18 @@ hiddenimports = (
     collect_submodules("uvicorn")
     + collect_submodules("sentinelueba")
     + collect_submodules("skops")
-    + ["win32timezone", "win32serviceutil", "win32service", "win32event", "servicemanager"]
+    + collect_submodules("skops.io.old")
+    + [
+        "skops.io.old",
+        "skops.io.old._general_v0",
+        "skops.io.old._numpy_v0",
+        "skops.io.old._numpy_v1",
+        "win32timezone",
+        "win32serviceutil",
+        "win32service",
+        "win32event",
+        "servicemanager",
+    ]
 )
 
 common_kwargs = {
